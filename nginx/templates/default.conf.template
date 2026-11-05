@@ -1,0 +1,72 @@
+# 这个文件由 nginx 镜像启动时 envsubst 渲染（只替换已定义的环境变量，如 ${HLS_SECRET}）
+
+# ---------- "CDN 边缘"缓存 ----------
+# keys_zone 存缓存索引，max_size 限制磁盘，inactive 内没被访问就淘汰
+proxy_cache_path /var/cache/nginx/hls levels=1:2 keys_zone=hls:50m max_size=5g inactive=7d use_temp_path=off;
+
+log_format vod '$remote_addr [$time_local] "$request" $status $body_bytes_sent '
+               'rt=$request_time urt=$upstream_response_time cache=$upstream_cache_status rid=$request_id';
+
+upstream minio_origin { server minio:9000; }
+upstream api_backend  { server api:8000; keepalive 16; }
+
+server {
+    listen 8080;
+    access_log /var/log/nginx/access.log vod;
+
+    # 测试播放页
+    location / { root /usr/share/nginx/html; index index.html; }
+
+    # 业务 API：把 request_id 透传下去当 trace_id
+    location /api/ {
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header X-Request-ID $request_id;
+        add_header X-Request-ID $request_id always;
+    }
+
+    # key 服务：绝不缓存
+    location /keys/ {
+        proxy_pass http://api_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header X-Request-ID $request_id;
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+    }
+
+    # HLS：/hls/<签名>/<过期时间>/<资产id>/<文件>
+    # 签名覆盖"过期时间 + 资产目录"，m3u8 里的相对路径分片会自动继承这个前缀，所以每个分片都被校验
+    location ~ ^/hls/(?<sl_sig>[A-Za-z0-9_-]+)/(?<sl_exp>[0-9]+)/(?<asset>[0-9]+)/(?<file>[A-Za-z0-9_./-]+)$ {
+        secure_link $sl_sig,$sl_exp;
+        secure_link_md5 "$sl_exp/$asset ${HLS_SECRET}";
+        if ($secure_link = "")  { return 403; }   # 签名不对
+        if ($secure_link = "0") { return 410; }   # 已过期
+
+        proxy_cache hls;
+        proxy_cache_key "$asset/$file";            # 缓存键不含签名 -> 不同用户命中同一份缓存
+        proxy_cache_valid 200 7d;                  # VOD 产物不可变，可以长缓存
+        proxy_cache_lock on;                       # 同一对象并发 miss 只回源一次（防击穿）
+        proxy_cache_use_stale error timeout updating;
+        proxy_ignore_headers Set-Cookie Cache-Control Expires;
+        proxy_hide_header Set-Cookie;
+        proxy_set_header Host minio:9000;
+        proxy_pass http://minio_origin/vod-hls/assets/$asset/$file;
+        add_header X-Cache-Status $upstream_cache_status always;
+    }
+
+    location = /nginx_status { stub_status; allow 127.0.0.1; allow 172.16.0.0/12; deny all; }
+}
+
+# ---------- 上传网关：只放行带预签名的 PUT 直传 ----------
+server {
+    listen 9000;
+    client_max_body_size 5g;
+    location / {
+        limit_except PUT { deny all; }
+        proxy_request_buffering off;              # 边收边转，不在 nginx 落盘
+        proxy_set_header Host $http_host;         # 保留客户端看到的 host，预签名校验要用
+        proxy_pass http://minio_origin;
+    }
+}

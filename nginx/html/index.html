@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>drama-vod 测试播放页</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+ body{font-family:system-ui,sans-serif;max-width:900px;margin:16px auto;padding:0 12px}
+ .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+ video{width:360px;max-width:100%;aspect-ratio:9/16;background:#000}
+ pre{background:#f4f4f4;padding:8px;height:320px;overflow:auto;font-size:12px;flex:1;min-width:280px}
+</style>
+</head>
+<body>
+<h3>drama-vod 测试播放页（hls.js）</h3>
+<div class="row">
+  user_id <input id="uid" value="1001" size="6">
+  episode_id <input id="eid" value="1" size="6">
+  <button onclick="play()">播放</button>
+  <button onclick="unlock()">解锁本集（模拟购买）</button>
+  <button onclick="play(nextEp)">下一集</button>
+</div>
+<div class="row" id="status"></div>
+<div class="row" style="align-items:flex-start">
+  <video id="v" controls muted playsinline></video>
+  <pre id="log"></pre>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+function log(...a){ logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = 1e9; }
+let hls, nextEp = null, t0 = 0;
+window.vodState = {firstFrameMs: null, level: null, errors: []};
+
+async function unlock(){
+  const r = await fetch(`/api/users/${$('uid').value}/unlock`, {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({episode_id: +$('eid').value})});
+  log('unlock', r.status);
+}
+
+async function play(epId){
+  if (epId) $('eid').value = epId;
+  t0 = performance.now();
+  const r = await fetch(`/api/episodes/${$('eid').value}/play?user_id=${$('uid').value}`);
+  const info = await r.json();
+  if (!r.ok){ log('play 被拒', r.status, JSON.stringify(info)); window.vodState.errors.push(r.status); return; }
+  log('拿到签名地址', info.master_url, '加密=', info.encrypted);
+  nextEp = info.next && !info.next.locked ? info.next.episode_id : null;
+  if (hls) hls.destroy();
+  hls = new Hls({
+    startLevel: 0,                  // 弱网/高 RTT（比如 Tailscale DERP）先从最低档起播
+    capLevelToPlayerSize: true,     // 不选比播放器尺寸大的档，省流量
+    maxBufferLength: 60,            // 多攒一点缓冲，扛高延迟抖动
+    maxMaxBufferLength: 120,
+    fragLoadingTimeOut: 20000,
+    manifestLoadingTimeOut: 20000,
+    abrEwmaDefaultEstimate: 300000, // 默认按 ~300kbps 估，避免一上来就冲高档
+    // key 请求带上播放 token；分片和 m3u8 已经由 URL 里的签名保护
+    xhrSetup: (xhr, url) => { if (url.includes('/keys/')) xhr.setRequestHeader('Authorization', 'Bearer ' + info.token); }
+  });
+  hls.on(Hls.Events.MANIFEST_PARSED, (_, d) => log('master 解析完成，档位:', d.levels.map(l => Math.min(l.width,l.height) + 'p@' + Math.round(l.bitrate/1000) + 'k').join(' ')));
+  hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => { const l = hls.levels[d.level]; window.vodState.level = Math.min(l.width,l.height); log('切档 ->', Math.min(l.width,l.height) + 'p'); });
+  hls.on(Hls.Events.FRAG_LOADED, (_, d) => {
+    const ms = Math.round(d.frag.stats.loading.end - d.frag.stats.loading.start);
+    $('status').textContent =
+      `当前档 ${(l => l ? Math.min(l.width,l.height) : '-')(hls.levels[hls.currentLevel])}p | 带宽估计 ${Math.round(hls.bandwidthEstimate/1000)} kbps | 缓冲 ${($('v').buffered.length? ($('v').buffered.end(0)-$('v').currentTime).toFixed(1):0)}s | 分片 ${d.frag.sn} 用时 ${ms} ms`;
+    // 缓冲够了、带宽也够了再预加载下一集，避免和当前播放抢带宽
+    if (info.next && !info.next.locked && !window._preloaded && hls.bandwidthEstimate > 600000
+        && $('v').buffered.length && ($('v').buffered.end(0) - $('v').currentTime) > 8) {
+      window._preloaded = true; preload(info.next);
+    }
+  });
+  hls.on(Hls.Events.ERROR, (_, d) => { log('ERROR', d.type, d.details, d.response?.code || ''); window.vodState.errors.push(d.details); });
+  window._preloaded = false;
+  hls.loadSource(info.master_url);
+  hls.attachMedia($('v'));
+  $('v').onplaying = () => { const ms = Math.round(performance.now() - t0);
+    if (window.vodState.firstFrameMs === null) window.vodState.firstFrameMs = ms;
+    log('开始播放，点击到首帧(本机实测)', ms, 'ms'); };
+  $('v').play().catch(e => log('autoplay', e.message));
+}
+
+// 预加载下一集：拉 master、最低档 m3u8 和它的第一个分片，让下一集"秒开"（顺便把 CDN 缓存也预热了）
+async function preload(n){
+  try{
+    const base = n.master_url.replace(/master\.m3u8$/, '');
+    const master = await (await fetch(n.master_url)).text();
+    const variants = master.split('\n').filter(l => l && !l.startsWith('#'));
+    const low = variants[variants.length - 1];
+    const media = await (await fetch(base + low)).text();
+    const seg0 = media.split('\n').find(l => l && !l.startsWith('#'));
+    await fetch(base + low.replace(/index\.m3u8$/, '') + seg0);
+    log('已预加载下一集', n.episode_id, '的 master + 首片', low.replace('/index.m3u8',''));
+  }catch(e){ log('预加载失败', e.message); }
+}
+// ?ep=1 自动播放（便于无头浏览器验证）
+const _q = new URLSearchParams(location.search);
+if (_q.get('ep')) { if (_q.get('uid')) $('uid').value = _q.get('uid'); play(+_q.get('ep')); }
+setInterval(() => { document.title = JSON.stringify(window.vodState); }, 500);
+</script>
+</body>
+</html>

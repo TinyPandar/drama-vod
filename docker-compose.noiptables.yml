@@ -1,0 +1,29 @@
+# 仅在"Docker 守护进程没有 iptables"的环境下叠加使用（比如本次验证用的沙箱机器）：
+#   docker compose -f docker-compose.yml -f docker-compose.noiptables.yml up -d
+# 原因：没有 iptables 时 Docker 内置 DNS(127.0.0.11) 不工作，容器之间按服务名解析失败。
+# 做法：给每个容器固定 IP，再用 extra_hosts 写进 /etc/hosts。正常装的 Docker Desktop / Linux Docker 不需要这个文件。
+x-hosts: &hosts
+  extra_hosts:
+    - "minio:172.28.0.10"
+    - "mysql:172.28.0.11"
+    - "redis:172.28.0.12"
+    - "rabbitmq:172.28.0.13"
+    - "api:172.28.0.14"
+    - "worker:172.28.0.15"
+    - "nginx:172.28.0.16"
+    - "prometheus:172.28.0.17"
+
+networks:
+  default:
+    ipam:
+      config: [{subnet: 172.28.0.0/24}]
+
+services:
+  minio:      {<<: *hosts, networks: {default: {ipv4_address: 172.28.0.10}}}
+  mysql:      {<<: *hosts, networks: {default: {ipv4_address: 172.28.0.11}}}
+  redis:      {<<: *hosts, networks: {default: {ipv4_address: 172.28.0.12}}}
+  rabbitmq:   {<<: *hosts, networks: {default: {ipv4_address: 172.28.0.13}}}
+  api:        {<<: *hosts, networks: {default: {ipv4_address: 172.28.0.14}}}
+  worker:     {<<: *hosts, networks: {default: {ipv4_address: 172.28.0.15}}}
+  nginx:      {<<: *hosts, networks: {default: {ipv4_address: 172.28.0.16}}}
+  prometheus: {<<: *hosts, networks: {default: {ipv4_address: 172.28.0.17}}}

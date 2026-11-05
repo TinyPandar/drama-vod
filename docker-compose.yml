@@ -1,0 +1,102 @@
+name: drama-vod
+
+x-app-env: &app-env
+  MYSQL_HOST: mysql
+  MYSQL_USER: vod
+  MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+  MYSQL_DB: vod
+  REDIS_URL: redis://redis:6379/0
+  AMQP_URL: amqp://guest:guest@rabbitmq:5672/%2F
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+  SOURCE_BUCKET: vod-source
+  HLS_BUCKET: vod-hls
+
+services:
+  minio:                      # 对象存储（原片 + HLS 产物）
+    image: cgr.dev/chainguard/minio:latest
+    user: "0:0"
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes: [minio-data:/data]
+    ports: ["9001:9001"]      # 只暴露控制台；9000 不直接暴露，由 nginx 上传网关转发
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: vod
+      MYSQL_USER: vod
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command: ["--performance-schema=OFF", "--innodb-buffer-pool-size=128M"]
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports: ["3306:3306"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  rabbitmq:                   # 转码任务队列
+    image: rabbitmq:3.13-management-alpine
+    ports: ["15672:15672"]    # 管理界面 guest/guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 30
+
+  api:                        # 业务 API + key 服务（MVP 用 FastAPI，见 README 里 Spring Boot 迁移说明）
+    build: {context: ./api, network: host}
+    environment:
+      <<: *app-env
+      PUBLIC_UPLOAD_ENDPOINT: ${PUBLIC_UPLOAD_ENDPOINT}
+      HLS_SECRET: ${HLS_SECRET}
+      TOKEN_SECRET: ${TOKEN_SECRET}
+      PLAY_URL_TTL: "600"
+    depends_on:
+      mysql: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      minio: {condition: service_started}
+
+  worker:                     # FFmpeg 转码 worker，可 scale：docker compose up -d --scale worker=2
+    build: {context: ./worker, network: host}
+    environment:
+      <<: *app-env
+    depends_on:
+      api: {condition: service_started}
+
+  nginx:                      # 模拟 CDN 边缘：secure_link 鉴权 + proxy_cache 缓存；同时是上传网关
+    image: nginx:1.27-alpine
+    environment:
+      HLS_SECRET: ${HLS_SECRET}
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/html:/usr/share/nginx/html:ro
+      - nginx-cache:/var/cache/nginx/hls
+    ports:
+      - "8080:8080"           # 播放页 / API / HLS / key
+      - "9000:9000"           # 预签名直传入口（只放行 PUT）
+    depends_on: [api, minio]
+
+  prometheus:                 # 可选：docker compose --profile obs up -d
+    image: prom/prometheus:latest
+    profiles: ["obs"]
+    volumes: [./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro]
+    ports: ["9090:9090"]
+
+volumes:
+  minio-data:
+  mysql-data:
+  nginx-cache:
