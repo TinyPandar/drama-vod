@@ -2,16 +2,21 @@
 
 接口一览（经 nginx :8080 访问）：
   POST /api/dramas                         建剧
+  GET  /api/dramas                         上架剧列表（播放页）
+  GET  /api/dramas/{id}                    剧详情 + 分集
   POST /api/dramas/{id}/episodes           建集（is_paid=1 表示付费集，转码时会 AES-128 加密）
+  GET  /api/episodes/{id}                  集详情（含所属剧）
   POST /api/episodes/{id}/upload-url       申请预签名直传 URL（客户端直接 PUT 到对象存储）
   POST /api/assets/{id}/complete           客户端上传完回调 -> 建转码任务 -> 投递 MQ
   GET  /api/assets/{id}                    查资产/转码状态
   POST /api/users/{uid}/unlock             模拟购买解锁
   GET  /api/episodes/{id}/play?user_id=    鉴权后发签名播放地址 + 播放 token（还带下一集，供预加载）
   GET  /keys/{asset_id}                    key 服务：凭播放 token 下发 AES-128 密钥
+  GET  /api/playback/{asset}/master.m3u8   给不能设请求头的播放器（iPhone）改写播放列表
   GET  /api/rank/hot  /api/episodes/{id}/stats  /metrics
 """
-import base64, hashlib, hmac, json, os, threading, time
+import base64, hashlib, hmac, json, os, re, threading, time
+from urllib.parse import quote
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
@@ -137,6 +142,69 @@ def create_episode(drama_id: int, body: EpisodeIn):
     return {"episode_id": eid}
 
 
+def _episode_rows(c, drama_id: int):
+    c.execute(
+        "SELECT e.id, e.ep_no, e.title, e.is_paid, e.price_coins, e.asset_id, e.status, a.duration_ms "
+        "FROM episode e LEFT JOIN video_asset a ON a.id = e.asset_id "
+        "WHERE e.drama_id=%s ORDER BY e.ep_no", (drama_id,))
+    rows = c.fetchall()
+    for ep in rows:
+        ep["is_paid"] = bool(ep["is_paid"])
+        ep["price_coins"] = int(ep["price_coins"] or 0)
+    return rows
+
+
+@app.get("/api/dramas")
+def list_dramas():
+    """播放页用。只列已上架的剧，不改现有的建剧/播放接口。"""
+    conn = db()
+    with conn.cursor() as c:
+        c.execute(
+            "SELECT d.id, d.title, d.cover_key, d.total_episodes, d.status, "
+            "(SELECT COUNT(*) FROM episode e WHERE e.drama_id=d.id AND e.status='READY') AS ready_episodes "
+            "FROM drama d WHERE d.status='ONLINE' ORDER BY d.id DESC")
+        rows = c.fetchall()
+    conn.close()
+    for row in rows:
+        row["ready_episodes"] = int(row["ready_episodes"] or 0)
+        row["total_episodes"] = int(row["total_episodes"] or 0)
+    return {"dramas": rows}
+
+
+@app.get("/api/dramas/{drama_id}")
+def drama_detail(drama_id: int):
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("SELECT id, title, cover_key, total_episodes, status FROM drama WHERE id=%s", (drama_id,))
+        drama = c.fetchone()
+        episodes = _episode_rows(c, drama_id) if drama else []
+    conn.close()
+    if not drama:
+        raise HTTPException(404, "drama not found")
+    drama["total_episodes"] = int(drama["total_episodes"] or 0)
+    return {"drama": drama, "episodes": episodes}
+
+
+@app.get("/api/episodes/{episode_id}")
+def episode_detail(episode_id: int):
+    conn = db()
+    with conn.cursor() as c:
+        c.execute(
+            "SELECT e.id, e.drama_id, e.ep_no, e.title, e.is_paid, e.price_coins, e.asset_id, e.status, a.duration_ms "
+            "FROM episode e LEFT JOIN video_asset a ON a.id = e.asset_id WHERE e.id=%s", (episode_id,))
+        ep = c.fetchone()
+        drama = None
+        if ep:
+            c.execute("SELECT id, title, cover_key, total_episodes, status FROM drama WHERE id=%s", (ep["drama_id"],))
+            drama = c.fetchone()
+    conn.close()
+    if not ep:
+        raise HTTPException(404, "episode not found")
+    ep["is_paid"] = bool(ep["is_paid"])
+    ep["price_coins"] = int(ep["price_coins"] or 0)
+    return {"episode": ep, "drama": drama}
+
+
 # ---------------- 上传：预签名直传 ----------------
 @app.post("/api/episodes/{episode_id}/upload-url")
 def upload_url(episode_id: int):
@@ -260,12 +328,16 @@ def get_episode(episode_id: int) -> dict:
     return ep
 
 
-def sign_hls_path(asset_id: int, expires: int) -> str:
-    """nginx secure_link：md5( 过期时间 + "/" + 资产目录 + " " + 密钥 )，base64url。
-    签的是"整个资产目录"而不是单个文件，所以 m3u8 里的相对路径分片会自动带上同一个签名前缀。"""
+def hls_dir(asset_id: int, expires: int) -> str:
+    """nginx secure_link：md5( 过期时间 + "/" + 资产目录 + " " + 密钥 )，base64url。"""
     raw = f"{expires}/{asset_id} {HLS_SECRET}".encode()
     sig = base64.urlsafe_b64encode(hashlib.md5(raw).digest()).decode().rstrip("=")
-    return f"/hls/{sig}/{expires}/{asset_id}/master.m3u8"
+    return f"/hls/{sig}/{expires}/{asset_id}"
+
+
+def sign_hls_path(asset_id: int, expires: int) -> str:
+    """签的是"整个资产目录"而不是单个文件，所以 m3u8 里的相对路径分片会自动带上同一个签名前缀。"""
+    return f"{hls_dir(asset_id, expires)}/master.m3u8"
 
 
 def make_token(user_id: int, asset_id: int, exp: int) -> str:
@@ -323,9 +395,13 @@ def play(episode_id: int, user_id: int):
 
 
 @app.get("/keys/{asset_id}")
-def get_key(asset_id: int, authorization: str | None = Header(default=None)):
-    """播放器拿 m3u8 里的 #EXT-X-KEY URI 来请求这里。没有合法 token 不给 key，分片偷走了也解不开。"""
-    tok = verify_token((authorization or "").removeprefix("Bearer ").strip())
+def get_key(asset_id: int, authorization: str | None = Header(default=None), token: str | None = None):
+    """播放器拿 m3u8 里的 #EXT-X-KEY URI 来请求这里。没有合法 token 不给 key，分片偷走了也解不开。
+
+    iPhone 自带 HLS 不能给 key 请求加 Authorization 头，所以也接受 ?token=。电脑上的 hls.js 仍走请求头，不把 token 放进分片 URL。
+    """
+    raw = (token or "").strip() or (authorization or "").removeprefix("Bearer ").strip()
+    tok = verify_token(raw)
     if not tok or tok["a"] != asset_id:
         KEY_REQ.labels("denied").inc()
         raise HTTPException(401, "invalid or expired play token")
@@ -340,6 +416,79 @@ def get_key(asset_id: int, authorization: str | None = Header(default=None)):
     KEY_REQ.labels("ok").inc()
     return Response(bytes.fromhex(row["key_hex"]), media_type="application/octet-stream",
                     headers={"Cache-Control": "no-store"})
+
+
+def _require_asset_token(asset_id: int, token: str) -> None:
+    tok = verify_token((token or "").strip())
+    if not tok or tok["a"] != asset_id:
+        raise HTTPException(401, "invalid or expired play token")
+
+
+def _s3_text(key: str) -> str:
+    try:
+        obj = s3_internal.get_object(Bucket=HLS_BUCKET, Key=key)
+        body = obj["Body"]
+        try:
+            return body.read().decode("utf-8", "replace")
+        finally:
+            body.close()
+    except Exception:
+        raise HTTPException(404, "playlist not found")
+
+
+def _rewrite_master(text: str, asset_id: int, token: str) -> str:
+    """把子列表指到本服务，这样 iPhone 拉到的 media playlist 里才能带上 key token。"""
+    q = quote(token, safe="")
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        m = re.fullmatch(r"([A-Za-z0-9_-]+)/index\.m3u8", s)
+        if m:
+            out.append(f"/api/playback/{asset_id}/media.m3u8?rendition={m.group(1)}&token={q}")
+        else:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def _rewrite_media(text: str, asset_id: int, rendition: str, token: str) -> str:
+    prefix = hls_dir(asset_id, int(time.time()) + PLAY_URL_TTL)
+    q = quote(token, safe="")
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("#EXT-X-KEY"):
+            out.append(re.sub(r'URI="([^"]*)"', lambda m: f'URI="{m.group(1).split("?")[0]}?token={q}"', line))
+        elif s and not s.startswith("#"):
+            name = s.split("?", 1)[0].split("/")[-1]
+            if re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+                out.append(f"{prefix}/{rendition}/{name}")
+            else:
+                out.append(line)
+        else:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def _m3u8(text: str) -> Response:
+    return Response(text, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/playback/{asset_id}/master.m3u8")
+def playback_master(asset_id: int, token: str = ""):
+    """Safari / iPhone 不能给分片和 key 加请求头。这里现生成一份播放列表：分片仍走原来的签名 CDN 地址，key 带 ?token=。
+    电脑和 Android 继续直接用 play 接口返回的 master_url，不经过这里，CDN 缓存行为不变。"""
+    _require_asset_token(asset_id, token)
+    text = _s3_text(f"assets/{asset_id}/master.m3u8")
+    return _m3u8(_rewrite_master(text, asset_id, token))
+
+
+@app.get("/api/playback/{asset_id}/media.m3u8")
+def playback_media(asset_id: int, rendition: str, token: str = ""):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", rendition or ""):
+        raise HTTPException(404, "playlist not found")
+    _require_asset_token(asset_id, token)
+    text = _s3_text(f"assets/{asset_id}/{rendition}/index.m3u8")
+    return _m3u8(_rewrite_media(text, asset_id, rendition, token))
 
 
 # ---------------- 统计 ----------------

@@ -1,89 +1,791 @@
 <!doctype html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>drama-vod 测试播放页</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0d0c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>短剧场</title>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <style>
- body{font-family:system-ui,sans-serif;max-width:900px;margin:16px auto;padding:0 12px}
- .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
- video{width:360px;max-width:100%;aspect-ratio:9/16;background:#000}
- pre{background:#f4f4f4;padding:8px;height:320px;overflow:auto;font-size:12px;flex:1;min-width:280px}
+  :root {
+    --bg: #0e0d0c;
+    --ink: #f3eee6;
+    --muted: #a79d92;
+    --line: rgba(243, 238, 230, .12);
+    --gold: #e0b15c;
+    --gold-ink: #1c140b;
+    --danger: #e07a5f;
+    --card: #171512;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html { color-scheme: dark; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font: 15px/1.45 "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+  button, input { font: inherit; color: inherit; }
+  button { cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+  button:disabled { opacity: .38; cursor: default; }
+  :focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+  .ico { display: inline-flex; }
+  .ico svg {
+    width: 20px; height: 20px; display: block;
+    stroke: currentColor; fill: none; stroke-width: 1.8;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+  .ico.fill svg { fill: currentColor; stroke: none; }
+
+  .top {
+    position: sticky; top: 0; z-index: 3;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: calc(12px + env(safe-area-inset-top)) 16px 12px;
+    background: rgba(14, 13, 12, .9);
+    backdrop-filter: blur(14px);
+  }
+  .brand { display: flex; flex-direction: column; gap: 1px; }
+  .brand strong { font-size: 18px; letter-spacing: .04em; }
+  .brand span { font-size: 12px; color: var(--muted); }
+  .uid-wrap { position: relative; }
+  .uid-btn {
+    border: 1px solid var(--line); background: transparent; border-radius: 999px;
+    padding: 8px 12px; color: var(--muted); min-height: 40px;
+  }
+  .uid-pop {
+    position: absolute; right: 0; top: calc(100% + 8px); width: min(240px, 72vw);
+    padding: 12px; background: #1c1916; border: 1px solid var(--line); border-radius: 14px;
+    box-shadow: 0 16px 40px rgba(0,0,0,.4);
+  }
+  .uid-pop label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .uid-pop input {
+    width: 100%; border: 1px solid var(--line); background: #100e0c; border-radius: 10px;
+    padding: 10px 12px; margin-bottom: 8px;
+  }
+  .wrap { width: min(1080px, 100%); margin: 0 auto; padding: 8px 16px 48px; }
+  .home-h { font-size: 22px; margin: 18px 0 12px; font-weight: 720; letter-spacing: -.02em; }
+  .lede, .fine { color: var(--muted); font-size: 13px; }
+  .fine { margin-top: 28px; }
+  .continue {
+    width: 100%; text-align: left; border: 1px solid var(--line); background: #16130f;
+    border-radius: 14px; padding: 12px 14px; display: flex; flex-direction: column; gap: 2px;
+  }
+  .continue span { font-size: 12px; color: var(--gold); }
+  .continue strong { font-size: 16px; }
+  .continue em { font-style: normal; color: var(--muted); font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .card {
+    display: block; width: 100%; padding: 0; border: 0; background: none; text-align: left; color: inherit;
+  }
+  .poster {
+    position: relative; display: flex; flex-direction: column; justify-content: flex-end;
+    aspect-ratio: 3/4; border-radius: 16px; overflow: hidden; padding: 12px;
+    background: #241c16;
+  }
+  .poster::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(to top, rgba(0,0,0,.72) 0%, rgba(0,0,0,.05) 55%);
+  }
+  .glyph {
+    position: absolute; right: -6px; top: 6px; font-size: clamp(64px, 18vw, 96px);
+    font-weight: 760; line-height: .85; opacity: .2; color: #fff;
+  }
+  .card-foot { position: relative; z-index: 1; }
+  .card-title {
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    font-size: 15px; font-weight: 720; line-height: 1.3;
+    text-shadow: 0 1px 8px rgba(0,0,0,.5);
+  }
+  .card-meta { display: block; margin-top: 4px; font-size: 12px; color: rgba(243,238,230,.8); }
+  .card:hover .poster, .card:focus-visible .poster { transform: translateY(-2px); }
+  .poster { transition: transform .18s ease; }
+  .skel {
+    aspect-ratio: 3/4; border-radius: 16px;
+    background: linear-gradient(110deg, #1a1816 30%, #2a241c 48%, #1a1816 62%);
+    background-size: 200% 100%; animation: sk 1.2s ease-in-out infinite;
+  }
+  @keyframes sk { to { background-position: -200% 0; } }
+  .empty { padding: 48px 8px; text-align: center; }
+  .empty strong { display: block; font-size: 18px; margin-bottom: 6px; }
+
+  #watch { background: #000; }
+  .screen { position: relative; background: #000; color: #fff; }
+  .screen video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+  .shade { position: absolute; left: 0; right: 0; z-index: 2; pointer-events: none; }
+  .shade button, .shade input, .shade a { pointer-events: auto; }
+  .topshade {
+    top: 0; display: flex; align-items: center; gap: 8px;
+    padding: calc(10px + env(safe-area-inset-top)) 12px 36px;
+    background: linear-gradient(to bottom, rgba(0,0,0,.62), transparent);
+  }
+  .botshade {
+    bottom: 0; padding: 56px 14px calc(14px + env(safe-area-inset-bottom));
+    background: linear-gradient(to top, rgba(0,0,0,.82), rgba(0,0,0,.15) 72%, transparent);
+  }
+  .back, .ibtn, .sound {
+    width: 44px; height: 44px; border-radius: 50%; border: 1px solid rgba(255,255,255,.18);
+    background: rgba(0,0,0,.35); color: #fff; display: grid; place-items: center;
+  }
+  .back { width: auto; border-radius: 999px; padding: 0 14px 0 10px; gap: 2px; display: inline-flex; align-items: center; }
+  .sound { margin-left: auto; }
+  .pill {
+    font-size: 12px; letter-spacing: .04em;
+    border: 1px solid rgba(255,255,255,.2); border-radius: 999px; padding: 4px 8px;
+    background: rgba(0,0,0,.35);
+  }
+  .now-kicker { margin: 0 0 2px; color: var(--gold); font-size: 12px; letter-spacing: .08em; }
+  .now-title {
+    margin: 0; font-size: 18px; font-weight: 720; line-height: 1.25;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .time-row { display: flex; justify-content: flex-end; font-size: 12px; color: rgba(255,255,255,.75); font-variant-numeric: tabular-nums; }
+  .seek { padding: 4px 0 8px; }
+  .seek input { width: 100%; height: 28px; margin: 0; accent-color: var(--gold); }
+  .iconrow { display: flex; gap: 10px; align-items: center; }
+  .btn {
+    min-height: 44px; border-radius: 999px; padding: 0 16px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  .btn.gold { background: var(--gold); color: var(--gold-ink); border: 0; font-weight: 720; }
+  .btn.ghost { background: transparent; border: 1px solid var(--line); color: var(--ink); }
+  .btn.wide { width: 100%; margin-bottom: 10px; }
+  .bigplay, #opening {
+    position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%); z-index: 3;
+  }
+  .bigplay {
+    width: 68px; height: 68px; border-radius: 50%; border: 0;
+    background: rgba(20, 16, 12, .55); color: #fff; display: grid; place-items: center;
+    backdrop-filter: blur(8px);
+  }
+  .bigplay .ico svg { width: 28px; height: 28px; }
+  #opening {
+    margin: 0; padding: 8px 12px; border-radius: 999px; background: rgba(0,0,0,.55);
+    font-size: 13px; color: #fff;
+  }
+  #gate {
+    position: absolute; inset: 0; z-index: 4;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; padding: 24px; text-align: center; background: rgba(8,7,6,.74);
+  }
+  #gate strong { font-size: 20px; }
+  #gate p { margin: 0; color: rgba(243,238,230,.78); }
+
+  .panel { background: var(--bg); color: var(--ink); }
+  .handle {
+    width: 36px; height: 4px; border-radius: 99px; background: rgba(243,238,230,.28);
+    margin: 8px auto 12px;
+  }
+  .label {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 680; color: #c8bfb2; margin: 22px 0 10px;
+  }
+  .label i { width: 14px; height: 1px; background: var(--gold); display: block; }
+  #drama-title { font-size: 28px; line-height: 1.15; margin: 4px 0 8px; letter-spacing: -.02em; }
+  #drama-meta { margin: 0; color: var(--muted); font-size: 14px; }
+  .side-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .eps { display: grid; grid-template-columns: repeat(auto-fill, minmax(56px, 1fr)); gap: 8px; }
+  .ep {
+    position: relative; aspect-ratio: 1; border-radius: 12px; border: 1px solid var(--line);
+    background: transparent; font-weight: 720; font-variant-numeric: tabular-nums;
+  }
+  .ep.on { background: var(--gold); color: var(--gold-ink); border-color: transparent; }
+  .ep.wait { opacity: .45; }
+  .ep .lock {
+    position: absolute; right: 4px; top: 4px; width: 12px; height: 12px;
+  }
+  .ep .lock svg { width: 12px; height: 12px; }
+  .side-uid { margin-top: 22px; }
+  .linkish {
+    border: 0; background: none; color: var(--muted); padding: 8px 0; min-height: 44px;
+  }
+  #log {
+    margin: 0; white-space: pre-wrap; word-break: break-word;
+    font: 12px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    color: #c8bfb2; background: #141210; border-radius: 12px; padding: 10px;
+    max-height: 220px; overflow: auto;
+  }
+  #log.quiet {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+    clip: rect(0 0 0 0); border: 0;
+  }
+  #toast {
+    position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom));
+    transform: translateX(-50%); z-index: 30; max-width: min(92vw, 420px);
+    background: #2a241c; color: var(--ink); border: 1px solid rgba(224,177,92,.45);
+    border-radius: 999px; padding: 10px 14px; font-size: 14px; text-align: center;
+  }
+  #backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 4; }
+
+  @media (max-width: 879px) {
+    body.watching { overflow: hidden; height: 100vh; height: 100dvh; }
+    #watch { position: fixed; inset: 0; z-index: 5; }
+    #watch .screen { width: 100%; height: 100vh; height: 100dvh; }
+    #watch .panel {
+      position: fixed; z-index: 6; left: 0; right: 0; bottom: 0;
+      max-height: min(72dvh, 560px); overflow: auto; -webkit-overflow-scrolling: touch;
+      transform: translateY(110%);
+      border-radius: 18px 18px 0 0;
+      padding: 0 16px calc(16px + env(safe-area-inset-bottom));
+      background: #161411;
+      transition: transform .28s ease;
+    }
+    #watch.sheet .panel { transform: translateY(0); }
+  }
+  @media (max-width: 879px) and (orientation: landscape) {
+    #watch .stage { display: flex; height: 100vh; height: 100dvh; }
+    #watch .screen { width: min(46vw, 100%); height: 100%; flex: none; }
+    #watch .panel {
+      position: relative; transform: none; max-height: none; flex: 1;
+      border-radius: 0; background: var(--bg);
+    }
+    #watch .handle, #backdrop { display: none !important; }
+  }
+  @media (min-width: 640px) {
+    .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+    .wrap { padding-left: 28px; padding-right: 28px; }
+  }
+  @media (min-width: 880px) {
+    .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; }
+    #watch { background: var(--bg); min-height: 100vh; min-height: 100dvh; }
+    body.watching {
+      background:
+        radial-gradient(ellipse 42% 70% at 24% 48%, rgba(224, 177, 92, .09), transparent 62%),
+        var(--bg);
+    }
+    #watch .stage {
+      display: grid; grid-template-columns: auto minmax(280px, 1fr);
+      gap: 40px; align-items: center;
+      width: min(1120px, calc(100% - 64px)); margin: 0 auto;
+      min-height: 100vh; min-height: 100dvh; padding: 28px 0;
+    }
+    #watch .screen {
+      height: min(86dvh, 840px);
+      width: calc(min(86dvh, 840px) * 9 / 16);
+      aspect-ratio: 9/16;
+      border-radius: 18px; overflow: hidden;
+      box-shadow: 0 24px 80px rgba(0,0,0,.45);
+    }
+    #watch .panel { max-height: 86dvh; overflow: auto; padding-right: 6px; }
+    .handle { display: none; }
+  }
+  @media (min-width: 960px) {
+    .grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
 </style>
 </head>
 <body>
-<h3>drama-vod 测试播放页（hls.js）</h3>
-<div class="row">
-  user_id <input id="uid" value="1001" size="6">
-  episode_id <input id="eid" value="1" size="6">
-  <button onclick="play()">播放</button>
-  <button onclick="unlock()">解锁本集（模拟购买）</button>
-  <button onclick="play(nextEp)">下一集</button>
-</div>
-<div class="row" id="status"></div>
-<div class="row" style="align-items:flex-start">
-  <video id="v" controls muted playsinline></video>
-  <pre id="log"></pre>
-</div>
+  <div id="home">
+    <header class="top">
+      <div class="brand"><strong>短剧场</strong><span>drama-vod</span></div>
+      <div class="uid-wrap">
+        <button class="uid-btn" id="uid-btn" type="button">观众 1001</button>
+        <div class="uid-pop" id="uid-pop" hidden>
+          <label for="uid">观众编号</label>
+          <input id="uid" inputmode="numeric" value="1001" autocomplete="off">
+          <button class="btn gold" id="uid-save" type="button" style="width:100%">确定</button>
+        </div>
+      </div>
+    </header>
+    <main class="wrap">
+      <button class="continue" id="continue" type="button" hidden>
+        <span>继续播放</span>
+        <strong id="cont-title"></strong>
+        <em id="cont-ep"></em>
+      </button>
+      <h1 class="home-h">在播</h1>
+      <div id="grid" class="grid" aria-live="polite"></div>
+      <div id="empty" class="empty" hidden>
+        <strong>还没有上架的剧</strong>
+        <p class="lede">上传并转码完成后，会出现在这里。</p>
+      </div>
+      <p class="fine">本地演示。解锁只写一条记录，不扣金币。</p>
+    </main>
+  </div>
+
+  <div id="watch" hidden>
+    <div class="stage">
+      <div class="screen">
+        <video id="v" playsinline webkit-playsinline muted></video>
+        <div class="shade topshade">
+          <button class="back" id="back" type="button" aria-label="返回剧场"></button>
+          <span id="q" class="pill" hidden></span>
+          <button class="sound" id="sound" type="button" aria-label="开启声音"></button>
+        </div>
+        <button class="bigplay" id="bigplay" type="button" aria-label="播放" hidden></button>
+        <p id="opening" hidden>正在打开</p>
+        <div id="gate" hidden>
+          <strong id="gate-title"></strong>
+          <p id="gate-sub"></p>
+          <button class="btn gold" id="gate-go" type="button"></button>
+        </div>
+        <div class="shade botshade">
+          <p class="now-kicker" id="now-kicker"></p>
+          <p class="now-title" id="now-title"></p>
+          <div class="time-row"><span id="time">0:00</span></div>
+          <div class="seek"><input id="seek" type="range" min="0" max="1000" value="0" aria-label="进度"></div>
+          <button class="btn gold wide" id="btn-unlock" type="button" hidden>解锁并播放</button>
+          <div class="iconrow">
+            <button class="ibtn" id="btn-play" type="button" aria-label="播放或暂停"></button>
+            <button class="ibtn" id="btn-next" type="button" aria-label="下一集"></button>
+            <button class="ibtn" id="btn-eps" type="button" aria-label="选集"></button>
+          </div>
+        </div>
+      </div>
+      <aside class="panel" id="panel">
+        <div class="handle" id="handle"></div>
+        <p class="now-kicker" id="side-kicker">选集</p>
+        <h1 id="drama-title">短剧</h1>
+        <p id="drama-meta"></p>
+        <div class="side-actions">
+          <button class="btn gold" id="side-unlock" type="button" hidden>解锁并播放</button>
+          <button class="btn ghost" id="side-next" type="button">下一集</button>
+        </div>
+        <h2 class="label"><i></i>选集</h2>
+        <div id="eps" class="eps"></div>
+        <div class="side-uid">
+          <button class="linkish" id="log-toggle" type="button">技术日志</button>
+          <pre id="log" class="quiet"></pre>
+        </div>
+      </aside>
+    </div>
+    <div id="backdrop" hidden></div>
+  </div>
+  <div id="toast" hidden role="status"></div>
+
 <script>
+// browser_check.py 依赖：#v、#log、window.vodState，以及 ?ep= 时自动 play()。
 const $ = id => document.getElementById(id);
 const logEl = $('log');
-function log(...a){ logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = 1e9; }
-let hls, nextEp = null, t0 = 0;
-window.vodState = {firstFrameMs: null, level: null, errors: []};
+function log(...a) { logEl.textContent += a.join(' ') + '\n'; logEl.scrollTop = 1e9; }
+window.vodState = { firstFrameMs: null, level: null, errors: [] };
 
-async function unlock(){
-  const r = await fetch(`/api/users/${$('uid').value}/unlock`, {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify({episode_id: +$('eid').value})});
-  log('unlock', r.status);
+const PALETTES = [
+  ['#3a2a1c', '#8c5a2e'],
+  ['#1b2830', '#3e6e78'],
+  ['#2a1c28', '#7a4568'],
+  ['#1c2418', '#5d7044'],
+  ['#2c1c16', '#a85a3a'],
+  ['#1b1d2a', '#4d5d8a'],
+];
+const ICONS = {
+  back: '<path d="M15 6 9 12l6 6"/>',
+  play: '<path d="M9 7v10l9-5z"/>',
+  pause: '<path d="M7 6h3.5v12H7zM13.5 6H17v12h-3.5z"/>',
+  next: '<path d="M6 6v12l9-6zM17 6v12"/>',
+  list: '<path d="M5 7h14M5 12h14M5 17h10"/>',
+  lock: '<rect x="6" y="11" width="12" height="8" rx="1.5"/><path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3"/>',
+  sound: '<path d="M4 10v4h3l4 3V7L7 10H4zM16 9a4 4 0 0 1 0 6"/>',
+  mute: '<path d="M4 10v4h3l4 3V7L7 10H4zM16 10l4 4M20 10l-4 4"/>',
+};
+function icon(name, fill) {
+  const span = document.createElement('span');
+  span.className = 'ico' + (fill ? ' fill' : '');
+  span.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+  return span;
+}
+function setIcon(el, name, fill) {
+  el.replaceChildren(icon(name, fill));
 }
 
-async function play(epId){
-  if (epId) $('eid').value = epId;
+const state = { dramas: [], drama: null, episodes: [], episodeId: null, token: null, assetId: null };
+let hls = null, nextEp = null, t0 = 0, playGen = 0, seeking = false, soundOn = false, toastTimer = 0;
+
+function wide() { return matchMedia('(min-width: 880px)').matches; }
+function landscapePhone() { return matchMedia('(max-width: 879px) and (orientation: landscape)').matches; }
+function currentUid() { return ($('uid').value || '1001').trim(); }
+function uidLabel() { $('uid-btn').textContent = '观众 ' + currentUid(); }
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 3200);
+}
+function fmt(s) {
+  if (!Number.isFinite(s)) return '--:--';
+  s = Math.max(0, Math.floor(s));
+  const m = Math.floor(s / 60);
+  return m + ':' + String(s % 60).padStart(2, '0');
+}
+function epName(ep) {
+  const t = (ep.title || '').trim();
+  const base = '第 ' + ep.ep_no + ' 集';
+  if (!t || t === '第' + ep.ep_no + '集') return base;
+  return base + ' · ' + t;
+}
+function clockMs(ms) {
+  if (!ms) return '';
+  return fmt(ms / 1000);
+}
+async function api(path) {
+  const r = await fetch(path);
+  if (r.status === 404 && path === '/api/dramas') return { missing: true };
+  if (!r.ok) throw new Error(path + ' ' + r.status);
+  return r.json();
+}
+function readLast() {
+  try { return JSON.parse(localStorage.getItem('vod.last') || 'null'); } catch { return null; }
+}
+function writeLast(ep, drama) {
+  try {
+    localStorage.setItem('vod.last', JSON.stringify({
+      id: ep.id, drama_id: drama && drama.id, drama_title: drama && drama.title,
+      ep_no: ep.ep_no, title: ep.title || ''
+    }));
+    localStorage.setItem('vod.uid', currentUid());
+  } catch { /* 隐私模式忽略 */ }
+}
+
+function showHome() {
+  $('watch').hidden = true;
+  $('home').hidden = false;
+  document.body.classList.remove('watching');
+  closeSheet();
+  $('v').pause();
+  const u = new URL(location.href);
+  if (u.searchParams.has('ep')) {
+    u.searchParams.delete('ep');
+    history.replaceState(null, '', u);
+  }
+  document.title = '短剧场';
+  loadDramas();
+}
+function showWatch() {
+  $('home').hidden = true;
+  $('watch').hidden = false;
+  document.body.classList.add('watching');
+}
+function openSheet() {
+  if (wide() || landscapePhone()) {
+    $('eps').scrollIntoView({ block: 'nearest' });
+    return;
+  }
+  $('watch').classList.add('sheet');
+  $('backdrop').hidden = false;
+}
+function closeSheet() {
+  $('watch').classList.remove('sheet');
+  $('backdrop').hidden = true;
+}
+
+function renderHome() {
+  const grid = $('grid');
+  grid.replaceChildren();
+  const last = readLast();
+  const cont = $('continue');
+  if (last && last.id) {
+    $('cont-title').textContent = last.drama_title || '上次看到';
+    $('cont-ep').textContent = '第 ' + (last.ep_no || '?') + ' 集';
+    cont.hidden = false;
+    cont.onclick = () => last.drama_id ? openDrama(last.drama_id, last.id) : play(last.id, { gesture: true });
+  } else cont.hidden = true;
+  if (!state.dramas.length) {
+    $('empty').hidden = false;
+    return;
+  }
+  $('empty').hidden = true;
+  for (const d of state.dramas) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'card';
+    btn.setAttribute('aria-label', (d.title || '未命名') + '，' + d.ready_episodes + ' 集可播');
+    const poster = document.createElement('span');
+    poster.className = 'poster';
+    const [a, b] = PALETTES[(d.id || 0) % PALETTES.length];
+    poster.style.backgroundImage = `linear-gradient(165deg, ${a}, ${b})`;
+    const glyph = document.createElement('span');
+    glyph.className = 'glyph';
+    glyph.textContent = ((d.title || '剧').trim() || '剧')[0];
+    const foot = document.createElement('span');
+    foot.className = 'card-foot';
+    const title = document.createElement('span');
+    title.className = 'card-title';
+    title.textContent = d.title || '未命名';
+    const meta = document.createElement('span');
+    meta.className = 'card-meta';
+    meta.textContent = d.ready_episodes + '/' + d.total_episodes + ' 可播';
+    foot.append(title, meta);
+    poster.append(glyph, foot);
+    btn.append(poster);
+    btn.onclick = () => openDrama(d.id);
+    grid.append(btn);
+  }
+}
+function skeletons() {
+  const grid = $('grid');
+  grid.replaceChildren();
+  for (let i = 0; i < 6; i++) {
+    const s = document.createElement('div');
+    s.className = 'skel';
+    grid.append(s);
+  }
+}
+async function loadDramas() {
+  skeletons();
+  $('empty').hidden = true;
+  $('empty').querySelector('strong').textContent = '还没有上架的剧';
+  $('empty').querySelector('.lede').textContent = '上传并转码完成后，会出现在这里。';
+  try {
+    const data = await api('/api/dramas');
+    if (data && data.missing) {
+      $('empty').hidden = false;
+      $('empty').querySelector('strong').textContent = '剧列表还没接上';
+      $('empty').querySelector('.lede').textContent = '播放页已更新。请重新构建 api 后再刷新。';
+      $('grid').replaceChildren();
+      return;
+    }
+    state.dramas = data.dramas || [];
+    renderHome();
+  } catch (e) {
+    $('grid').replaceChildren();
+    $('empty').hidden = false;
+    $('empty').querySelector('strong').textContent = '剧列表没有加载出来';
+    $('empty').querySelector('.lede').textContent = '确认服务已启动后刷新。';
+    log('list', e.message);
+  }
+}
+
+function fillNow(ep, drama) {
+  if (!ep) return;
+  $('now-kicker').textContent = drama && drama.title ? drama.title : '短剧';
+  $('now-title').textContent = epName(ep);
+  document.title = epName(ep);
+}
+function renderPanel() {
+  const drama = state.drama;
+  const eps = state.episodes || [];
+  $('drama-title').textContent = (drama && drama.title) || '短剧';
+  const ready = eps.filter(e => e.status === 'READY').length;
+  const bits = [ready + '/' + eps.length + ' 可播'];
+  if (drama && drama.status && drama.status !== 'ONLINE') bits.push(drama.status);
+  $('drama-meta').textContent = bits.join(' · ');
+  const box = $('eps');
+  box.replaceChildren();
+  for (const ep of eps) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ep' + (ep.id === state.episodeId ? ' on' : '') + (ep.status === 'READY' ? '' : ' wait');
+    b.textContent = String(ep.ep_no);
+    b.setAttribute('aria-label', epName(ep) + (ep.is_paid ? '，付费' : '') + (ep.status === 'READY' ? '' : '，转码中'));
+    if (ep.is_paid) {
+      const lock = icon('lock');
+      lock.classList.add('lock');
+      b.append(lock);
+    }
+    b.onclick = () => { closeSheet(); play(ep.id, { gesture: true }); };
+    box.append(b);
+  }
+  const cur = eps.find(e => e.id === state.episodeId);
+  if (cur) {
+    const extra = [];
+    if (cur.is_paid) extra.push(cur.price_coins ? cur.price_coins + ' 金币' : '付费');
+    if (cur.duration_ms) extra.push(clockMs(cur.duration_ms));
+    if (cur.status !== 'READY') extra.push('转码中');
+    if (extra.length) $('drama-meta').textContent += ' · ' + extra.join(' · ');
+    fillNow(cur, drama);
+  }
+}
+
+function setLocked(on) {
+  $('btn-unlock').hidden = !on;
+  $('side-unlock').hidden = !on;
+}
+function setQuality(n) {
+  const el = $('q');
+  if (!n) { el.hidden = true; el.textContent = ''; return; }
+  el.hidden = false;
+  el.textContent = n + 'p';
+}
+function updateSound() {
+  setIcon($('sound'), soundOn ? 'sound' : 'mute');
+  $('sound').setAttribute('aria-label', soundOn ? '关闭声音' : '开启声音');
+  $('v').muted = !soundOn;
+}
+function updatePlayIcon() {
+  const paused = $('v').paused;
+  setIcon($('btn-play'), paused ? 'play' : 'pause', true);
+  $('bigplay').hidden = !paused || !$('gate').hidden || !$('opening').hidden;
+}
+function showGate(title, sub, label, action) {
+  $('opening').hidden = true;
+  $('gate').hidden = false;
+  $('gate-title').textContent = title;
+  $('gate-sub').textContent = sub || '';
+  const go = $('gate-go');
+  if (!label) { go.hidden = true; }
+  else {
+    go.hidden = false;
+    go.textContent = label;
+    go.onclick = action;
+  }
+  updatePlayIcon();
+}
+function hideGate() { $('gate').hidden = true; updatePlayIcon(); }
+
+function clearPlayer() {
+  const v = $('v');
+  v.onerror = null;
+  if (hls) { hls.destroy(); hls = null; }
+  v.pause();
+  v.removeAttribute('src');
+  try { v.load(); } catch (e) { /* 切集时清掉上一集 */ }
+}
+function useNative() {
+  return !(window.Hls && Hls.isSupported()) && !!$('v').canPlayType('application/vnd.apple.mpegurl');
+}
+function rememberQuery(id) {
+  const u = new URL(location.href);
+  u.searchParams.set('ep', id);
+  u.searchParams.set('uid', currentUid());
+  history.replaceState(null, '', u);
+}
+
+async function play(epId, opts) {
+  opts = opts || {};
+  if (epId) state.episodeId = +epId;
+  const gen = ++playGen;
+  showWatch();
+  $('v').pause();
+  hideGate();
+  setLocked(false);
+  setQuality(null);
+  $('opening').hidden = false;
   t0 = performance.now();
-  const r = await fetch(`/api/episodes/${$('eid').value}/play?user_id=${$('uid').value}`);
-  const info = await r.json();
-  if (!r.ok){ log('play 被拒', r.status, JSON.stringify(info)); window.vodState.errors.push(r.status); return; }
+  window.vodState.firstFrameMs = null;
+  window.vodState.level = null;
+  window.vodState.errors = [];
+  nextEp = null;
+  $('btn-next').disabled = true;
+  $('side-next').disabled = true;
+  rememberQuery(state.episodeId);
+  renderPanel();
+  let r;
+  try {
+    r = await fetch('/api/episodes/' + state.episodeId + '/play?user_id=' + encodeURIComponent(currentUid()));
+  } catch (e) {
+    if (gen !== playGen) return;
+    $('opening').hidden = true;
+    log('play', e.message);
+    showGate('网络不通', '播放服务没有响应。', '重试', () => play(state.episodeId, { gesture: true }));
+    return;
+  }
+  if (gen !== playGen) return;
+  let info = null;
+  try { info = await r.json(); } catch { info = {}; }
+  if (!r.ok) {
+    $('v').pause();
+    $('opening').hidden = true;
+    log('play 被拒', r.status, JSON.stringify(info));
+    window.vodState.errors.push(r.status);
+    if (r.status === 402) {
+      setLocked(true);
+      showGate('本集需要解锁', '解锁后即可播放。演示不扣金币。', '解锁并播放', () => unlockAndPlay(state.episodeId));
+    } else if (r.status === 409) {
+      showGate('还在转码', '这一集还不能播。', '再试一次', () => play(state.episodeId, { gesture: true }));
+    } else {
+      showGate('暂时无法播放', info.detail || ('错误 ' + r.status), '返回', showHome);
+    }
+    return;
+  }
   log('拿到签名地址', info.master_url, '加密=', info.encrypted);
-  nextEp = info.next && !info.next.locked ? info.next.episode_id : null;
-  if (hls) hls.destroy();
+  state.token = info.token;
+  state.assetId = info.asset_id;
+  nextEp = info.next ? info.next.episode_id : null;
+  $('btn-next').disabled = !nextEp;
+  $('side-next').disabled = !nextEp;
+  const cur = (state.episodes || []).find(e => e.id === state.episodeId);
+  if (cur) writeLast(cur, state.drama);
+  if (opts.gesture) soundOn = true;
+  clearPlayer();
+  const v = $('v');
+  v.muted = !soundOn;
+  updateSound();
+  if (useNative()) await attachNative(v, info);
+  else attachHls(v, info);
+  if (gen !== playGen) return;
+  try { await v.play(); }
+  catch (e) {
+    log('autoplay', e.message);
+    soundOn = false;
+    v.muted = true;
+    updateSound();
+    try { await v.play(); } catch (e2) { log('autoplay', e2.message); }
+  }
+  updatePlayIcon();
+}
+
+function attachHls(v, info) {
+  if (!(window.Hls && Hls.isSupported())) {
+    showGate('这个浏览器播不了', '需要 HLS 支持。', '返回', showHome);
+    return;
+  }
   hls = new Hls({
-    startLevel: 0,                  // 弱网/高 RTT（比如 Tailscale DERP）先从最低档起播
-    capLevelToPlayerSize: true,     // 不选比播放器尺寸大的档，省流量
-    maxBufferLength: 60,            // 多攒一点缓冲，扛高延迟抖动
+    startLevel: 0,
+    capLevelToPlayerSize: true,
+    maxBufferLength: 60,
     maxMaxBufferLength: 120,
     fragLoadingTimeOut: 20000,
     manifestLoadingTimeOut: 20000,
-    abrEwmaDefaultEstimate: 300000, // 默认按 ~300kbps 估，避免一上来就冲高档
-    // key 请求带上播放 token；分片和 m3u8 已经由 URL 里的签名保护
+    abrEwmaDefaultEstimate: 300000,
     xhrSetup: (xhr, url) => { if (url.includes('/keys/')) xhr.setRequestHeader('Authorization', 'Bearer ' + info.token); }
   });
-  hls.on(Hls.Events.MANIFEST_PARSED, (_, d) => log('master 解析完成，档位:', d.levels.map(l => Math.min(l.width,l.height) + 'p@' + Math.round(l.bitrate/1000) + 'k').join(' ')));
-  hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => { const l = hls.levels[d.level]; window.vodState.level = Math.min(l.width,l.height); log('切档 ->', Math.min(l.width,l.height) + 'p'); });
+  hls.on(Hls.Events.MANIFEST_PARSED, (_, d) => {
+    $('opening').hidden = true;
+    log('master 解析完成，档位:', d.levels.map(l => Math.min(l.width, l.height) + 'p@' + Math.round(l.bitrate / 1000) + 'k').join(' '));
+  });
+  hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => {
+    const l = hls.levels[d.level];
+    const px = Math.min(l.width, l.height);
+    window.vodState.level = px;
+    setQuality(px);
+    log('切档 ->', px + 'p');
+  });
   hls.on(Hls.Events.FRAG_LOADED, (_, d) => {
     const ms = Math.round(d.frag.stats.loading.end - d.frag.stats.loading.start);
-    $('status').textContent =
-      `当前档 ${(l => l ? Math.min(l.width,l.height) : '-')(hls.levels[hls.currentLevel])}p | 带宽估计 ${Math.round(hls.bandwidthEstimate/1000)} kbps | 缓冲 ${($('v').buffered.length? ($('v').buffered.end(0)-$('v').currentTime).toFixed(1):0)}s | 分片 ${d.frag.sn} 用时 ${ms} ms`;
-    // 缓冲够了、带宽也够了再预加载下一集，避免和当前播放抢带宽
+    log('分片', d.frag.sn, ms + 'ms');
     if (info.next && !info.next.locked && !window._preloaded && hls.bandwidthEstimate > 600000
-        && $('v').buffered.length && ($('v').buffered.end(0) - $('v').currentTime) > 8) {
-      window._preloaded = true; preload(info.next);
+        && v.buffered.length && (v.buffered.end(0) - v.currentTime) > 8) {
+      window._preloaded = true;
+      preload(info.next);
     }
   });
-  hls.on(Hls.Events.ERROR, (_, d) => { log('ERROR', d.type, d.details, d.response?.code || ''); window.vodState.errors.push(d.details); });
+  hls.on(Hls.Events.ERROR, (_, d) => {
+    log('ERROR', d.type, d.details, d.response && d.response.code || '');
+    window.vodState.errors.push(d.details);
+    if (d.fatal) showGate('播放中断', d.details || '', '重试', () => play(state.episodeId, { gesture: true }));
+  });
   window._preloaded = false;
   hls.loadSource(info.master_url);
-  hls.attachMedia($('v'));
-  $('v').onplaying = () => { const ms = Math.round(performance.now() - t0);
-    if (window.vodState.firstFrameMs === null) window.vodState.firstFrameMs = ms;
-    log('开始播放，点击到首帧(本机实测)', ms, 'ms'); };
-  $('v').play().catch(e => log('autoplay', e.message));
+  hls.attachMedia(v);
 }
 
-// 预加载下一集：拉 master、最低档 m3u8 和它的第一个分片，让下一集"秒开"（顺便把 CDN 缓存也预热了）
-async function preload(n){
-  try{
+async function attachNative(v, info) {
+  // iPhone 不能给 key 请求加头。改写后的列表仍把分片指回原来的签名地址。
+  const url = '/api/playback/' + info.asset_id + '/master.m3u8?token=' + encodeURIComponent(info.token);
+  const probe = await fetch(url, { method: 'GET' });
+  if (probe.ok) {
+    v.src = url;
+    log('native HLS', url.split('?')[0]);
+  } else {
+    v.src = info.master_url;
+    log('native HLS 回退到签名地址', probe.status);
+  }
+  $('opening').hidden = true;
+  v.onerror = () => {
+    window.vodState.errors.push('native');
+    showGate('手机播放失败', '免费集可直接播。付费集需要重新构建 api。', '重试', () => play(state.episodeId, { gesture: true }));
+  };
+}
+
+async function preload(n) {
+  try {
     const base = n.master_url.replace(/master\.m3u8$/, '');
     const master = await (await fetch(n.master_url)).text();
     const variants = master.split('\n').filter(l => l && !l.startsWith('#'));
@@ -91,13 +793,135 @@ async function preload(n){
     const media = await (await fetch(base + low)).text();
     const seg0 = media.split('\n').find(l => l && !l.startsWith('#'));
     await fetch(base + low.replace(/index\.m3u8$/, '') + seg0);
-    log('已预加载下一集', n.episode_id, '的 master + 首片', low.replace('/index.m3u8',''));
-  }catch(e){ log('预加载失败', e.message); }
+    log('已预加载下一集', n.episode_id, '的 master + 首片');
+  } catch (e) { log('预加载失败', e.message); }
 }
-// ?ep=1 自动播放（便于无头浏览器验证）
-const _q = new URLSearchParams(location.search);
-if (_q.get('ep')) { if (_q.get('uid')) $('uid').value = _q.get('uid'); play(+_q.get('ep')); }
-setInterval(() => { document.title = JSON.stringify(window.vodState); }, 500);
+
+async function unlockAndPlay(epId) {
+  const id = epId || state.episodeId;
+  const r = await fetch('/api/users/' + encodeURIComponent(currentUid()) + '/unlock', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ episode_id: +id })
+  });
+  log('unlock', r.status);
+  if (!r.ok) { toast('解锁失败'); return; }
+  toast('已解锁');
+  play(id, { gesture: true });
+}
+async function openDrama(dramaId, epId) {
+  showWatch();
+  $('opening').hidden = false;
+  try {
+    const detail = await api('/api/dramas/' + dramaId);
+    state.drama = detail.drama;
+    state.episodes = detail.episodes || [];
+    renderPanel();
+    const ep = epId
+      ? state.episodes.find(e => e.id === +epId) || { id: +epId }
+      : state.episodes.find(e => e.status === 'READY' && e.asset_id) || state.episodes[0];
+    if (!ep) {
+      showGate('这部剧还没有集', '', '返回', showHome);
+      return;
+    }
+    play(ep.id, { gesture: true });
+  } catch (e) {
+    log('open', e.message);
+    if (epId) play(epId, { gesture: true });
+    else showGate('打不开这部剧', '', '返回', showHome);
+  }
+}
+async function loadContext(epId) {
+  try {
+    const meta = await api('/api/episodes/' + epId);
+    state.drama = meta.drama;
+    fillNow(meta.episode, meta.drama);
+    if (meta.drama) {
+      const detail = await api('/api/dramas/' + meta.drama.id);
+      state.drama = detail.drama;
+      state.episodes = detail.episodes || [];
+      renderPanel();
+    }
+  } catch (e) { log('context', e.message); }
+}
+
+function togglePlay() {
+  const v = $('v');
+  if (v.paused) {
+    soundOn = true;
+    updateSound();
+    v.play().catch(e => log('play', e.message));
+  } else v.pause();
+  updatePlayIcon();
+}
+function applySeek() {
+  const v = $('v');
+  if (!Number.isFinite(v.duration) || !v.duration) return;
+  v.currentTime = ($('seek').value / 1000) * v.duration;
+}
+
+$('back').append(icon('back'), document.createTextNode('剧场'));
+setIcon($('bigplay'), 'play', true);
+setIcon($('btn-play'), 'play', true);
+setIcon($('btn-next'), 'next');
+setIcon($('btn-eps'), 'list');
+updateSound();
+
+$('back').onclick = showHome;
+$('bigplay').onclick = togglePlay;
+$('btn-play').onclick = togglePlay;
+$('v').onclick = togglePlay;
+$('btn-next').onclick = () => { if (nextEp) play(nextEp, { gesture: true }); };
+$('side-next').onclick = () => { if (nextEp) play(nextEp, { gesture: true }); };
+$('btn-eps').onclick = openSheet;
+$('btn-unlock').onclick = () => unlockAndPlay(state.episodeId);
+$('side-unlock').onclick = () => unlockAndPlay(state.episodeId);
+$('handle').onclick = closeSheet;
+$('backdrop').onclick = closeSheet;
+$('sound').onclick = () => { soundOn = !soundOn; updateSound(); if (soundOn) $('v').play().catch(() => {}); };
+$('log-toggle').onclick = () => $('log').classList.toggle('quiet');
+$('uid-btn').onclick = () => { $('uid-pop').hidden = !$('uid-pop').hidden; };
+$('uid-save').onclick = () => { uidLabel(); $('uid-pop').hidden = true; try { localStorage.setItem('vod.uid', currentUid()); } catch {} };
+$('seek').addEventListener('pointerdown', () => { seeking = true; });
+$('seek').addEventListener('pointerup', () => { seeking = false; applySeek(); });
+$('seek').addEventListener('change', () => { seeking = false; applySeek(); });
+$('v').addEventListener('timeupdate', () => {
+  const v = $('v');
+  if (!seeking && Number.isFinite(v.duration) && v.duration) $('seek').value = String(Math.round(v.currentTime / v.duration * 1000));
+  $('time').textContent = fmt(v.currentTime) + ' / ' + fmt(v.duration);
+});
+$('v').addEventListener('play', updatePlayIcon);
+$('v').addEventListener('pause', updatePlayIcon);
+$('v').addEventListener('ended', () => { if (nextEp) play(nextEp, { gesture: true }); else updatePlayIcon(); });
+$('v').onplaying = () => {
+  $('opening').hidden = true;
+  hideGate();
+  const ms = Math.round(performance.now() - t0);
+  if (window.vodState.firstFrameMs === null) window.vodState.firstFrameMs = ms;
+  log('开始播放，点击到首帧', ms, 'ms');
+  updatePlayIcon();
+};
+document.addEventListener('keydown', (e) => {
+  if (e.target.closest('input, textarea')) return;
+  if ($('home').hidden && e.code === 'Space') { e.preventDefault(); togglePlay(); }
+  if ($('home').hidden && e.code === 'ArrowRight' && nextEp) play(nextEp, { gesture: true });
+  if (e.key === 'Escape') { if ($('watch').classList.contains('sheet')) closeSheet(); else if ($('home').hidden) showHome(); }
+});
+
+try {
+  const saved = localStorage.getItem('vod.uid');
+  if (saved) $('uid').value = saved;
+} catch {}
+const q = new URLSearchParams(location.search);
+if (q.get('uid')) $('uid').value = q.get('uid');
+uidLabel();
+if (q.get('ep')) {
+  setInterval(() => { document.title = JSON.stringify(window.vodState); }, 500);
+  showWatch();
+  play(+q.get('ep'));
+  loadContext(+q.get('ep'));
+} else {
+  loadDramas();
+}
 </script>
 </body>
 </html>

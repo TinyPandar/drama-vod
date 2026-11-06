@@ -16,7 +16,7 @@ drama-vod/
 │   ├── worker.py common.py requirements.txt Dockerfile (静态 ffmpeg 7.1)
 ├── nginx/
 │   ├── templates/default.conf.template  # :8080 播放/API/key/HLS(secure_link+cache)；:9000 上传网关(只放行 PUT)
-│   └── html/index.html                  # hls.js 测试播放页（ABR 日志、首帧耗时、下一集预加载）
+│   └── html/index.html                  # 播放页：手机全屏 / 电脑左播右选；?ep= 仍直接开播
 ├── prometheus/prometheus.yml
 └── scripts/
     ├── e2e.py                    # 端到端验证（只用标准库 + 本机 ffmpeg）
@@ -40,12 +40,14 @@ docker compose ps                       # mysql 健康后 api/worker 会自动�
 
 | 地址 | 用途 |
 |---|---|
-| http://localhost:8080 | hls.js 测试播放页（`?ep=1&uid=7` 自动播放） |
+| http://localhost:8080 | 播放页（手机全屏、电脑左右分栏；`?ep=1&uid=7` 仍直接开播） |
 | http://localhost:8080/api/... | API（经 nginx，带 X-Request-ID） |
 | http://localhost:9000 | 上传网关（只接受预签名 PUT，转发 MinIO） |
 | http://localhost:9001 | MinIO 控制台（minioadmin / minioadmin123） |
 | http://localhost:15672 | RabbitMQ 管理台（guest / guest） |
 | http://localhost:9090 | Prometheus（obs profile） |
+
+播放页刷新即可更新（`nginx/html` 是挂载进去的）。剧列表和 iPhone 付费集播放要重新构建 api：`docker compose up -d --build api`。手机请用这台电脑的局域网地址，不要用 `localhost`。
 
 ## 3. 验证
 
