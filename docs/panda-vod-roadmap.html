@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light">
+<title>Panda VOD · 技术方案与开发路线图</title>
+<style>
+:root{--bg:#f5f7fb;--paper:#fff;--ink:#172033;--muted:#64748b;--line:#e5eaf2;--blue:#315efb;--blue2:#eaf0ff;--green:#087f5b;--amber:#a45b00;--shadow:0 10px 30px rgba(25,40,75,.06)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.75 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}.shell{display:grid;grid-template-columns:260px minmax(0,900px);gap:34px;max-width:1260px;margin:auto;padding:34px 28px}
+aside{position:sticky;top:24px;height:calc(100vh - 48px);overflow:auto;padding:22px 18px;background:var(--paper);border:1px solid var(--line);border-radius:18px}
+.brand{font-weight:800;font-size:20px;letter-spacing:-.5px}.brand span{color:var(--blue)}.tagline{font-size:12px;color:var(--muted);margin:2px 0 22px}
+nav a{display:block;padding:7px 10px;margin:2px 0;border-radius:8px;color:#536078;font-size:13px}nav a:hover{background:var(--blue2);text-decoration:none;color:var(--blue)}
+main{min-width:0}.hero{padding:42px 42px 38px;background:linear-gradient(135deg,#14234a,#263f83 62%,#315efb);border-radius:22px;color:#fff;box-shadow:var(--shadow)}
+.eyebrow{font-size:12px;letter-spacing:1.5px;text-transform:uppercase;color:#c5d3ff}.hero h1{font-size:38px;line-height:1.2;letter-spacing:-1.2px;margin:12px 0}.hero p{max-width:700px;color:#e0e8ff;margin:12px 0 0}.meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.pill{font-size:12px;border:1px solid #ffffff55;border-radius:99px;padding:4px 10px;color:#eef2ff}
+section{margin-top:28px;padding:30px 32px;background:var(--paper);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);scroll-margin-top:22px}
+h2{font-size:23px;letter-spacing:-.4px;margin:0 0 14px}h3{font-size:16px;margin:22px 0 8px}p{margin:8px 0}.lead{font-size:16px;color:#46536a}.muted,.note{color:var(--muted)}.note{font-size:13px}
+.callout{padding:15px 17px;border-radius:12px;background:var(--blue2);border-left:3px solid var(--blue);margin:16px 0}.callout strong{color:#183ebd}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.tile{border:1px solid var(--line);border-radius:12px;padding:15px}.tile b{display:block;margin-bottom:4px}.tile small{color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:14px;margin:12px 0}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}th{background:#f7f9fc;color:#4a5870;font-weight:650}td:first-child{font-weight:650;white-space:nowrap}
+.diagram{background:#101a30;color:#dce7ff;border-radius:14px;padding:20px;overflow:auto;font:13px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre}
+.steps{counter-reset:step;list-style:none;padding:0}.steps li{position:relative;padding:0 0 20px 48px;border-left:1px solid #d9e1ef;margin-left:14px}.steps li:last-child{border-left:0}.steps li:before{counter-increment:step;content:counter(step);position:absolute;left:-15px;top:0;width:29px;height:29px;border-radius:50%;display:grid;place-items:center;background:var(--blue);color:#fff;font-size:12px;font-weight:700}.steps b{display:block}.duration{font-size:12px;color:var(--blue);font-weight:700}
+ul{padding-left:22px}li{margin:4px 0}.checklist li{margin:7px 0}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;background:#eef2f7;color:#536078;margin-left:6px}.green{background:#e7f7f0;color:var(--green)}.amber{background:#fff3df;color:var(--amber)}
+.footer{padding:24px 6px 40px;color:var(--muted);font-size:12px;text-align:center}
+@media(max-width:900px){.shell{display:block;padding:16px}.sidebar{display:none}aside{display:none}.hero{padding:30px 24px}.hero h1{font-size:30px}section{padding:23px 20px}.grid{grid-template-columns:1fr}}
+@media print{body{background:#fff}.shell{display:block;padding:0;max-width:none}aside{display:none}.hero,section{box-shadow:none;break-inside:avoid}.hero{border-radius:0}section{border:0;border-bottom:1px solid #ddd;padding:20px 0}.footer{display:none}a{color:inherit}}
+</style>
+</head>
+<body>
+<div class="shell">
+<aside>
+  <div class="brand">🐼 Panda <span>VOD</span></div>
+  <div class="tagline">技术方案 · Architecture & Roadmap</div>
+  <nav>
+    <a href="#position">01 产品定位</a><a href="#principles">02 架构决策</a><a href="#stack">03 技术栈</a>
+    <a href="#architecture">04 系统架构</a><a href="#domain">05 核心数据模型</a><a href="#api">06 API 设计</a>
+    <a href="#reliability">07 异步任务可靠性</a><a href="#security">08 安全与生产化</a>
+    <a href="#roadmap">09 开发路线图</a><a href="#acceptance">10 验收标准</a><a href="#later">11 后续演进</a>
+  </nav>
+  <p class="note" style="margin-top:22px">建议每完成一个阶段，就回到本文更新状态与决策。</p>
+</aside>
+<main>
+<header class="hero">
+  <div class="eyebrow">Project blueprint · 2026.11</div>
+  <h1>Panda VOD</h1>
+  <div style="font-size:18px;color:#dce7ff">面向开发者的视频云服务平台</div>
+  <p>将现有短剧点播 MVP 演进为可复用的视频基础设施：统一提供上传、媒体资产管理、异步转码、存储、播放授权与分发能力。短剧站作为第一个业务 Demo 和内部客户。</p>
+  <div class="meta"><span class="pill">Java 21 · Spring Boot</span><span class="pill">Python · FFmpeg Worker</span><span class="pill">MySQL · Redis · RabbitMQ</span><span class="pill">MinIO · Nginx · HLS</span></div>
+</header>
+
+<section id="position">
+<h2>01. 产品定位</h2>
+<p class="lead">不要把项目只做成一个“能播放短剧的网站”，而是把它拆成视频云核心能力 + 短剧业务示例。</p>
+<div class="grid">
+ <div class="tile"><b>Panda VOD Core</b><small>视频云基础设施。面向开发者提供 API、资产管理、转码、播放授权、回调和用量统计。</small></div>
+ <div class="tile"><b>Drama Demo</b><small>短剧业务应用。负责剧集、付费解锁、内容展示和业务页面，通过 API 调用 Panda VOD。</small></div>
+</div>
+<div class="callout"><strong>关键边界：</strong>Drama / Episode 是短剧业务概念，不应该成为 VOD Core 的核心领域模型。核心平台只需要理解 Media Asset（媒体资产）。短剧的一集关联一个或多个媒体资产即可。</div>
+<p>短剧当然属于视频内容平台；这里的“短剧平台”和“视频云”不是竞争关系：前者是业务产品，后者是底层视频能力服务。VOD（Video on Demand）描述的是点播交付模式，不限定视频时长或内容类型。</p>
+</section>
+
+<section id="principles">
+<h2>02. 核心架构决策</h2>
+<table><tr><th>决策</th><th>建议</th><th>原因</th></tr>
+<tr><td>服务形态</td><td>模块化单体 + 独立 Worker</td><td>早期降低部署和联调成本，同时保留清晰领域边界；暂不拆微服务。</td></tr>
+<tr><td>控制面</td><td>Java 21 + Spring Boot</td><td>承载租户、鉴权、资产、任务编排、播放授权、回调和管理 API。</td></tr>
+<tr><td>媒体执行面</td><td>保留 Python + FFmpeg</td><td>已有转码链路可复用；重计算工作由 FFmpeg 完成，没必要为语言统一而重写。</td></tr>
+<tr><td>事实来源</td><td>MySQL</td><td>任务与资产状态以数据库为准；消息队列不是业务状态数据库。</td></tr>
+<tr><td>异步通信</td><td>RabbitMQ</td><td>负责唤醒 Worker、投递事件；消费者必须支持重复消息和幂等。</td></tr>
+<tr><td>对象存储</td><td>MinIO（后续兼容 S3）</td><td>原片与转码产物放对象存储，数据库只保存对象元数据和引用。</td></tr>
+</table>
+<div class="callout"><strong>不建议现在做：</strong>一上来拆成十几个微服务、引入 Kubernetes、重写 Python Worker、做 DRM 或多 CDN。先把单租户到多租户的核心链路做扎实。</div>
+</section>
+
+<section id="stack">
+<h2>03. 推荐技术栈</h2>
+<table><tr><th>层次</th><th>技术</th><th>职责 / 说明</th></tr>
+<tr><td>业务后端</td><td>Java 21 + Spring Boot 3.x</td><td>核心业务 API、领域服务、任务编排。</td></tr>
+<tr><td>安全</td><td>Spring Security</td><td>租户身份、管理端登录、RBAC、API Key 认证与权限范围。</td></tr>
+<tr><td>数据访问</td><td>MyBatis-Plus</td><td>持久层与常规 CRUD；复杂 SQL 仍显式编写，避免过度依赖自动生成。</td></tr>
+<tr><td>数据库迁移</td><td>Flyway</td><td>版本化管理 schema，避免手工改库导致环境漂移。</td></tr>
+<tr><td>关系数据库</td><td>MySQL 8.4</td><td>租户、资产、上传会话、转码任务、回调、用量等元数据。</td></tr>
+<tr><td>缓存 / 限流</td><td>Redis 7</td><td>热点缓存、短期令牌、限流、计数缓冲；不作为唯一事实源。</td></tr>
+<tr><td>消息队列</td><td>RabbitMQ 3.13</td><td>转码任务通知、异步事件、失败重试与死信队列。</td></tr>
+<tr><td>媒体 Worker</td><td>Python + FFmpeg 7.x</td><td>ffprobe 探测、转码、HLS 切片、产物上传与任务回报。</td></tr>
+<tr><td>对象存储</td><td>MinIO</td><td>原始视频、HLS playlist、分片、缩略图等文件。</td></tr>
+<tr><td>播放网关</td><td>Nginx</td><td>静态 HLS 分发、签名 URL 校验、缓存、Range / CORS。</td></tr>
+<tr><td>管理前端</td><td>Vue 3 + TypeScript + Vite（后续）</td><td>租户、资产、转码任务、模板、回调和用量控制台。</td></tr>
+<tr><td>可观测性</td><td>Actuator + Micrometer + Prometheus + Grafana</td><td>健康检查、API/队列/转码指标和仪表盘。</td></tr>
+<tr><td>测试</td><td>JUnit 5 + Testcontainers</td><td>服务测试、数据库/Redis/RabbitMQ 集成测试。</td></tr>
+</table>
+<p class="note">版本策略：新项目建议选 Java 21 LTS 与当前兼容的 Spring Boot 3.x 稳定版本；依赖版本统一由 Maven/Gradle BOM 管理，不在各模块随意漂移。</p>
+</section>
+
+<section id="architecture">
+<h2>04. 系统架构</h2>
+<div class="diagram">                  ┌──────────────────────────────┐
+                  │       Developer / Drama      │
+                  │  SDK / REST API / Web Player │
+                  └──────────────┬───────────────┘
+                                 │ HTTPS
+                  ┌──────────────▼───────────────┐
+                  │       vod-api (Spring)       │
+                  │ Tenant · API Key · Asset     │
+                  │ Upload · Job · Playback      │
+                  │ Template · Webhook · Usage   │
+                  └───────┬────────┬─────────────┘
+                          │        │
+                   SQL Tx │        │ Presigned URL
+                          │        ▼
+                 ┌────────▼───┐  ┌───────────────┐
+                 │   MySQL    │  │    MinIO      │
+                 │ Truth DB   │  │ Private Bucket│
+                 └────────────┘  └───────▲───────┘
+                          │              │
+                    Outbox Publisher     │ read source /
+                          │              │ write renditions
+                 ┌────────▼────────┐     │
+                 │   RabbitMQ      │     │
+                 │ durable queue   │     │
+                 └────────┬────────┘     │
+                          │ job_id       │
+                 ┌────────▼─────────────┴┐
+                 │ Python Worker + FFmpeg│
+                 │ probe · transcode     │
+                 │ package HLS · report  │
+                 └───────────────────────┘
+
+        Playback: Client → signed URL → Nginx/CDN → private object origin
+        Observability: API + Worker + MQ + Nginx → Prometheus → Grafana</div>
+<h3>仓库 / 部署单元建议</h3>
+<ul>
+<li><b>vod-api/</b>：Spring Boot 模块化单体，负责所有控制面 API。</li>
+<li><b>worker/</b>：保留现有 Python Worker，逐步升级消息契约、租约和重试。</li>
+<li><b>drama-demo/</b>：保留现有短剧页面与业务接口，逐步改为调用 VOD API。</li>
+<li><b>console/</b>：后续新增 Vue 管理控制台。</li>
+<li><b>infra/</b>：Docker Compose、Nginx、Prometheus、Grafana、初始化脚本。</li>
+</ul>
+</section>
+
+<section id="domain">
+<h2>05. 核心数据模型</h2>
+<table><tr><th>实体</th><th>核心字段 / 职责</th></tr>
+<tr><td>tenant</td><td>id、name、status、plan；所有资源的归属边界。</td></tr>
+<tr><td>api_credential</td><td>tenant_id、key_hash、scopes、status、expires_at；只存 API Key 哈希。</td></tr>
+<tr><td>media_asset</td><td>tenant_id、source_object_id、duration、width、height、status；核心媒体资产。</td></tr>
+<tr><td>upload_session</td><td>asset_id、object_key、expires_at、status、checksum；管理直传生命周期。</td></tr>
+<tr><td>storage_object</td><td>bucket、object_key、size、etag、checksum、content_type、role；描述对象存储文件。</td></tr>
+<tr><td>transcode_template</td><td>编码器、码率、分辨率 ladder、音频参数、封装格式。</td></tr>
+<tr><td>transcode_job</td><td>asset_id、template_id、status、attempts、lease_until、claim_version、error_code。</td></tr>
+<tr><td>rendition</td><td>job_id、profile、width、height、bitrate、codec、playlist_object_id。</td></tr>
+<tr><td>webhook_endpoint / delivery</td><td>回调地址、签名密钥引用、投递状态、重试次数、响应码。</td></tr>
+<tr><td>usage_daily</td><td>tenant_id、日期、存储量、转码秒数、播放请求/流量等聚合指标。</td></tr>
+<tr><td>drama / episode</td><td>只属于 Drama Demo；episode 通过 media_asset_id 关联 VOD Core。</td></tr>
+</table>
+<div class="callout"><strong>多租户约束：</strong>核心业务表统一带 tenant_id。所有查询都必须从认证上下文取得 tenant_id 并强制追加隔离条件，不能相信客户端传来的 tenant_id。</div>
+</section>
+
+<section id="api">
+<h2>06. API 设计草案</h2>
+<p>统一前缀 <code>/api/v1</code>，使用资源导向命名；管理端 API 与租户 API 分开授权。</p>
+<table><tr><th>方法 / 路径</th><th>用途</th></tr>
+<tr><td>POST /uploads</td><td>创建上传会话，返回 presigned URL 或 multipart 信息。</td></tr>
+<tr><td>POST /uploads/{id}/complete</td><td>通知上传完成；服务端 HEAD 校验对象后创建转码任务。</td></tr>
+<tr><td>GET /assets</td><td>分页查询当前租户媒体资产。</td></tr>
+<tr><td>GET /assets/{id}</td><td>查看资产状态、媒体信息与可用播放版本。</td></tr>
+<tr><td>POST /assets/{id}/transcodes</td><td>使用指定模板发起转码。</td></tr>
+<tr><td>GET /jobs/{id}</td><td>查询任务状态、进度、失败原因。</td></tr>
+<tr><td>POST /assets/{id}/playback-token</td><td>签发短期播放授权。</td></tr>
+<tr><td>POST /webhooks</td><td>注册转码成功/失败等事件回调。</td></tr>
+<tr><td>GET /usage</td><td>查询租户用量和配额信息。</td></tr>
+</table>
+<p class="note">幂等性：创建上传会话、发起转码等写接口建议支持 <code>Idempotency-Key</code>。客户端重试不能意外创建多份任务。</p>
+</section>
+
+<section id="reliability">
+<h2>07. 异步转码任务：项目最值得做深的工程点</h2>
+<p class="lead">目标不是喊“Exactly Once”，而是做到至少一次投递 + 幂等消费 + 可恢复状态机。</p>
+<ol class="steps">
+<li><b>数据库事务创建任务与 Outbox 事件</b><span class="duration">同一事务</span><br>上传完成校验后，在同一个 MySQL transaction 中写入 transcode_job 和 outbox_event，避免“任务已入库但消息没发出去”。</li>
+<li><b>Outbox Publisher 可靠发布</b><span class="duration">后台循环</span><br>发布到 durable queue，使用 publisher confirms；成功后标记事件已发布。发布器崩溃可重发，因此下游必须幂等。</li>
+<li><b>Worker 按 job_id 查询并 Claim</b><span class="duration">消费端</span><br>消息只携带 job_id 与 schema_version。Worker 从 DB 原子领取任务，不直接相信消息中的任务状态。</li>
+<li><b>Lease + Heartbeat + Fencing Token</b><span class="duration">执行期间</span><br>Worker 定期续租；每次 claim 递增 claim_version。旧 Worker 即使租约过期后恢复，也不能提交过期版本的结果。</li>
+<li><b>临时输出目录 + 完成后原子切换</b><span class="duration">提交结果</span><br>先写入 job 专属 prefix，校验 playlist 与分片完整后，再通过事务把资产切为 READY。避免客户端看到半成品 HLS。</li>
+<li><b>退避重试与死信</b><span class="duration">故障恢复</span><br>区分可重试与不可重试错误；指数退避加 jitter，超过次数进入 FAILED / DLQ，保留错误码和日志定位信息。</li>
+</ol>
+<h3>建议任务状态</h3>
+<p><code>PENDING → QUEUED → RUNNING → SUCCEEDED</code>；失败可进入 <code>RETRY_WAIT</code> 再回到 <code>QUEUED</code>，不可恢复则 <code>FAILED</code>，用户取消则 <code>CANCELLED</code>。</p>
+</section>
+
+<section id="security">
+<h2>08. 安全与生产化清单</h2>
+<ul class="checklist">
+<li>API Key 只存哈希；支持 scope、过期、撤销和轮换，创建时仅展示一次明文。</li>
+<li>管理端使用 Spring Security + JWT 或安全 Session + RBAC；租户 API 与管理 API 权限隔离。</li>
+<li>MinIO Bucket 默认私有；由服务端签发短时上传 URL，播放通过短期 token / 签名 URL 授权。</li>
+<li>上传校验对象归属、文件大小、MIME、扩展名、配额；不能只信任客户端声明。</li>
+<li>FFmpeg 使用参数数组执行，不拼接 shell 字符串；限制 CPU、内存、时长、磁盘和并发，隔离不可信媒体输入。</li>
+<li>HLS Key 不明文暴露；生产环境使用 KMS / 信封加密。开发环境也应抽象 KeyProvider，不把密钥硬编码进代码仓库。</li>
+<li>Webhook 防 SSRF：拒绝 localhost、内网、云 metadata 地址；处理 DNS 重绑定，限制 HTTPS、超时、重试和响应体大小。</li>
+<li>播放 Key API 做鉴权与限流；敏感响应禁止被公共缓存。</li>
+<li>播放计数不能简单 GETDEL 后直接写 DB，否则 DB 故障可能丢增量；采用可恢复事件/持久化缓冲与幂等回刷。</li>
+</ul>
+</section>
+
+<section id="roadmap">
+<h2>09. 开发路线图</h2>
+<p class="note">按每周约 15–20 小时估算；时间是工程计划区间，不是硬承诺。优先保证每个阶段都有可演示的验收结果。</p>
+<ol class="steps">
+<li><b>Phase 0 · 契约与边界冻结</b><span class="duration">2–3 天</span><br>梳理现有 API、表结构、MQ 消息和 Worker 行为；定义 OpenAPI、消息 JSON Schema 与版本号；写关键 contract tests。先确定哪些旧接口需要兼容。</li>
+<li><b>Phase 1 · Spring Boot 骨架</b><span class="duration">约 1 周</span><br>建立 Java 21 + Spring Boot 模块化单体；接入 MyBatis-Plus、Flyway、Spring Security、Actuator、Micrometer；统一异常响应、参数校验、日志、request-id、配置管理。先迁移健康检查和只读接口。</li>
+<li><b>Phase 2 · 上传与资产主链路</b><span class="duration">1–2 周</span><br>实现 tenant（初期可单租户）、API Key、upload_session、storage_object、media_asset；完成 presigned upload → complete → HEAD 校验 → 创建 job/outbox。Python Worker 继续消费兼容消息。</li>
+<li><b>Phase 3 · 转码任务可靠性</b><span class="duration">1–2 周</span><br>实现 Outbox Publisher、幂等 Claim、租约续期、fencing token、退避重试、取消和 DLQ；修复小分辨率 ladder 不应被放大的问题；补充 Worker 多实例和故障注入测试。</li>
+<li><b>Phase 4 · 播放与分发</b><span class="duration">1–2 周</span><br>MinIO 私有桶、播放 token / 签名 URL、Nginx 回源鉴权、HLS playlist 与分片访问、缓存和 CORS；补充首帧时间、播放失败、卡顿等 QoE 指标。</li>
+<li><b>Phase 5 · 平台化控制台</b><span class="duration">2–3 周</span><br>Vue 3 控制台：租户、API Key、资产列表、上传、任务详情、转码模板、Webhook、用量统计；实现 webhook 签名、重试、限流与基础配额。</li>
+<li><b>Phase 6 · 高级媒体能力</b><span class="duration">长期迭代</span><br>断点续传 / Multipart、截图与缩略图、字幕/音轨、CMAF/fMP4、H.265/AV1、多对象存储适配、多 CDN、生命周期与冷存储。DRM 放到有明确需求后再做。</li>
+</ol>
+<div class="grid">
+ <div class="tile"><b>4–6 周</b><small>目标：Java API → Python Worker → MinIO → HLS 播放，端到端闭环。</small></div>
+ <div class="tile"><b>8–12 周</b><small>目标：可演示的平台版本，具备多租户、可靠任务、控制台、Webhook 与监控。</small></div>
+</div>
+</section>
+
+<section id="acceptance">
+<h2>10. 第一版验收标准</h2>
+<ul class="checklist">
+<li>租户 A 无法读取、修改或播放租户 B 的资产。</li>
+<li>浏览器或脚本可通过预签名 URL 直传视频，不经过 API 服务中转大文件。</li>
+<li>上传完成后任务可靠创建；API 重试不会重复创建转码任务。</li>
+<li>Worker 重复收到消息、进程被 kill、租约过期、MinIO 短暂不可用时，任务能恢复或明确失败。</li>
+<li>只有所有 HLS 产物验证完成后，资产才进入 READY。</li>
+<li>过期或伪造的播放 token 无法访问受保护内容；私有对象不能被匿名直读。</li>
+<li>Drama Demo 能通过 VOD API 完成上传、转码、播放，付费解锁仍由 Demo 业务层控制。</li>
+<li>Prometheus 能观测 API 延迟、任务积压、转码耗时、失败率和 Worker 存活状态。</li>
+</ul>
+</section>
+
+<section id="later">
+<h2>11. 后续演进与项目展示重点</h2>
+<h3>值得优先展示的工程能力</h3>
+<ul>
+<li><b>可靠异步任务：</b>Outbox、幂等、租约、fencing token、重试和死信。</li>
+<li><b>多租户安全：</b>tenant scope、API Key scope、资源隔离和权限测试。</li>
+<li><b>对象存储直传：</b>预签名上传、校验、Multipart 扩展。</li>
+<li><b>媒体处理链路：</b>FFmpeg 多码率 HLS、模板化转码、失败诊断。</li>
+<li><b>可观测性：</b>任务吞吐、队列积压、转码耗时、播放 QoE 和成本指标。</li>
+</ul>
+<h3>明确暂缓</h3>
+<p>微服务拆分、Kubernetes、复杂计费、DRM、多 CDN、多区域调度。先做出一套边界清楚、稳定可靠、能让第三方开发者调用的 API。</p>
+<div class="callout"><strong>最终项目叙事：</strong>我实现了一个面向开发者的视频云平台，采用 Spring Boot 控制面与 Python/FFmpeg 媒体执行面分离架构，支持对象存储直传、多码率异步转码、HLS 安全分发、多租户隔离和可靠任务调度；并用短剧 Demo 验证完整业务闭环。</div>
+</section>
+<div class="footer">Panda VOD · Architecture & Roadmap · 可离线保存，浏览器打开即可阅读；打印时可另存为 PDF。</div>
+</main>
+</div>
+</body>
+</html>

@@ -13,7 +13,8 @@ import json, mimetypes, os, shutil, socket, subprocess, threading, time
 
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
-from common import (HLS_BUCKET, Q_DLQ, Q_MAIN, Q_RETRY, db, log, mq_channel, publish, rds, s3, wait_for)
+from common import (HLS_BUCKET, Q_DLQ, Q_MAIN, Q_RETRY, db, log, mq_channel, publish, rds, s3,
+                    transcode_message, wait_for)
 
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 LEASE_MIN = 30
@@ -189,7 +190,7 @@ def finish(ch, method, msg, res):
 def on_message(ch, method, props, body):
     """转码可能跑几分钟，放到子线程里做；主线程继续跑 pika 的 IO 循环发心跳，
     否则 broker 会以为连接死了把它断掉。pika 的 channel 不是线程安全的，所以 ack 要切回主线程。"""
-    msg = json.loads(body)
+    msg = json.loads(body)  # v1 只读 job_id / trace_id；未知字段与 schema_version 忽略，状态以数据库为准
     conn = ch.connection
 
     def work():
@@ -217,8 +218,7 @@ def sweeper():
             if rows:
                 mconn, mch = mq_channel()
                 for row in rows:
-                    publish(mch, Q_MAIN, {"job_id": row["id"], "asset_id": row["asset_id"],
-                                          "trace_id": row["trace_id"]})
+                    publish(mch, Q_MAIN, transcode_message(row["id"], row["asset_id"], row["trace_id"]))
                     log("sweeper_republish", job_id=row["id"])
                 mconn.close()
         except Exception as e:

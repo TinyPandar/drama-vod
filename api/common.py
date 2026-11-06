@@ -45,6 +45,12 @@ def mq_channel():
     return conn, ch
 
 
+def transcode_message(job_id: int, asset_id: int, trace_id: str | None) -> dict:
+    """转码消息 v1。见 docs/contracts/transcode-message.v1.schema.json。
+    消费者只认 job_id，忽略未知字段；没有 schema_version 的旧消息仍按 v1 处理。"""
+    return {"schema_version": 1, "job_id": job_id, "asset_id": asset_id, "trace_id": trace_id}
+
+
 def publish(ch, queue, body: dict, delay_ms: int | None = None):
     props = pika.BasicProperties(delivery_mode=2, content_type="application/json",
                                  expiration=str(delay_ms) if delay_ms else None)

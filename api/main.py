@@ -23,7 +23,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 from pydantic import BaseModel
 
 from common import (ENV, HLS_BUCKET, Q_MAIN, SOURCE_BUCKET, db, log, mq_channel, publish, rds, s3,
-                    wait_for)
+                    transcode_message, wait_for)
 
 HLS_SECRET = ENV("HLS_SECRET", "dev")
 TOKEN_SECRET = ENV("TOKEN_SECRET", "dev").encode()
@@ -248,7 +248,7 @@ def upload_complete(asset_id: int, x_request_id: str | None = Header(default=Non
         # 先落库再发消息；发失败也没关系，worker 的补偿扫描会把久未开始的 PENDING 任务重新投递
         try:
             mconn, ch = mq_channel()
-            publish(ch, Q_MAIN, {"job_id": job["id"], "asset_id": asset_id, "trace_id": x_request_id})
+            publish(ch, Q_MAIN, transcode_message(job["id"], asset_id, x_request_id))
             mconn.close()
         except Exception as e:
             log("publish_failed", job_id=job["id"], err=str(e))

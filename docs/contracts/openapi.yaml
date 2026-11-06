@@ -1,0 +1,241 @@
+openapi: 3.0.3
+info:
+  title: drama-vod current HTTP contract
+  version: "0.1.0-phase0"
+  description: |
+    现状冻结，不是 Panda VOD 的 /api/v1。
+    x-scope=core-compat 的状态码和响应字段，在 Drama Demo 改完调用前不能改。
+    x-scope=drama-demo 不属于视频云核心。
+    错误体是 FastAPI 的 {"detail": "..."}。兼容承诺只覆盖状态码，不覆盖 detail 文案。
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      x-scope: core-compat
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+  /api/episodes/{episode_id}/upload-url:
+    post:
+      x-scope: core-compat
+      parameters:
+        - $ref: "#/components/parameters/EpisodeId"
+      responses:
+        "200":
+          description: 创建 UPLOADING 资产并返回预签名 PUT。过期 900 秒。
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [asset_id, put_url, expires_in]
+                properties:
+                  asset_id: { type: integer }
+                  put_url: { type: string }
+                  expires_in: { type: integer, const: 900 }
+        "404":
+          description: episode not found
+  /api/assets/{asset_id}/complete:
+    post:
+      x-scope: core-compat
+      description: |
+        服务端 HEAD 原片。不存在返回 409。重复调用返回同一个 job_id，不新建任务。
+        仅当任务仍是 PENDING 时投递消息；投递失败仍返回 200，由 Worker 补偿扫描重投。
+      parameters:
+        - $ref: "#/components/parameters/AssetId"
+        - in: header
+          name: X-Request-ID
+          schema: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [asset_id, job_id, job_status]
+                properties:
+                  asset_id: { type: integer }
+                  job_id: { type: integer }
+                  job_status: { type: string }
+        "404":
+          description: asset not found
+        "409":
+          description: source object not found
+  /api/assets/{asset_id}:
+    get:
+      x-scope: core-compat
+      parameters:
+        - $ref: "#/components/parameters/AssetId"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [asset, jobs, renditions]
+                properties:
+                  asset:
+                    type: object
+                    required: [id, episode_id, status, encrypted]
+                  jobs:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, status, attempts]
+                  renditions:
+                    type: array
+                    items:
+                      type: object
+                      required: [name, width, height, video_kbps]
+        "404":
+          description: asset not found
+  /api/episodes/{episode_id}/play:
+    get:
+      x-scope: core-compat
+      description: |
+        user_id 由调用方传入，这是 Demo 鉴权，不是 Core 的最终形态。
+        但 200 响应里的 master_url、token、asset_id、encrypted、next 已被播放页和 e2e 依赖。
+      parameters:
+        - $ref: "#/components/parameters/EpisodeId"
+        - in: query
+          name: user_id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlayInfo"
+        "402":
+          description: 付费集未解锁
+        "404":
+          description: episode not found
+        "409":
+          description: 集不是 READY 或没有 asset_id
+  /keys/{asset_id}:
+    get:
+      x-scope: core-compat
+      description: |
+        16 字节密钥。Authorization: Bearer <token> 或 ?token=。
+        无 token、过期、资产不匹配都是 401。Cache-Control 必须是 no-store。
+      parameters:
+        - $ref: "#/components/parameters/AssetId"
+        - in: header
+          name: Authorization
+          schema: { type: string }
+        - in: query
+          name: token
+          schema: { type: string }
+      responses:
+        "200":
+          description: application/octet-stream, 16 bytes
+        "401":
+          description: invalid or expired play token
+        "404":
+          description: key not found
+  /api/playback/{asset_id}/master.m3u8:
+    get:
+      x-scope: core-compat
+      description: iPhone 改写列表。分片 URL 仍走 /hls 签名前缀。不承诺查询参数以外的文本格式长期不变，但必须仍能让原生 HLS 播付费集。
+      parameters:
+        - $ref: "#/components/parameters/AssetId"
+        - in: query
+          name: token
+          schema: { type: string }
+      responses:
+        "200":
+          description: application/vnd.apple.mpegurl, Cache-Control no-store
+        "401":
+          description: invalid token
+        "404":
+          description: playlist not found
+  /api/dramas:
+    get:
+      x-scope: drama-demo
+      responses:
+        "200":
+          description: 只返回 status=ONLINE 的剧
+    post:
+      x-scope: drama-demo
+      responses:
+        "200":
+          description: "{drama_id}"
+  /api/dramas/{drama_id}:
+    get:
+      x-scope: drama-demo
+      parameters:
+        - in: path
+          name: drama_id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: "{drama, episodes}"
+        "404":
+          description: drama not found
+  /api/dramas/{drama_id}/episodes:
+    post:
+      x-scope: drama-demo
+      parameters:
+        - in: path
+          name: drama_id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: "{episode_id}"
+  /api/episodes/{episode_id}:
+    get:
+      x-scope: drama-demo
+      parameters:
+        - $ref: "#/components/parameters/EpisodeId"
+      responses:
+        "200":
+          description: "{episode, drama}"
+        "404":
+          description: episode not found
+  /api/users/{user_id}/unlock:
+    post:
+      x-scope: drama-demo
+      parameters:
+        - in: path
+          name: user_id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: "{ok: true}。不扣费。重复解锁仍返回 200。"
+components:
+  parameters:
+    EpisodeId:
+      in: path
+      name: episode_id
+      required: true
+      schema: { type: integer }
+    AssetId:
+      in: path
+      name: asset_id
+      required: true
+      schema: { type: integer }
+  schemas:
+    PlayInfo:
+      type: object
+      required: [episode_id, asset_id, encrypted, master_url, token, expires_at, next]
+      properties:
+        episode_id: { type: integer }
+        asset_id: { type: integer }
+        encrypted: { type: boolean, description: 当前等于 episode.is_paid，不是 asset.encrypted }
+        master_url: { type: string, description: "/hls/{sig}/{exp}/{asset_id}/master.m3u8" }
+        token: { type: string }
+        expires_at: { type: integer, description: unix 秒 }
+        next:
+          nullable: true
+          description: 下一集未就绪时为 null。未解锁时只有 episode_id 和 locked=true。

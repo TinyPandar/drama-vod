@@ -2,6 +2,8 @@
 
 一套最小但"链路完整"的点播系统：**预签名直传 → MQ → FFmpeg 多码率 HLS → Nginx 模拟 CDN（secure_link 防盗链 + proxy_cache）→ hls.js 播放**，付费集走 **AES-128 HLS + 鉴权取 key**，Redis 做热点缓存 / 播放计数 / 热榜，MySQL 存元数据，Prometheus 拉指标。
 
+演进方向见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)。现有接口里哪些不能改，见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
+
 ## 1. 目录结构
 
 ```

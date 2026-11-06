@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "transcode-message.v1.schema.json",
+  "title": "Transcode queue message v1",
+  "description": "Publisher contract for queues transcode, transcode.retry and transcode.dlq. Consumers must ignore unknown fields and must still accept messages that omit schema_version.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "job_id", "asset_id", "trace_id"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "job_id": { "type": "integer", "minimum": 1 },
+    "asset_id": { "type": "integer", "minimum": 1 },
+    "trace_id": { "type": ["string", "null"] }
+  },
+  "examples": [
+    { "schema_version": 1, "job_id": 12, "asset_id": 9, "trace_id": "req-1" },
+    { "schema_version": 1, "job_id": 12, "asset_id": 9, "trace_id": null }
+  ]
+}
