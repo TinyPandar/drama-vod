@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>视频云控制台</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0e0d0c; color: #f3eee6; font: 15px/1.45 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  main { width: min(880px, 100%); margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 28px; margin: 8px 0; }
+  a { color: #e0b15c; }
+  label { display: block; color: #a79d92; font-size: 13px; margin: 14px 0 6px; }
+  input, button { font: inherit; color: inherit; }
+  input { width: 100%; background: #171512; border: 1px solid rgba(243,238,230,.16); border-radius: 10px; padding: 10px 12px; }
+  button, .file { min-height: 44px; border-radius: 999px; border: 0; background: #e0b15c; color: #1c140b; font-weight: 700; padding: 0 16px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid rgba(243,238,230,.12); font-size: 14px; }
+  .muted { color: #a79d92; }
+  #msg { min-height: 1.4em; }
+  @media (max-width: 640px) { table { display: block; overflow-x: auto; } }
+</style>
+</head>
+<body>
+<main>
+  <p class="muted"><a href="/">返回短剧场</a></p>
+  <h1>视频云控制台</h1>
+  <p class="muted">只看当前 API Key 所属租户的资产和转码任务。付费解锁不在这里。</p>
+  <label for="key">API Key</label>
+  <input id="key" autocomplete="off" placeholder="dev-demo-key">
+  <div class="row">
+    <button id="save" type="button">保存并刷新</button>
+    <label class="file">上传视频<input id="file" type="file" accept="video/*" hidden></label>
+  </div>
+  <p id="msg" class="muted"></p>
+  <h2>资产</h2>
+  <table><thead><tr><th>ID</th><th>状态</th><th>大小</th></tr></thead><tbody id="assets"></tbody></table>
+  <h2>转码任务</h2>
+  <table><thead><tr><th>任务</th><th>资产</th><th>状态</th><th>尝试</th><th>版本</th></tr></thead><tbody id="jobs"></tbody></table>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const keyEl = $('key');
+try { keyEl.value = sessionStorage.getItem('vod.key') || 'dev-demo-key'; } catch { keyEl.value = 'dev-demo-key'; }
+function say(text) { $('msg').textContent = text; }
+async function api(path, opts) {
+  const r = await fetch(path, { ...(opts || {}), headers: { 'X-Api-Key': keyEl.value, ...(opts && opts.headers || {}) } });
+  const text = await r.text();
+  let body = {};
+  try { body = text ? JSON.parse(text) : {}; } catch { body = { detail: text }; }
+  if (!r.ok) throw new Error(body.detail || ('HTTP ' + r.status));
+  return body;
+}
+function row(cells) {
+  const tr = document.createElement('tr');
+  for (const cell of cells) {
+    const td = document.createElement('td');
+    td.textContent = cell == null ? '' : String(cell);
+    tr.append(td);
+  }
+  return tr;
+}
+async function refresh() {
+  try { sessionStorage.setItem('vod.key', keyEl.value); } catch {}
+  const assets = await api('/api/v1/assets');
+  const jobs = await api('/api/v1/jobs');
+  $('assets').replaceChildren(...(assets.assets || []).map(a => row([a.id, a.status, a.source_size])));
+  $('jobs').replaceChildren(...(jobs.jobs || []).map(j => row([j.id, j.asset_id, j.status, j.attempts, j.claim_version])));
+  say('已刷新');
+}
+$('save').onclick = () => refresh().catch(e => say(e.message));
+$('file').onchange = async () => {
+  const file = $('file').files && $('file').files[0];
+  if (!file) return;
+  try {
+    say('申请直传地址');
+    const up = await api('/api/v1/uploads', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    say('直传中');
+    const put = await fetch(up.put_url, { method: 'PUT', body: file });
+    if (!put.ok) throw new Error('直传失败 ' + put.status);
+    say('提交转码');
+    await api('/api/v1/uploads/' + up.session_id + '/complete', { method: 'POST' });
+    await refresh();
+    say('已投递转码任务');
+  } catch (e) { say(e.message); }
+};
+refresh().catch(e => say(e.message));
+</script>
+</body>
+</html>

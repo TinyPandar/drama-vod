@@ -9,6 +9,7 @@ log_format vod '$remote_addr [$time_local] "$request" $status $body_bytes_sent '
 
 upstream minio_origin { server minio:9000; }
 upstream api_backend  { server api:8000; keepalive 16; }
+resolver 127.0.0.11 valid=10s ipv6=off;
 
 server {
     listen 8080;
@@ -16,6 +17,17 @@ server {
 
     # 测试播放页
     location / { root /usr/share/nginx/html; index index.html; }
+
+    # 新控制面。比 /api/ 更具体，不会抢走旧接口。
+    location /api/v1/ {
+        set $vod_upstream vod-api:8001;
+        proxy_pass http://$vod_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_set_header X-Request-ID $request_id;
+        add_header X-Request-ID $request_id always;
+    }
 
     # 业务 API：把 request_id 透传下去当 trace_id
     location /api/ {
@@ -51,8 +63,29 @@ server {
         proxy_cache_use_stale error timeout updating;
         proxy_ignore_headers Set-Cookie Cache-Control Expires;
         proxy_hide_header Set-Cookie;
-        proxy_set_header Host minio:9000;
-        proxy_pass http://minio_origin/vod-hls/assets/$asset/$file;
+        proxy_set_header X-Origin-Secret ${ORIGIN_SECRET};
+        rewrite ^ /internal/origin/legacy/$asset/$file break;
+        proxy_pass http://api_backend;
+        add_header X-Cache-Status $upstream_cache_status always;
+    }
+
+    # 核心资产：签名明文带 v1，对象在 assets/v1/ 下，避免和旧资产 id 撞车
+    location ~ ^/hls/v1/(?<sl_sig>[A-Za-z0-9_-]+)/(?<sl_exp>[0-9]+)/(?<asset>[0-9]+)/(?<file>[A-Za-z0-9_./-]+)$ {
+        secure_link $sl_sig,$sl_exp;
+        secure_link_md5 "$sl_exp/v1/$asset ${HLS_SECRET}";
+        if ($secure_link = "")  { return 403; }
+        if ($secure_link = "0") { return 410; }
+
+        proxy_cache hls;
+        proxy_cache_key "v1/$asset/$file";
+        proxy_cache_valid 200 7d;
+        proxy_cache_lock on;
+        proxy_cache_use_stale error timeout updating;
+        proxy_ignore_headers Set-Cookie Cache-Control Expires;
+        proxy_hide_header Set-Cookie;
+        proxy_set_header X-Origin-Secret ${ORIGIN_SECRET};
+        rewrite ^ /internal/origin/v1/$asset/$file break;
+        proxy_pass http://api_backend;
         add_header X-Cache-Status $upstream_cache_status always;
     }
 
@@ -64,6 +97,14 @@ server {
     listen 9000;
     client_max_body_size 5g;
     location / {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin $http_origin always;
+            add_header Access-Control-Allow-Methods "PUT, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "*" always;
+            add_header Access-Control-Max-Age 600 always;
+            return 204;
+        }
+        add_header Access-Control-Allow-Origin $http_origin always;
         limit_except PUT { deny all; }
         proxy_request_buffering off;              # 边收边转，不在 nginx 落盘
         proxy_set_header Host $http_host;         # 保留客户端看到的 host，预签名校验要用

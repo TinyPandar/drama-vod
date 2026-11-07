@@ -15,6 +15,8 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from common import (HLS_BUCKET, Q_DLQ, Q_MAIN, Q_RETRY, db, log, mq_channel, publish, rds, s3,
                     transcode_message, wait_for)
+from hls_verify import verify_hls
+from job_route import hls_prefix, job_table, updates_episode
 
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 LEASE_MIN = 30
@@ -30,14 +32,39 @@ s3c = s3()
 r = rds()
 
 
-def claim(c, job_id):
-    """状态机：PENDING/RETRYING -> RUNNING，或 RUNNING 但租约过期(上个 worker 挂了) -> RUNNING。"""
+def ensure_claim_version():
+    """旧库没有这一列。新安装由 init.sql 建好，这里只补已有卷。"""
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("SHOW COLUMNS FROM transcode_job LIKE 'claim_version'")
+        if not c.fetchone():
+            c.execute("ALTER TABLE transcode_job ADD COLUMN claim_version INT NOT NULL DEFAULT 0")
+    conn.close()
+
+
+def claim(c, job_id, table="transcode_job", steal=False):
+    """PENDING/RETRYING 可抢。RUNNING 只在租约过期，或消息被重新投递（原进程已死）时抢走。claim_version +1，旧进程不能再提交。"""
+    table = job_table("core" if table == "vod_transcode_job" else "legacy") if table in ("transcode_job", "vod_transcode_job") else job_table(table)
+    running = "status='RUNNING'" if steal else "(status='RUNNING' AND locked_until < NOW())"
     n = c.execute(
-        "UPDATE transcode_job SET status='RUNNING', attempts=attempts+1, worker_id=%s, "
-        "locked_until=NOW() + INTERVAL %s MINUTE "
-        "WHERE id=%s AND (status IN ('PENDING','RETRYING') OR (status='RUNNING' AND locked_until < NOW()))",
+        f"UPDATE {table} SET status='RUNNING', attempts=attempts+1, worker_id=%s, "
+        "claim_version=claim_version+1, locked_until=NOW() + INTERVAL %s MINUTE "
+        f"WHERE id=%s AND (status IN ('PENDING','RETRYING') OR {running})",
         (WORKER_ID, LEASE_MIN, job_id))
     return n == 1
+
+
+def renew_lease(job_id, version, table="transcode_job"):
+    table = job_table("core" if table == "vod_transcode_job" else "legacy")
+    conn = db()
+    try:
+        with conn.cursor() as c:
+            return c.execute(
+                f"UPDATE {table} SET locked_until=NOW() + INTERVAL %s MINUTE "
+                "WHERE id=%s AND claim_version=%s AND status='RUNNING'",
+                (LEASE_MIN, job_id, version)) == 1
+    finally:
+        conn.close()
 
 
 def run(cmd):
@@ -104,21 +131,41 @@ def upload_dir(local, prefix):
     return len(files)
 
 
-def process(job_id, trace_id):
+def process(job_id, trace_id, origin="legacy", steal=False):
+    table = job_table(origin)
     conn = db()
     c = conn.cursor()
-    if not claim(c, job_id):
-        c.execute("SELECT status, locked_until FROM transcode_job WHERE id=%s", (job_id,))
+    if not claim(c, job_id, table, steal=steal):
+        c.execute(f"SELECT status, locked_until FROM {table} WHERE id=%s", (job_id,))
         row = c.fetchone()
         conn.close()
-        log("skip_duplicate", job_id=job_id, status=row and row["status"], trace_id=trace_id)
+        log("skip_duplicate", job_id=job_id, status=row and row["status"], trace_id=trace_id, origin=origin)
         # 别人正在跑（租约未到期）：延迟再看；已终态：丢弃
         return "requeue" if row and row["status"] == "RUNNING" else "drop"
-    c.execute("SELECT j.attempts, j.max_attempts, a.* FROM transcode_job j JOIN video_asset a ON a.id=j.asset_id "
-              "WHERE j.id=%s", (job_id,))
+    if origin == "core":
+        c.execute("SELECT j.attempts, j.max_attempts, j.claim_version, a.id, a.source_bucket, a.source_key, "
+                  "a.encrypted FROM vod_transcode_job j JOIN vod_media_asset a ON a.id=j.asset_id WHERE j.id=%s",
+                  (job_id,))
+    else:
+        c.execute("SELECT j.attempts, j.max_attempts, j.claim_version, a.* FROM transcode_job j "
+                  "JOIN video_asset a ON a.id=j.asset_id WHERE j.id=%s", (job_id,))
     a = c.fetchone()
+    if origin == "core":
+        a["episode_id"] = None
     asset_id = a["id"]
-    c.execute("UPDATE video_asset SET status='TRANSCODING' WHERE id=%s", (asset_id,))
+    version = a["claim_version"]
+    fenced = threading.Event()
+
+    def beat():
+        while not fenced.wait(60):
+            if not renew_lease(job_id, version, table):
+                fenced.set()
+                log("lease_lost", job_id=job_id, claim_version=version, trace_id=trace_id)
+    threading.Thread(target=beat, daemon=True).start()
+    if origin == "core":
+        c.execute("UPDATE vod_media_asset SET status='TRANSCODING' WHERE id=%s", (asset_id,))
+    else:
+        c.execute("UPDATE video_asset SET status='TRANSCODING' WHERE id=%s", (asset_id,))
     work = f"/tmp/job_{job_id}"
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(f"{work}/out")
@@ -130,7 +177,11 @@ def process(job_id, trace_id):
         s3c.download_file(a["source_bucket"], a["source_key"], src)
         w, h, dur_ms, has_audio = probe(src)
         portrait = h >= w
-        ladder = [x for x in LADDER if x[1] <= min(w, h)] or [LADDER[-1]]  # 只降不升，不把小视频放大
+        short = min(w, h)
+        ladder = [x for x in LADDER if x[1] <= short]
+        if not ladder:  # 小于 360 也不放大，按源的短边出一档
+            even = max(2, short // 2 * 2)
+            ladder = [(f"{even}p", even, 600)]
         keyinfo = None
         if a["encrypted"]:
             k = get_or_create_key(c, asset_id)
@@ -140,22 +191,36 @@ def process(job_id, trace_id):
             with open(keyinfo, "w") as f:  # 三行：写进 m3u8 的 key URI / 本地 key 文件 / IV
                 f.write(f"/keys/{asset_id}\n{work}/enc.key\n{k['iv_hex']}\n")
         run(build_ffmpeg(src, f"{work}/out", ladder, has_audio, keyinfo, portrait))
-        prefix = f"assets/{asset_id}/"
+        verify_hls(f"{work}/out", [name for name, _, _ in ladder], bool(a["encrypted"]))
+        if fenced.is_set():
+            log("drop_fenced", job_id=job_id, claim_version=version, trace_id=trace_id)
+            return "drop"
+        prefix = hls_prefix(origin, asset_id)
         nfiles = upload_dir(f"{work}/out", prefix)
         conn.begin()
-        for name, p, kbps in ladder:
-            other = round(max(w, h) * p / min(w, h) / 2) * 2
-            rw, rh = (p, other) if portrait else (other, p)
-            c.execute("INSERT INTO asset_rendition(asset_id, name, width, height, video_kbps, playlist_key) "
-                      "VALUES(%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE video_kbps=VALUES(video_kbps)",
-                      (asset_id, name, rw, rh, kbps, f"{prefix}{name}/index.m3u8"))
-        c.execute("UPDATE video_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s "
-                  "WHERE id=%s", (prefix, dur_ms, w, h, asset_id))
-        c.execute("UPDATE episode SET asset_id=%s, status='READY' WHERE id=%s", (asset_id, a["episode_id"]))
-        c.execute("UPDATE transcode_job SET status='SUCCEEDED', locked_until=NULL, last_error=NULL WHERE id=%s",
-                  (job_id,))
+        if updates_episode(origin):
+            for name, p, kbps in ladder:
+                other = round(max(w, h) * p / min(w, h) / 2) * 2
+                rw, rh = (p, other) if portrait else (other, p)
+                c.execute("INSERT INTO asset_rendition(asset_id, name, width, height, video_kbps, playlist_key) "
+                          "VALUES(%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE video_kbps=VALUES(video_kbps)",
+                          (asset_id, name, rw, rh, kbps, f"{prefix}{name}/index.m3u8"))
+            c.execute("UPDATE video_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s "
+                      "WHERE id=%s", (prefix, dur_ms, w, h, asset_id))
+            c.execute("UPDATE episode SET asset_id=%s, status='READY' WHERE id=%s", (asset_id, a["episode_id"]))
+        else:
+            c.execute("UPDATE vod_media_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s "
+                      "WHERE id=%s", (prefix, dur_ms, w, h, asset_id))
+        changed = c.execute(
+            f"UPDATE {table} SET status='SUCCEEDED', locked_until=NULL, last_error=NULL "
+            "WHERE id=%s AND claim_version=%s", (job_id, version))
+        if changed != 1:
+            conn.rollback()
+            log("drop_fenced", job_id=job_id, claim_version=version, trace_id=trace_id)
+            return "drop"
         conn.commit()
-        r.delete(f"ep:{a['episode_id']}")  # 缓存失效：下次播放读到新 asset_id
+        if a.get("episode_id"):
+            r.delete(f"ep:{a['episode_id']}")  # 缓存失效：下次播放读到新 asset_id
         JOBS.labels("succeeded").inc()
         DUR.observe(time.time() - t0)
         log("job_done", job_id=job_id, asset_id=asset_id, renditions=[x[0] for x in ladder], files=nfiles,
@@ -164,14 +229,18 @@ def process(job_id, trace_id):
     except Exception as e:
         conn.rollback()
         final = a["attempts"] >= a["max_attempts"]
-        c.execute("UPDATE transcode_job SET status=%s, locked_until=NULL, last_error=%s WHERE id=%s",
-                  ("FAILED" if final else "RETRYING", str(e)[-2000:], job_id))
-        if final:
+        c.execute(f"UPDATE {table} SET status=%s, locked_until=NULL, last_error=%s "
+                  "WHERE id=%s AND claim_version=%s",
+                  ("FAILED" if final else "RETRYING", str(e)[-2000:], job_id, version))
+        if final and origin == "core":
+            c.execute("UPDATE vod_media_asset SET status='FAILED' WHERE id=%s", (asset_id,))
+        elif final:
             c.execute("UPDATE video_asset SET status='FAILED' WHERE id=%s", (asset_id,))
         JOBS.labels("failed" if final else "retry").inc()
         log("job_error", job_id=job_id, attempt=a["attempts"], final=final, err=str(e)[-300:], trace_id=trace_id)
         return "dlq" if final else ("retry", 10_000 * 2 ** (a["attempts"] - 1))
     finally:
+        fenced.set()
         INFLIGHT.dec()
         conn.close()
         shutil.rmtree(work, ignore_errors=True)
@@ -195,7 +264,8 @@ def on_message(ch, method, props, body):
 
     def work():
         try:
-            res = process(msg["job_id"], msg.get("trace_id"))
+            res = process(msg["job_id"], msg.get("trace_id"), msg.get("origin") or "legacy",
+                          steal=bool(method.redelivered))
         except Exception as e:  # 比如数据库连不上：稍后重试
             log("process_crash", job_id=msg.get("job_id"), err=str(e))
             res = "requeue"
@@ -215,11 +285,27 @@ def sweeper():
                           "(status='RUNNING' AND locked_until < NOW())")
                 rows = c.fetchall()
             conn.close()
-            if rows:
+            core_rows = []
+            try:
+                c2 = db()
+                with c2.cursor() as cur:
+                    cur.execute("SELECT id, asset_id FROM vod_transcode_job WHERE "
+                                "(status='PENDING' AND updated_at < NOW() - INTERVAL 2 MINUTE) OR "
+                                "(status='RUNNING' AND locked_until < NOW())")
+                    core_rows = cur.fetchall()
+                c2.close()
+            except Exception as e:
+                log("sweeper_core_skip", err=str(e)[:120])
+            if rows or core_rows:
                 mconn, mch = mq_channel()
                 for row in rows:
                     publish(mch, Q_MAIN, transcode_message(row["id"], row["asset_id"], row["trace_id"]))
                     log("sweeper_republish", job_id=row["id"])
+                for row in core_rows:
+                    body = transcode_message(row["id"], row["asset_id"], None)
+                    body["origin"] = "core"
+                    publish(mch, Q_MAIN, body)
+                    log("sweeper_republish_core", job_id=row["id"])
                 mconn.close()
         except Exception as e:
             log("sweeper_error", err=str(e))
@@ -229,6 +315,7 @@ def sweeper():
 def main():
     start_http_server(9100)
     wait_for("mysql", lambda: db().close())
+    ensure_claim_version()
     mconn, ch = wait_for("rabbitmq", mq_channel)
     threading.Thread(target=sweeper, daemon=True).start()
     ch.basic_qos(prefetch_count=1)  # 一个 worker 同时只拿一条，转码是 CPU 密集，靠多开 worker 横向扩

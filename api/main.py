@@ -19,6 +19,9 @@ import base64, hashlib, hmac, json, os, re, threading, time
 from urllib.parse import quote
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
+from origin_path import object_key
+import vod_client
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel
 
@@ -29,6 +32,7 @@ HLS_SECRET = ENV("HLS_SECRET", "dev")
 TOKEN_SECRET = ENV("TOKEN_SECRET", "dev").encode()
 PLAY_URL_TTL = int(ENV("PLAY_URL_TTL", "600"))
 PUBLIC_UPLOAD_ENDPOINT = ENV("PUBLIC_UPLOAD_ENDPOINT", "http://localhost:9000")
+ORIGIN_SECRET = ENV("ORIGIN_SECRET", "dev")
 
 app = FastAPI(title="drama-vod api")
 s3_internal = s3()
@@ -62,6 +66,33 @@ def healthz():
     return {"ok": True}
 
 
+@app.get("/internal/origin/{scope}/{asset_id}/{file_path:path}")
+def internal_origin(scope: str, asset_id: str, file_path: str,
+                    x_origin_secret: str | None = Header(default=None)):
+    """只给 Nginx 回源。对象存储不再匿名可读。"""
+    if not x_origin_secret or x_origin_secret != ORIGIN_SECRET:
+        raise HTTPException(403, "origin denied")
+    try:
+        key = object_key(scope, asset_id, file_path)
+    except ValueError:
+        raise HTTPException(404, "bad path")
+    try:
+        obj = s3_internal.get_object(Bucket=HLS_BUCKET, Key=key)
+    except Exception:
+        raise HTTPException(404, "object not found")
+    body = obj["Body"]
+
+    def chunks():
+        try:
+            for chunk in body.iter_chunks(64 * 1024):
+                yield chunk
+        finally:
+            body.close()
+
+    ctype = obj.get("ContentType") or "application/octet-stream"
+    return StreamingResponse(chunks(), media_type=ctype)
+
+
 # ---------------- 启动：建桶 + 播放计数回刷线程 ----------------
 @app.on_event("startup")
 def startup():
@@ -70,16 +101,44 @@ def startup():
         for b in (SOURCE_BUCKET, HLS_BUCKET):
             if b not in existing:
                 s3_internal.create_bucket(Bucket=b)
-        # HLS 桶允许匿名读：MinIO 不对外暴露，只有 nginx(模拟 CDN) 在内网回源。
-        # 生产等价物：私有桶 + CDN 回源鉴权（OSS 私有 Bucket 回源 / CloudFront OAC）。
-        s3_internal.put_bucket_policy(Bucket=HLS_BUCKET, Policy=json.dumps({
-            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": ["*"]},
-                                                    "Action": ["s3:GetObject"],
-                                                    "Resource": [f"arn:aws:s3:::{HLS_BUCKET}/*"]}]}))
+        # 桶保持私有。边缘验完签名后，由 /internal/origin 用本服务的密钥回源。
+        try:
+            s3_internal.delete_bucket_policy(Bucket=HLS_BUCKET)
+        except Exception:
+            pass
     wait_for("minio", ensure_buckets)
     wait_for("mysql", lambda: db().close())
+    wait_for("mysql", ensure_vod_link_table)
     threading.Thread(target=flush_play_counts_loop, daemon=True).start()
     log("api_started")
+
+
+def ensure_vod_link_table():
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS episode_vod_link ("
+                  "episode_id BIGINT PRIMARY KEY, vod_asset_id BIGINT NOT NULL, "
+                  "vod_session_id BIGINT NOT NULL, "
+                  "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    conn.close()
+
+
+def vod_link(episode_id):
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("SELECT vod_asset_id, vod_session_id FROM episode_vod_link WHERE episode_id=%s", (episode_id,))
+        row = c.fetchone()
+    conn.close()
+    return row
+
+
+def save_vod_link(episode_id, asset_id, session_id):
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("INSERT INTO episode_vod_link(episode_id, vod_asset_id, vod_session_id) VALUES (%s,%s,%s) "
+                  "ON DUPLICATE KEY UPDATE vod_asset_id=VALUES(vod_asset_id), vod_session_id=VALUES(vod_session_id)",
+                  (episode_id, asset_id, session_id))
+    conn.close()
 
 
 def flush_play_counts_loop():
@@ -364,6 +423,57 @@ def play_info(user_id: int, ep: dict) -> dict:
             "token": make_token(user_id, ep["asset_id"], exp), "expires_at": exp}
 
 
+def apply_vod_playback(info, episode_id):
+    """能从视频云拿到播放地址就替换 master_url。解锁仍由本服务决定，这里不再检查。"""
+    link = vod_link(episode_id)
+    if not link:
+        return info
+    status, payload = vod_client.playback(link["vod_asset_id"])
+    if status == 200 and payload.get("master_url"):
+        info["master_url"] = payload["master_url"]
+        info["expires_at"] = payload.get("expires_at", info["expires_at"])
+        info["via"] = "vod-api"
+    return info
+
+
+@app.post("/api/episodes/{episode_id}/vod-upload")
+def vod_upload(episode_id: int):
+    get_episode(episode_id)
+    status, payload = vod_client.open_upload()
+    if status != 200:
+        raise HTTPException(status if status < 500 else 502, payload.get("detail", "vod upload failed"))
+    save_vod_link(episode_id, payload["asset_id"], payload["session_id"])
+    return payload
+
+
+@app.post("/api/episodes/{episode_id}/vod-complete")
+def vod_complete(episode_id: int):
+    link = vod_link(episode_id)
+    if not link:
+        raise HTTPException(404, "upload first")
+    status, payload = vod_client.complete_upload(link["vod_session_id"])
+    if status != 200:
+        raise HTTPException(status if status < 500 else 502, payload.get("detail", "vod complete failed"))
+    return payload
+
+
+@app.get("/api/episodes/{episode_id}/vod-play")
+def vod_play(episode_id: int, user_id: int):
+    ep = get_episode(episode_id)
+    link = vod_link(episode_id)
+    if not link:
+        raise HTTPException(404, "no vod asset")
+    if not can_play(user_id, ep):
+        PLAY_REQ.labels("need_unlock").inc()
+        raise HTTPException(402, "paid episode, unlock first")
+    status, payload = vod_client.playback(link["vod_asset_id"])
+    if status != 200:
+        raise HTTPException(409 if status == 409 else 502, payload.get("detail", "vod playback failed"))
+    return {"episode_id": episode_id, "asset_id": link["vod_asset_id"], "encrypted": False,
+            "master_url": payload["master_url"], "token": "", "expires_at": payload.get("expires_at"),
+            "via": "vod-api", "next": None}
+
+
 @app.get("/api/episodes/{episode_id}/play")
 def play(episode_id: int, user_id: int):
     ep = get_episode(episode_id)
@@ -373,7 +483,7 @@ def play(episode_id: int, user_id: int):
     if not can_play(user_id, ep):
         PLAY_REQ.labels("need_unlock").inc()
         raise HTTPException(402, "paid episode, unlock first")
-    info = play_info(user_id, ep)
+    info = apply_vod_playback(play_info(user_id, ep), episode_id)
     # 下一集：能播才给地址，客户端用来预加载 master + 首片
     conn = db()
     with conn.cursor() as c:

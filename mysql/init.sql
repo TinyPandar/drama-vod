@@ -67,6 +67,7 @@ CREATE TABLE transcode_job (
   attempts     INT NOT NULL DEFAULT 0,
   max_attempts INT NOT NULL DEFAULT 3,
   locked_until DATETIME NULL,               -- 租约：worker 挂了，过期后别人可以接手
+  claim_version INT NOT NULL DEFAULT 0,      -- 每次抢占 +1；旧 worker 提交时对不上就丢弃
   worker_id    VARCHAR(64) NULL,
   trace_id     VARCHAR(64) NULL,
   last_error   TEXT NULL,

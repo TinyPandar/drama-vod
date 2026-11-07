@@ -305,7 +305,7 @@
         <strong>还没有上架的剧</strong>
         <p class="lede">上传并转码完成后，会出现在这里。</p>
       </div>
-      <p class="fine">本地演示。解锁只写一条记录，不扣金币。</p>
+      <p class="fine">本地演示。解锁只写一条记录，不扣金币。视频云控制台在 <a href="/vod-console/">/vod-console/</a>。</p>
     </main>
   </div>
 
@@ -350,6 +350,9 @@
         <h2 class="label"><i></i>选集</h2>
         <div id="eps" class="eps"></div>
         <div class="side-uid">
+          <label class="btn ghost" for="vod-file">上传到视频云</label>
+          <input id="vod-file" type="file" accept="video/mp4,video/*" hidden>
+          <p class="fine" id="vod-upload-status"></p>
           <button class="linkish" id="log-toggle" type="button">技术日志</button>
           <pre id="log" class="quiet"></pre>
         </div>
@@ -668,7 +671,9 @@ async function play(epId, opts) {
   renderPanel();
   let r;
   try {
-    r = await fetch('/api/episodes/' + state.episodeId + '/play?user_id=' + encodeURIComponent(currentUid()));
+    const uid = encodeURIComponent(currentUid());
+    r = await fetch('/api/episodes/' + state.episodeId + '/vod-play?user_id=' + uid);
+    if (r.status === 404) r = await fetch('/api/episodes/' + state.episodeId + '/play?user_id=' + uid);
   } catch (e) {
     if (gen !== playGen) return;
     $('opening').hidden = true;
@@ -879,6 +884,23 @@ $('handle').onclick = closeSheet;
 $('backdrop').onclick = closeSheet;
 $('sound').onclick = () => { soundOn = !soundOn; updateSound(); if (soundOn) $('v').play().catch(() => {}); };
 $('log-toggle').onclick = () => $('log').classList.toggle('quiet');
+$('vod-file').onchange = async () => {
+  const file = $('vod-file').files && $('vod-file').files[0];
+  if (!file || !state.episodeId) { toast('先打开一集，再上传'); return; }
+  const status = $('vod-upload-status');
+  status.textContent = '正在申请直传地址';
+  const up = await fetch('/api/episodes/' + state.episodeId + '/vod-upload', {method: 'POST'});
+  const info = await up.json();
+  if (!up.ok) { status.textContent = '申请失败'; toast(info.detail || '上传申请失败'); return; }
+  status.textContent = '正在直传，不经过业务服务';
+  const put = await fetch(info.put_url, {method: 'PUT', body: file});
+  if (!put.ok) { status.textContent = '直传失败'; toast('直传失败 ' + put.status); return; }
+  status.textContent = '正在提交转码';
+  const done = await fetch('/api/episodes/' + state.episodeId + '/vod-complete', {method: 'POST'});
+  if (!done.ok) { status.textContent = '提交失败'; toast('转码提交失败'); return; }
+  status.textContent = '已交给视频云转码';
+  toast('上传完成，转码后可播放');
+};
 $('uid-btn').onclick = () => { $('uid-pop').hidden = !$('uid-pop').hidden; };
 $('uid-save').onclick = () => { uidLabel(); $('uid-pop').hidden = true; try { localStorage.setItem('vod.uid', currentUid()); } catch {} };
 $('seek').addEventListener('pointerdown', () => { seeking = true; });

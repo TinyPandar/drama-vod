@@ -6,5 +6,5 @@ COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY common.py worker.py ./
+COPY common.py worker.py hls_verify.py job_route.py ./
 CMD ["python", "-u", "worker.py"]
