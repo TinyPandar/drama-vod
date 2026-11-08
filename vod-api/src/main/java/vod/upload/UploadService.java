@@ -2,6 +2,7 @@ package vod.upload;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.stereotype.Service;
@@ -79,10 +80,23 @@ public class UploadService {
                 "SELECT id, status FROM vod_transcode_job WHERE asset_id = ? AND profile = ?",
                 (rs, n) -> Map.<String, Object>of("job_id", rs.getLong(1), "job_status", rs.getString(2)),
                 assetId, PROFILE);
-        if (!jobs.isEmpty()) return Map.of("asset_id", assetId, "job_id", jobs.get(0).get("job_id"), "job_status", jobs.get(0).get("job_status"));
-        long jobId = insert(
-                "INSERT INTO vod_transcode_job(tenant_id, asset_id, profile, status) VALUES (?,?,?,?)",
-                tenantId, assetId, PROFILE, "PENDING");
+        if (!jobs.isEmpty()) return jobResult(assetId, jobs.get(0));
+        long jobId;
+        try {
+            jobId = insert(
+                    "INSERT INTO vod_transcode_job(tenant_id, asset_id, profile, status) VALUES (?,?,?,?)",
+                    tenantId, assetId, PROFILE, "PENDING");
+        } catch (DuplicateKeyException duplicate) {
+            // 并发 complete: 另一个事务已经建了同一个 (asset_id, profile) 的任务。
+            // FOR UPDATE 读取最新已提交行，避免 REPEATABLE READ 快照看不到它；
+            // 异常在这里被吞掉，事务不回滚，本次请求不写 outbox / usage。
+            var existing = jdbc.query(
+                    "SELECT id, status FROM vod_transcode_job WHERE asset_id = ? AND profile = ? FOR UPDATE",
+                    (rs, n) -> Map.<String, Object>of("job_id", rs.getLong(1), "job_status", rs.getString(2)),
+                    assetId, PROFILE);
+            if (existing.isEmpty()) throw duplicate;
+            return jobResult(assetId, existing.get(0));
+        }
         String body = payload(jobId, assetId, traceId);
         long outboxId = insert(
                 "INSERT INTO vod_outbox(tenant_id, event_type, payload, status) VALUES (?,?,?,?)",
@@ -144,6 +158,10 @@ public class UploadService {
         return out;
     }
 
+    private static Map<String, Object> jobResult(long assetId, Map<String, Object> job) {
+        return Map.of("asset_id", assetId, "job_id", job.get("job_id"), "job_status", job.get("job_status"));
+    }
+
     private String payload(long jobId, long assetId, String traceId) {
         try {
             var body = new LinkedHashMap<String, Object>();
@@ -163,7 +181,7 @@ public class UploadService {
             @Override
             public void afterCommit() {
                 if (publisher.publish(body)) {
-                    jdbc.update("UPDATE vod_outbox SET status = 'PUBLISHED' WHERE id = ?", outboxId);
+                    jdbc.update("UPDATE vod_outbox SET status = 'PUBLISHED', published_at = CURRENT_TIMESTAMP WHERE id = ?", outboxId);
                 }
                 webhooks.dispatch(tenantId, "transcode.requested", body);
             }

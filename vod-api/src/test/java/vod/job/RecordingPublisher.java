@@ -10,10 +10,12 @@ import java.util.List;
 @Profile("test")
 public class RecordingPublisher implements TranscodePublisher {
     public final List<String> messages = new ArrayList<>();
+    /** 测试可切换：默认成功，设为 false 模拟 broker 未确认。 */
+    public volatile boolean result = true;
 
     @Override
     public boolean publish(String payload) {
         messages.add(payload);
-        return true;
+        return result;
     }
 }

@@ -6,3 +6,11 @@ spring:
     password:
   flyway:
     enabled: true
+  task:
+    scheduling:
+      enabled: false
+vod:
+  outbox:
+    # Keep the scheduled loop out of the way; tests call publishPending() directly.
+    publish-interval-ms: 3600000
+    publish-initial-delay-ms: 3600000

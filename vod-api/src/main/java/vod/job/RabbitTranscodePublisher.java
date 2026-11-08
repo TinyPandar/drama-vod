@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 @Component
 @Profile("!test")
 public class RabbitTranscodePublisher implements TranscodePublisher, AutoCloseable {
+    private static final long CONFIRM_TIMEOUT_MILLIS = 5000;
     private final String url;
     private Connection connection;
 
@@ -29,6 +30,7 @@ public class RabbitTranscodePublisher implements TranscodePublisher, AutoCloseab
                 connection = factory.newConnection();
             }
             try (Channel channel = connection.createChannel()) {
+                channel.confirmSelect();
                 channel.queueDeclare("transcode", true, false, false, null);
                 channel.basicPublish("", "transcode",
                         new com.rabbitmq.client.AMQP.BasicProperties.Builder()
@@ -36,8 +38,8 @@ public class RabbitTranscodePublisher implements TranscodePublisher, AutoCloseab
                                 .contentType("application/json")
                                 .build(),
                         payload.getBytes(StandardCharsets.UTF_8));
+                return channel.waitForConfirms(CONFIRM_TIMEOUT_MILLIS);
             }
-            return true;
         } catch (Exception e) {
             return false;
         }

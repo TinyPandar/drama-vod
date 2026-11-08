@@ -11,11 +11,22 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import vod.auth.ApiKeys;
+import vod.job.OutboxPublisher;
 import vod.job.RecordingPublisher;
 import vod.storage.MemoryStorage;
 import vod.webhook.FakeWebhookIo;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -29,6 +40,7 @@ class UploadIsolationTest {
     @Autowired JdbcTemplate jdbc;
     @Autowired MemoryStorage storage;
     @Autowired RecordingPublisher publisher;
+    @Autowired OutboxPublisher outboxPublisher;
     @Autowired FakeWebhookIo webhooks;
     private final ObjectMapper json = new ObjectMapper();
 
@@ -49,6 +61,7 @@ class UploadIsolationTest {
         jdbc.update("INSERT INTO vod_api_credential(tenant_id, key_hash, scopes) VALUES (?,?,?)",
                 2, ApiKeys.sha256("key-b"), "upload,asset");
         publisher.messages.clear();
+        publisher.result = true;
         webhooks.signatures.clear();
     }
 
@@ -88,6 +101,72 @@ class UploadIsolationTest {
 
         JsonNode again = open("key-a", "up-1");
         assertEquals(assetId, again.get("asset_id").asLong());
+    }
+
+    @Test
+    void concurrentCompleteReturnsSameJobAndWritesOneOutbox() throws Exception {
+        JsonNode created = open("key-a", "race-1");
+        long assetId = created.get("asset_id").asLong();
+        long sessionId = created.get("session_id").asLong();
+        String key = jdbc.queryForObject("SELECT source_key FROM vod_media_asset WHERE id = ?", String.class, assetId);
+        storage.put("vod-source", key);
+
+        int workers = 2;
+        var pool = Executors.newFixedThreadPool(workers);
+        var ready = new CountDownLatch(workers);
+        var go = new CountDownLatch(1);
+        try {
+            List<Future<JsonNode>> results = new ArrayList<>();
+            for (int i = 0; i < workers; i++) {
+                results.add(pool.submit(() -> {
+                    ready.countDown();
+                    go.await(5, TimeUnit.SECONDS);
+                    return complete("key-a", sessionId);
+                }));
+            }
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            go.countDown();
+            JsonNode first = results.get(0).get(15, TimeUnit.SECONDS);
+            JsonNode second = results.get(1).get(15, TimeUnit.SECONDS);
+            assertEquals(first.get("job_id").asLong(), second.get("job_id").asLong());
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_transcode_job", Integer.class));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_outbox", Integer.class));
+        assertEquals("PUBLISHED", jdbc.queryForObject("SELECT status FROM vod_outbox", String.class));
+        assertEquals("COMPLETED", jdbc.queryForObject("SELECT status FROM vod_upload_session WHERE id = ?", String.class, sessionId));
+        assertEquals(1, jdbc.queryForObject("SELECT transcode_jobs FROM vod_usage_daily WHERE tenant_id = 1", Integer.class));
+        assertEquals(1, publisher.messages.size());
+    }
+
+    @Test
+    void failedPublishStaysPendingAndOutboxPublisherRetriesOnce() throws Exception {
+        JsonNode created = open("key-a", "fail-1");
+        long assetId = created.get("asset_id").asLong();
+        String key = jdbc.queryForObject("SELECT source_key FROM vod_media_asset WHERE id = ?", String.class, assetId);
+        storage.put("vod-source", key);
+
+        publisher.result = false;
+        JsonNode completed = complete("key-a", created.get("session_id").asLong());
+        assertNotNull(completed.get("job_id"));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_transcode_job", Integer.class));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_outbox", Integer.class));
+        assertEquals("PENDING", jdbc.queryForObject("SELECT status FROM vod_outbox", String.class));
+        assertNull(jdbc.queryForObject("SELECT published_at FROM vod_outbox", Object.class));
+
+        publisher.result = true;
+        assertEquals(1, outboxPublisher.publishPending());
+        assertEquals("PUBLISHED", jdbc.queryForObject("SELECT status FROM vod_outbox", String.class));
+        assertNotNull(jdbc.queryForObject("SELECT published_at FROM vod_outbox", Object.class));
+        String lastMessage = publisher.messages.get(publisher.messages.size() - 1);
+        assertTrue(lastMessage.contains("\"origin\":\"core\"") || lastMessage.contains("\"origin\": \"core\""));
+
+        publisher.messages.clear();
+        assertEquals(0, outboxPublisher.publishPending());
+        assertTrue(publisher.messages.isEmpty());
+        assertEquals("PUBLISHED", jdbc.queryForObject("SELECT status FROM vod_outbox", String.class));
     }
 
     @Test

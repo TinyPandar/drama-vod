@@ -1,0 +1,3 @@
+ALTER TABLE vod_outbox ADD COLUMN attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE vod_outbox ADD COLUMN next_attempt_at TIMESTAMP NULL;
+ALTER TABLE vod_outbox ADD COLUMN published_at TIMESTAMP NULL;
