@@ -22,11 +22,21 @@ vod:
     # 单个源对象字节上限，complete 时按 HEAD 结果判断；0 表示不限制。
     max-object-bytes: ${VOD_UPLOAD_MAX_OBJECT_BYTES:5368709120}
     allowed-extensions: ${VOD_UPLOAD_ALLOWED_EXTENSIONS:mp4,mov,m4v,mkv,webm}
-    # application/octet-stream 兼容不声明类型的客户端；要严格校验可从列表去掉。
-    allowed-content-types: ${VOD_UPLOAD_ALLOWED_CONTENT_TYPES:video/mp4,video/quicktime,video/x-m4v,video/x-matroska,video/webm,application/octet-stream}
+    # application/octet-stream 兼容不声明类型的客户端；binary/octet-stream 是 AWS S3 对未声明类型对象可能返回的值。
+    # 要严格校验可从列表去掉。
+    allowed-content-types: ${VOD_UPLOAD_ALLOWED_CONTENT_TYPES:video/mp4,video/quicktime,video/x-m4v,video/x-matroska,video/webm,application/octet-stream,binary/octet-stream}
   quota:
     # vod_tenant.storage_quota_bytes 为 NULL 时使用；0 表示不限制（当前默认不限制）。
     default-storage-bytes: ${VOD_QUOTA_DEFAULT_STORAGE_BYTES:0}
+  outbox:
+    # 兜底发布轮询（complete 后仍先走快速发布）。多实例靠条件 UPDATE 领取，领取过期后别的实例接手。
+    publish-interval-ms: ${VOD_OUTBOX_PUBLISH_INTERVAL_MS:5000}
+    batch-size: ${VOD_OUTBOX_BATCH_SIZE:20}
+    max-backoff-seconds: ${VOD_OUTBOX_MAX_BACKOFF_SECONDS:300}
+    claim-seconds: ${VOD_OUTBOX_CLAIM_SECONDS:60}
+  metrics:
+    # 任务积压 / outbox gauge 从库里刷新的间隔。
+    refresh-interval-ms: ${VOD_METRICS_REFRESH_INTERVAL_MS:15000}
   api:
     page-size-default: ${VOD_API_PAGE_SIZE_DEFAULT:20}
     page-size-max: ${VOD_API_PAGE_SIZE_MAX:100}

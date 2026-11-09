@@ -130,20 +130,25 @@ Schema：[contracts/transcode-message.v1.schema.json](contracts/transcode-messag
 
 `api/common.py` 和 `worker/common.py` 里的 `transcode_message()` 必须保持同一份。契约检查会比对这两个函数。
 
-## Worker 状态机（现状）
+## Worker 状态机
 
-任务唯一键是 `(asset_id, profile)`，profile 固定 `ladder_v1`。
+任务唯一键是 `(asset_id, profile)`，profile 固定 `ladder_v1`。旧 Demo（`transcode_job`）和 Core（`vod_transcode_job`）共用一个 Worker，按消息里的 `origin` 区分；下表「冻结」的结果对旧 Demo 继续有效，Phase 3 新增的列和状态只在 `vod_*` 表上。
 
-| 现状 | 是否冻结 |
+| 行为 | 是否冻结 |
 |---|---|
-| 抢任务：`PENDING` / `RETRYING`，或 `RUNNING` 且租约已过期 | 冻结到 fencing 落地之前。e2e 不直接测抢占，但多 Worker 依赖它。 |
-| 租约 30 分钟，`attempts` 在抢到时 +1，最多 3 次 | 冻结次数和「失败会进死信」这个结果。具体退避秒数不冻结。 |
-| 失败后退避 10s、20s，第三次 `FAILED` 并进 `transcode.dlq`，资产 `FAILED` | 结果冻结，秒数不冻结。 |
-| 别人正跑且租约未到期：60 秒后再看；已终态则丢弃 | 冻结「重复消息不能跑出第二份产物」。 |
+| 抢任务：`PENDING` / `RETRYING`，或 `RUNNING` 且租约已过期；每次抢到 `claim_version` +1、`attempts` +1 | 冻结。RabbitMQ 重投（`redelivered`）不再抢占租约内的任务：原进程可能还活着，只能等租约过期。 |
+| `claim_version` 围栏：任务 `SUCCEEDED`/`RETRYING`/`FAILED`、资产 `TRANSCODING`/`READY`/`FAILED` 都只在仍持有自己拿到的版本时写入；成功事务先写任务 `SUCCEEDED`，影响 1 行才写资产 `READY` | 冻结。旧 Worker 在租约过期后写不回结果。 |
+| 上传产物前、上传 `master.m3u8` 前各同步续租一次，失败就停止，不传 master、不写 `READY` | 冻结「围栏丢失不出现半成品 master」。 |
+| 租约默认 30 分钟、心跳 60 秒，`attempts` 最多 3 次 | 冻结次数和「失败会进死信」这个结果。租约、心跳是 Worker 环境变量，秒数不冻结。 |
+| 失败退避：指数退避加 jitter，最后一次 `FAILED` 并进 `transcode.dlq`，资产 `FAILED` | 结果冻结，秒数不冻结。 |
+| Core 失败分类：输入不可解析、无视频流、源对象不存在等不可重试错误首次即 `FAILED` + 死信；其余按退避重试。`vod_transcode_job.error_code` 记分类，`next_attempt_at` 记下次重试时间 | Core 冻结。旧 Demo 不分类，仍按次数重试。 |
+| 别人正跑且租约未到期：延迟后再看；已终态或已取消则丢弃 | 冻结「重复消息不能跑出第二份产物」。 |
 | 成功事务：rendition、资产 `READY`、集的 `asset_id` 和 `READY`、任务 `SUCCEEDED`，然后删 Redis `ep:{id}` | 冻结。master 必须最后上传。 |
-| 补偿扫描：`PENDING` 超过 2 分钟，或 `RUNNING` 租约过期，重新投递 | 行为要保留。2 分钟这个数不冻结。 |
+| 取消（只有 Core）：`POST /api/v1/jobs/{id}/cancel` 把 `PENDING`/`RETRYING`/`RUNNING` 改成 `CANCELLED` 并 `claim_version` +1；在跑的 Worker 续租失败后杀掉 FFmpeg、丢弃结果，不进 retry/DLQ | 冻结。`CANCELLED` 是终态，不会被领取或补偿扫描。 |
+| 补偿扫描：`PENDING` 超过 2 分钟，或 `RUNNING` 租约过期，重新投递；Core 另外兜底 `RETRYING` 且过了 `next_attempt_at` | 行为要保留。2 分钟这个数不冻结。 |
+| DLQ 重放：运维脚本 `scripts/dlq.py replay` 只接受库里 `FAILED` 的 Core 任务，以数据库为准重置并写新 outbox，不转发 DLQ 原消息 | 运维工具，不是公开 API。 |
 
-没有 fencing token。旧 Worker 在租约过期后仍可能把结果写回去。这是已知缺口，不是要保住的行为。Phase 3 加 `claim_version` 时，消息 v1 不用改，因为消费者本来就按 `job_id` 查库。
+`claim_version` 落地后消息 v1 不用改，消费者本来就按 `job_id` 查库。已知缺口：同一资产的产物仍写在固定前缀 `assets/{asset_id}/`（Core 为 `assets/v1/{asset_id}/`），并发写靠上面的围栏和上传前复核收敛，任务专属前缀加原子切换放在 Phase 4。
 
 ## 表归谁
 
@@ -152,7 +157,7 @@ Schema：[contracts/transcode-message.v1.schema.json](contracts/transcode-messag
 | `video_asset` `asset_rendition` `transcode_job` `content_key` | Core | 列可以加，不能改唯一键 `(asset_id, profile)` 和 `(asset_id, name)`。`content_key` 明文是不承诺项，以后改成信封加密时，key 接口的 16 字节响应不变。 |
 | `drama` `episode` `user_unlock` `episode_play_stat` | Demo | Core 的新表不要复制这些名字。`episode.asset_id` 是 Demo 指向 Core 的外键，拆库前保留。 |
 
-资产状态：`UPLOADING → UPLOADED → TRANSCODING → READY`，失败为 `FAILED`。任务状态：`PENDING → RUNNING → SUCCEEDED`，中间可有 `RETRYING`，终态失败为 `FAILED`。
+资产状态：`UPLOADING → UPLOADED → TRANSCODING → READY`，失败为 `FAILED`。任务状态：`PENDING → RUNNING → SUCCEEDED`，中间可有 `RETRYING`，终态失败为 `FAILED`。Core 另有用户取消：任务和（非 `READY` 的）资产为 `CANCELLED`；DLQ 重放把 `FAILED` 的 Core 任务改回 `PENDING`、资产改回 `UPLOADED`。
 
 ## 明确不承诺
 

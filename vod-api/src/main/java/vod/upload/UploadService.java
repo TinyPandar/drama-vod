@@ -181,7 +181,7 @@ public class UploadService {
     public Map<String, Object> job(long tenantId, long jobId) {
         var rows = jdbc.query(
                 "SELECT id, tenant_id, asset_id, profile, status, attempts, max_attempts, claim_version, "
-                        + "locked_until, last_error, updated_at FROM vod_transcode_job WHERE id = ?",
+                        + "locked_until, last_error, error_code, next_attempt_at, updated_at FROM vod_transcode_job WHERE id = ?",
                 (rs, n) -> {
                     TenantGuard.requireVisible(tenantId, rs.getLong("tenant_id"));
                     var out = new LinkedHashMap<String, Object>();
@@ -194,6 +194,8 @@ public class UploadService {
                     out.put("claim_version", rs.getInt("claim_version"));
                     out.put("locked_until", iso(rs.getTimestamp("locked_until")));
                     out.put("last_error", rs.getString("last_error"));
+                    out.put("error_code", rs.getString("error_code"));
+                    out.put("next_attempt_at", iso(rs.getTimestamp("next_attempt_at")));
                     out.put("updated_at", iso(rs.getTimestamp("updated_at")));
                     return out;
                 }, jobId);
@@ -245,10 +247,29 @@ public class UploadService {
                 SESSION_ROW, tenantId, idem);
     }
 
-    /** 同一 Idempotency-Key 重放：返回原会话；预签名有效期不超过会话剩余时间，会话已过期则拒绝。 */
+    /**
+     * 同一 Idempotency-Key 重放：OPEN 会话返回原会话和新的预签名 PUT，有效期不超过会话剩余时间，过期则 409。
+     * 非 OPEN（例如已 COMPLETED）不再签发 put_url：转码期间再 PUT 会覆盖已经 HEAD 校验过的源文件，
+     * 只返回会话、资产与已有任务信息。
+     */
     private Map<String, Object> replay(Session session) {
+        if (!"OPEN".equals(session.status())) return sessionInfo(session);
         if (session.expired(Instant.now())) throw new ConflictException("upload session expired");
         return putResponse(session);
+    }
+
+    private Map<String, Object> sessionInfo(Session session) {
+        var jobs = jdbc.query("SELECT id, status FROM vod_transcode_job WHERE asset_id = ? AND profile = ?",
+                (rs, n) -> Map.<String, Object>of("job_id", rs.getLong(1), "job_status", rs.getString(2)),
+                session.assetId(), PROFILE);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("session_id", session.id());
+        out.put("asset_id", session.assetId());
+        out.put("session_status", session.status());
+        out.put("expires_at", session.expiresAt() == null ? null : session.expiresAt().toString());
+        out.put("job_id", jobs.isEmpty() ? null : jobs.get(0).get("job_id"));
+        out.put("job_status", jobs.isEmpty() ? null : jobs.get(0).get("job_status"));
+        return out;
     }
 
     private Map<String, Object> putResponse(Session session) {

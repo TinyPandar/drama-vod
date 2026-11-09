@@ -53,6 +53,8 @@ services:
     user: "0:0"                 # Docker Desktop 上默认用户读不到 erlang.cookie
     environment:
       RABBITMQ_ERLANG_COOKIE: drama-vod-dev-cookie
+    volumes:                  # 显式启用 rabbitmq_prometheus：Prometheus 抓 :15692 的队列深度（含 retry/dlq）
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     ports: ["15672:15672"]    # 管理界面 guest/guest
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
@@ -99,6 +101,17 @@ services:
     build: {context: ./worker, network: host}
     environment:
       <<: *app-env
+      # 可调配置，留空用 worker.py 里的开发默认值（不是基准或承诺）；scripts/fault_inject.py 会临时缩短租约和心跳
+      WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-}
+      WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS:-}
+      WORKER_FFPROBE_TIMEOUT_SECONDS: ${WORKER_FFPROBE_TIMEOUT_SECONDS:-}
+      WORKER_FFMPEG_TIMEOUT_SECONDS: ${WORKER_FFMPEG_TIMEOUT_SECONDS:-}
+      WORKER_RETRY_BASE_MS: ${WORKER_RETRY_BASE_MS:-}
+      WORKER_RETRY_MAX_MS: ${WORKER_RETRY_MAX_MS:-}
+      WORKER_RETRY_JITTER: ${WORKER_RETRY_JITTER:-}
+      WORKER_REQUEUE_DELAY_MS: ${WORKER_REQUEUE_DELAY_MS:-}
+      WORKER_SWEEP_INTERVAL_SECONDS: ${WORKER_SWEEP_INTERVAL_SECONDS:-}
+      WORKER_SWEEP_PENDING_AGE_SECONDS: ${WORKER_SWEEP_PENDING_AGE_SECONDS:-}
     depends_on:
       api: {condition: service_started}
 

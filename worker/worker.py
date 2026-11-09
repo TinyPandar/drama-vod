@@ -1,27 +1,56 @@
 """FFmpeg 转码 worker：消费 RabbitMQ 的 transcode 队列，产出多码率 HLS 写回对象存储。
 
 一条消息的处理顺序（看懂这个函数就看懂了整条流水线）：
-  1. 抢占任务：带条件的 UPDATE（状态机 + 租约），抢不到说明是重复消息 -> 直接 ack
+  1. 抢占任务：带条件的 UPDATE（状态机 + 租约），抢不到说明是重复消息 -> 租约内延迟再看，终态直接 ack
   2. 下载原片 -> ffprobe 校验
   3. 付费集：取/建内容密钥（重试复用同一把 key）
   4. 一条 ffmpeg 命令出 3 档码率，强制关键帧对齐，首片 1s、之后 4s
-  5. 上传分片和子 m3u8，最后才上传 master.m3u8（master 出现 = 产物完整）
-  6. 一个事务里：任务 SUCCEEDED、资产 READY、集指向新资产；删 Redis 缓存
-  资产状态（TRANSCODING/FAILED）只在仍持有当前 claim_version 时更新，旧 worker 不会盖掉新结果
-  失败：attempts < max -> 进延迟重试队列（指数退避）；否则 FAILED + 进死信队列；围栏丢了则直接丢弃
+  5. 上传前同步复核围栏；上传分片和子 m3u8，master.m3u8 前再复核一次、最后才上传（master 出现 = 产物完整）
+  6. 一个事务里：先写带 claim_version 的任务 SUCCEEDED，成功才写资产 READY、集指向新资产；删 Redis 缓存
+  资产状态（TRANSCODING/FAILED/READY）只在仍持有当前 claim_version 时更新，旧 worker 不会盖掉新结果
+  失败：Core 先分类（retry_policy），不可重试直接 FAILED + 死信；可重试按指数退避 + jitter 进延迟重试队列，
+  次数用完 FAILED + 死信；围栏丢了（租约被接手、任务被取消）则杀掉 ffmpeg、什么都不写、直接丢弃
 """
 import json, mimetypes, os, shutil, socket, subprocess, threading, time
 
+import pika
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from common import (HLS_BUCKET, Q_DLQ, Q_MAIN, Q_RETRY, db, log, mq_channel, publish, rds, s3,
                     transcode_message, wait_for)
-from fencing import apply_failure, update_asset_status
+from fencing import apply_failure, claim, commit_success, due_jobs, record_failure, update_asset_status
+from fencing import renew_lease as renew_lease_sql
 from hls_verify import verify_hls
 from job_route import hls_prefix, job_table, updates_episode
+from retry_policy import (INPUT_INVALID, NO_VIDEO_STREAM, OUTPUT_INVALID, SOURCE_MISSING, TIMEOUT,
+                          TRANSCODE_FAILED, FenceLost, JobError, plan_failure)
+
+
+def env_int(name, default):
+    return int(os.environ.get(name) or default)
+
+
+def env_float(name, default):
+    return float(os.environ.get(name) or default)
+
 
 WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
-LEASE_MIN = 30
+# 以下都是可调配置项（环境变量），默认值只是开发默认，不是基准或承诺。
+LEASE_SEC = env_int("WORKER_LEASE_SECONDS", 1800)            # 租约时长
+HEARTBEAT_SEC = env_int("WORKER_HEARTBEAT_SECONDS", 60)      # 续租间隔，须明显小于租约
+if HEARTBEAT_SEC * 3 > LEASE_SEC:                            # 至少留两次续租机会
+    HEARTBEAT_SEC = max(1, LEASE_SEC // 3)
+FFPROBE_TIMEOUT_SEC = env_int("WORKER_FFPROBE_TIMEOUT_SECONDS", 120)
+FFMPEG_TIMEOUT_SEC = env_int("WORKER_FFMPEG_TIMEOUT_SECONDS", 3600)
+RETRY_BASE_MS = env_int("WORKER_RETRY_BASE_MS", 10_000)      # 第 1 次失败后的退避上限
+RETRY_MAX_MS = env_int("WORKER_RETRY_MAX_MS", 600_000)       # 退避封顶
+RETRY_JITTER = env_float("WORKER_RETRY_JITTER", 0.5)         # 退避随机缩短比例 0~1
+REQUEUE_DELAY_MS = env_int("WORKER_REQUEUE_DELAY_MS", 60_000)  # 别人租约内：多久后再看
+SWEEP_INTERVAL_SEC = env_int("WORKER_SWEEP_INTERVAL_SECONDS", 60)
+SWEEP_PENDING_AGE_SEC = env_int("WORKER_SWEEP_PENDING_AGE_SECONDS", 120)
+METRICS_PORT = env_int("WORKER_METRICS_PORT", 9100)
+POLL_SEC = 0.5                                               # 子进程轮询间隔：围栏丢失后多快杀掉 ffmpeg
+
 FIRST_SEG, SEG = 1, 4   # 首片 1s（秒开），之后 4s
 # 码率阶梯：(名字, 短边像素, 视频码率kbps)。竖屏短剧 720p = 720x1280。另一条边按比例算(-2 保证偶数)
 LADDER = [("720p", 720, 2500), ("540p", 540, 1200), ("360p", 360, 600)]
@@ -29,6 +58,10 @@ LADDER = [("720p", 720, 2500), ("540p", 540, 1200), ("360p", 360, 600)]
 JOBS = Counter("vod_transcode_jobs_total", "transcode job results", ["result"])
 DUR = Histogram("vod_transcode_seconds", "transcode wall time", buckets=(5, 10, 30, 60, 120, 300, 600, 1800))
 INFLIGHT = Gauge("vod_transcode_inflight", "jobs running in this worker")
+HEARTBEAT = Gauge("vod_worker_heartbeat_timestamp_seconds",
+                  "unix time of the last successful lease renewal or sweeper DB pass")
+LEASE_LOST = Counter("vod_worker_lease_lost_total", "heartbeat found the claim fence lost (taken over or cancelled)")
+DROP_FENCED = Counter("vod_worker_drop_fenced_total", "results dropped because the claim fence was lost")
 
 s3c = s3()
 r = rds()
@@ -44,45 +77,63 @@ def ensure_claim_version():
     conn.close()
 
 
-def claim(c, job_id, table="transcode_job", steal=False):
-    """PENDING/RETRYING 可抢。RUNNING 只在租约过期，或消息被重新投递（原进程已死）时抢走。claim_version +1，旧进程不能再提交。"""
-    table = job_table("core" if table == "vod_transcode_job" else "legacy") if table in ("transcode_job", "vod_transcode_job") else job_table(table)
-    running = "status='RUNNING'" if steal else "(status='RUNNING' AND locked_until < NOW())"
-    n = c.execute(
-        f"UPDATE {table} SET status='RUNNING', attempts=attempts+1, worker_id=%s, "
-        "claim_version=claim_version+1, locked_until=NOW() + INTERVAL %s MINUTE "
-        f"WHERE id=%s AND (status IN ('PENDING','RETRYING') OR {running})",
-        (WORKER_ID, LEASE_MIN, job_id))
-    return n == 1
-
-
-def renew_lease(job_id, version, table="transcode_job"):
-    table = job_table("core" if table == "vod_transcode_job" else "legacy")
+def renew_lease(job_id, version, origin="legacy"):
     conn = db()
     try:
         with conn.cursor() as c:
-            return c.execute(
-                f"UPDATE {table} SET locked_until=NOW() + INTERVAL %s MINUTE "
-                "WHERE id=%s AND claim_version=%s AND status='RUNNING'",
-                (LEASE_MIN, job_id, version)) == 1
+            return renew_lease_sql(c, origin, job_id, version, LEASE_SEC)
     finally:
         conn.close()
 
 
-def run(cmd):
-    p = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd, timeout=None, stop=None, fail_code=TRANSCODE_FAILED):
+    """跑子进程。超时杀掉并抛 JobError(TIMEOUT)；stop 被置位（围栏丢失）时杀掉并抛 FenceLost。"""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + timeout if timeout else None
+    while True:
+        try:
+            out, err = p.communicate(timeout=POLL_SEC)
+            break
+        except subprocess.TimeoutExpired:
+            if stop is not None and stop.is_set():
+                p.kill()
+                p.communicate()
+                raise FenceLost(f"{cmd[0]} killed: fence lost")
+            if deadline is not None and time.monotonic() >= deadline:
+                p.kill()
+                p.communicate()
+                raise JobError(TIMEOUT, f"{cmd[0]} timed out after {timeout}s")
     if p.returncode != 0:
-        raise RuntimeError(f"{cmd[0]} failed: {p.stderr[-800:]}")
-    return p.stdout
+        raise JobError(fail_code, f"{cmd[0]} failed: {err[-800:]}")
+    return out
 
 
-def probe(path):
-    info = json.loads(run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path]))
-    v = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
+def probe(path, stop=None):
+    out = run(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path],
+              FFPROBE_TIMEOUT_SEC, stop, INPUT_INVALID)
+    try:
+        info = json.loads(out)
+        v = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+    except (ValueError, AttributeError) as e:
+        raise JobError(INPUT_INVALID, f"ffprobe output unreadable: {e}") from e
     if not v:
-        raise RuntimeError("no video stream")
-    has_audio = any(s["codec_type"] == "audio" for s in info["streams"])
-    return int(v["width"]), int(v["height"]), int(float(info["format"]["duration"]) * 1000), has_audio
+        raise JobError(NO_VIDEO_STREAM, "no video stream")
+    try:
+        has_audio = any(s.get("codec_type") == "audio" for s in info["streams"])
+        return int(v["width"]), int(v["height"]), int(float(info["format"]["duration"]) * 1000), has_audio
+    except (KeyError, TypeError, ValueError) as e:
+        raise JobError(INPUT_INVALID, f"ffprobe missing field: {e}") from e
+
+
+def download_source(bucket, key, dest):
+    try:
+        s3c.download_file(bucket, key, dest)
+    except Exception as e:
+        resp = getattr(e, "response", None)
+        code = str(resp.get("Error", {}).get("Code", "")) if isinstance(resp, dict) else ""
+        if code in ("404", "NoSuchKey"):
+            raise JobError(SOURCE_MISSING, f"source object missing: {bucket}/{key}") from e
+        raise
 
 
 def build_ffmpeg(src, out, ladder, has_audio, keyinfo, portrait):
@@ -123,26 +174,44 @@ def get_or_create_key(c, asset_id):
     return c.fetchone()
 
 
-def upload_dir(local, prefix):
+def upload_dir(local, prefix, before_master=None):
+    """master 最后传；before_master 在传 master 之前调用，抛异常就不传 master。"""
     files = sorted(os.path.relpath(os.path.join(d, f), local) for d, _, fs in os.walk(local) for f in fs)
     files.sort(key=lambda f: f == "master.m3u8")  # master 最后传
     for rel in files:
+        if rel == "master.m3u8" and before_master:
+            before_master()
         ctype = "application/vnd.apple.mpegurl" if rel.endswith(".m3u8") else (
             mimetypes.guess_type(rel)[0] or "video/mp2t")
         s3c.upload_file(os.path.join(local, rel), HLS_BUCKET, prefix + rel, ExtraArgs={"ContentType": ctype})
     return len(files)
 
 
-def process(job_id, trace_id, origin="legacy", steal=False):
+def renditions_of(ladder, w, h, portrait):
+    out = []
+    for name, p, kbps in ladder:
+        other = round(max(w, h) * p / min(w, h) / 2) * 2
+        rw, rh = (p, other) if portrait else (other, p)
+        out.append((name, rw, rh, kbps))
+    return out
+
+
+def drop_fenced(job_id, version, trace_id, reason):
+    DROP_FENCED.inc()
+    log("drop_fenced", job_id=job_id, claim_version=version, reason=reason, trace_id=trace_id)
+    return "drop"
+
+
+def process(job_id, trace_id, origin="legacy"):
     table = job_table(origin)
     conn = db()
     c = conn.cursor()
-    if not claim(c, job_id, table, steal=steal):
+    if not claim(c, origin, job_id, WORKER_ID, LEASE_SEC):
         c.execute(f"SELECT status, locked_until FROM {table} WHERE id=%s", (job_id,))
         row = c.fetchone()
         conn.close()
         log("skip_duplicate", job_id=job_id, status=row and row["status"], trace_id=trace_id, origin=origin)
-        # 别人正在跑（租约未到期）：延迟再看；已终态：丢弃
+        # 别人正在跑（租约未到期，含消息被重投时原进程仍活着）：延迟再看；已终态/已取消：丢弃
         return "requeue" if row and row["status"] == "RUNNING" else "drop"
     if origin == "core":
         c.execute("SELECT j.attempts, j.max_attempts, j.claim_version, a.id, a.source_bucket, a.source_key, "
@@ -157,27 +226,43 @@ def process(job_id, trace_id, origin="legacy", steal=False):
     asset_id = a["id"]
     version = a["claim_version"]
     if update_asset_status(c, origin, asset_id, job_id, version, "TRANSCODING") != 1:
-        log("drop_fenced", job_id=job_id, claim_version=version, trace_id=trace_id)
         conn.close()
-        return "drop"
-    fenced = threading.Event()
+        return drop_fenced(job_id, version, trace_id, "asset_transcoding")
+    lost, done = threading.Event(), threading.Event()
 
     def beat():
-        while not fenced.wait(60):
-            if not renew_lease(job_id, version, table):
-                fenced.set()
-                log("lease_lost", job_id=job_id, claim_version=version, trace_id=trace_id)
+        while not done.wait(HEARTBEAT_SEC):
+            try:
+                held = renew_lease(job_id, version, origin)
+            except Exception as e:  # 数据库暂时连不上：下次再续，上传前还会同步复核
+                log("heartbeat_error", job_id=job_id, err=str(e)[:200], trace_id=trace_id)
+                continue
+            if held:
+                HEARTBEAT.set_to_current_time()
+                continue
+            lost.set()
+            LEASE_LOST.inc()
+            log("lease_lost", job_id=job_id, claim_version=version, trace_id=trace_id)
+            return
+
+    def check_fence():
+        """同步复核：不只看心跳线程的事件，当场再续一次租，失败就停。"""
+        if lost.is_set() or not renew_lease(job_id, version, origin):
+            lost.set()
+            raise FenceLost("fence lost before upload")
+
     threading.Thread(target=beat, daemon=True).start()
     work = f"/tmp/job_{job_id}"
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(f"{work}/out")
     t0 = time.time()
     INFLIGHT.inc()
-    log("job_start", job_id=job_id, asset_id=asset_id, attempt=a["attempts"], trace_id=trace_id, worker=WORKER_ID)
+    log("job_start", job_id=job_id, asset_id=asset_id, attempt=a["attempts"], claim_version=version,
+        origin=origin, trace_id=trace_id, worker=WORKER_ID)
     try:
         src = f"{work}/source"
-        s3c.download_file(a["source_bucket"], a["source_key"], src)
-        w, h, dur_ms, has_audio = probe(src)
+        download_source(a["source_bucket"], a["source_key"], src)
+        w, h, dur_ms, has_audio = probe(src, lost)
         portrait = h >= w
         short = min(w, h)
         ladder = [x for x in LADDER if x[1] <= short]
@@ -192,56 +277,46 @@ def process(job_id, trace_id, origin="legacy", steal=False):
             keyinfo = f"{work}/keyinfo"
             with open(keyinfo, "w") as f:  # 三行：写进 m3u8 的 key URI / 本地 key 文件 / IV
                 f.write(f"/keys/{asset_id}\n{work}/enc.key\n{k['iv_hex']}\n")
-        run(build_ffmpeg(src, f"{work}/out", ladder, has_audio, keyinfo, portrait))
-        verify_hls(f"{work}/out", [name for name, _, _ in ladder], bool(a["encrypted"]))
-        if fenced.is_set():
-            log("drop_fenced", job_id=job_id, claim_version=version, trace_id=trace_id)
-            return "drop"
+        run(build_ffmpeg(src, f"{work}/out", ladder, has_audio, keyinfo, portrait), FFMPEG_TIMEOUT_SEC, lost)
+        try:
+            verify_hls(f"{work}/out", [name for name, _, _ in ladder], bool(a["encrypted"]))
+        except RuntimeError as e:
+            raise JobError(OUTPUT_INVALID, str(e)) from e
+        check_fence()
         prefix = hls_prefix(origin, asset_id)
-        nfiles = upload_dir(f"{work}/out", prefix)
+        nfiles = upload_dir(f"{work}/out", prefix, before_master=check_fence)
         conn.begin()
-        if updates_episode(origin):
-            for name, p, kbps in ladder:
-                other = round(max(w, h) * p / min(w, h) / 2) * 2
-                rw, rh = (p, other) if portrait else (other, p)
-                c.execute("INSERT INTO asset_rendition(asset_id, name, width, height, video_kbps, playlist_key) "
-                          "VALUES(%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE video_kbps=VALUES(video_kbps)",
-                          (asset_id, name, rw, rh, kbps, f"{prefix}{name}/index.m3u8"))
-            c.execute("UPDATE video_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s "
-                      "WHERE id=%s", (prefix, dur_ms, w, h, asset_id))
-            c.execute("UPDATE episode SET asset_id=%s, status='READY' WHERE id=%s", (asset_id, a["episode_id"]))
-        else:
-            c.execute("UPDATE vod_media_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s "
-                      "WHERE id=%s", (prefix, dur_ms, w, h, asset_id))
-        changed = c.execute(
-            f"UPDATE {table} SET status='SUCCEEDED', locked_until=NULL, last_error=NULL "
-            "WHERE id=%s AND claim_version=%s", (job_id, version))
-        if changed != 1:
+        if not commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, w, h,
+                              renditions_of(ladder, w, h, portrait), a["episode_id"]):
             conn.rollback()
-            log("drop_fenced", job_id=job_id, claim_version=version, trace_id=trace_id)
-            return "drop"
+            return drop_fenced(job_id, version, trace_id, "commit_success")
         conn.commit()
         if a.get("episode_id"):
             r.delete(f"ep:{a['episode_id']}")  # 缓存失效：下次播放读到新 asset_id
         JOBS.labels("succeeded").inc()
         DUR.observe(time.time() - t0)
         log("job_done", job_id=job_id, asset_id=asset_id, renditions=[x[0] for x in ladder], files=nfiles,
-            secs=round(time.time() - t0, 1), trace_id=trace_id)
+            claim_version=version, secs=round(time.time() - t0, 1), trace_id=trace_id)
         return "ok"
+    except FenceLost as e:
+        conn.rollback()
+        return drop_fenced(job_id, version, trace_id, str(e))
     except Exception as e:
         conn.rollback()
-        final = a["attempts"] >= a["max_attempts"]
-        changed = c.execute(f"UPDATE {table} SET status=%s, locked_until=NULL, last_error=%s "
-                            "WHERE id=%s AND claim_version=%s",
-                            ("FAILED" if final else "RETRYING", str(e)[-2000:], job_id, version))
+        final, code, delay = plan_failure(origin, a["attempts"], a["max_attempts"], e,
+                                          RETRY_BASE_MS, RETRY_MAX_MS, RETRY_JITTER)
+        conn.begin()
+        changed = record_failure(c, origin, job_id, version, final, str(e)[-2000:], code, delay)
         if not apply_failure(c, origin, asset_id, job_id, version, changed, final):
-            log("drop_fenced", job_id=job_id, claim_version=version, trace_id=trace_id)
-            return "drop"
+            conn.rollback()
+            return drop_fenced(job_id, version, trace_id, "record_failure")
+        conn.commit()
         JOBS.labels("failed" if final else "retry").inc()
-        log("job_error", job_id=job_id, attempt=a["attempts"], final=final, err=str(e)[-300:], trace_id=trace_id)
-        return "dlq" if final else ("retry", 10_000 * 2 ** (a["attempts"] - 1))
+        log("job_error", job_id=job_id, attempt=a["attempts"], final=final, error_code=code, delay_ms=delay,
+            err=str(e)[-300:], trace_id=trace_id)
+        return "dlq" if final else ("retry", delay)
     finally:
-        fenced.set()
+        done.set()
         INFLIGHT.dec()
         conn.close()
         shutil.rmtree(work, ignore_errors=True)
@@ -249,7 +324,7 @@ def process(job_id, trace_id, origin="legacy", steal=False):
 
 def finish(ch, method, msg, res):
     if res == "requeue":
-        publish(ch, Q_RETRY, msg, delay_ms=60_000)
+        publish(ch, Q_RETRY, msg, delay_ms=REQUEUE_DELAY_MS)
     elif res == "dlq":
         publish(ch, Q_DLQ, msg)
     elif isinstance(res, tuple):
@@ -265,35 +340,34 @@ def on_message(ch, method, props, body):
 
     def work():
         try:
-            res = process(msg["job_id"], msg.get("trace_id"), msg.get("origin") or "legacy",
-                          steal=bool(method.redelivered))
+            # 重投（method.redelivered）不再抢占：原进程可能还活着，只有租约过期才能接手
+            res = process(msg["job_id"], msg.get("trace_id"), msg.get("origin") or "legacy")
         except Exception as e:  # 比如数据库连不上：稍后重试
             log("process_crash", job_id=msg.get("job_id"), err=str(e))
             res = "requeue"
-        conn.add_callback_threadsafe(lambda: finish(ch, method, msg, res))
+        try:
+            conn.add_callback_threadsafe(lambda: finish(ch, method, msg, res))
+        except Exception as e:  # 连接已断：消息会被重投，状态以数据库为准
+            log("ack_lost", job_id=msg.get("job_id"), err=str(e)[:200])
 
     threading.Thread(target=work, daemon=True).start()
 
 
 def sweeper():
-    """补偿扫描（发件箱的简化版）：API 落库成功但发 MQ 失败、或 worker 崩溃租约过期的任务，重新投递。"""
+    """补偿扫描：outbox 之外的兜底。PENDING 太久没人领、RUNNING 租约过期、
+    Core 的 RETRYING 过了 next_attempt_at（延迟重试消息丢了）都重新投递；CANCELLED 和终态不碰。"""
     while True:
         try:
             conn = db()
             with conn.cursor() as c:
-                c.execute("SELECT id, asset_id, trace_id FROM transcode_job WHERE "
-                          "(status='PENDING' AND updated_at < NOW() - INTERVAL 2 MINUTE) OR "
-                          "(status='RUNNING' AND locked_until < NOW())")
-                rows = c.fetchall()
+                rows = due_jobs(c, "legacy", SWEEP_PENDING_AGE_SEC)
             conn.close()
+            HEARTBEAT.set_to_current_time()
             core_rows = []
             try:
                 c2 = db()
                 with c2.cursor() as cur:
-                    cur.execute("SELECT id, asset_id FROM vod_transcode_job WHERE "
-                                "(status='PENDING' AND updated_at < NOW() - INTERVAL 2 MINUTE) OR "
-                                "(status='RUNNING' AND locked_until < NOW())")
-                    core_rows = cur.fetchall()
+                    core_rows = due_jobs(cur, "core", SWEEP_PENDING_AGE_SEC)
                 c2.close()
             except Exception as e:
                 log("sweeper_core_skip", err=str(e)[:120])
@@ -310,19 +384,24 @@ def sweeper():
                 mconn.close()
         except Exception as e:
             log("sweeper_error", err=str(e))
-        time.sleep(60)
+        time.sleep(SWEEP_INTERVAL_SEC)
 
 
 def main():
-    start_http_server(9100)
+    start_http_server(METRICS_PORT)
     wait_for("mysql", lambda: db().close())
     ensure_claim_version()
-    mconn, ch = wait_for("rabbitmq", mq_channel)
     threading.Thread(target=sweeper, daemon=True).start()
-    ch.basic_qos(prefetch_count=1)  # 一个 worker 同时只拿一条，转码是 CPU 密集，靠多开 worker 横向扩
-    ch.basic_consume(Q_MAIN, on_message)
-    log("worker_started", worker=WORKER_ID)
-    ch.start_consuming()
+    while True:  # RabbitMQ 重启或断线后重连；在跑的任务靠租约和围栏收尾
+        mconn, ch = wait_for("rabbitmq", mq_channel)
+        ch.basic_qos(prefetch_count=1)  # 一个 worker 同时只拿一条，转码是 CPU 密集，靠多开 worker 横向扩
+        ch.basic_consume(Q_MAIN, on_message)
+        log("worker_started", worker=WORKER_ID, lease_seconds=LEASE_SEC, heartbeat_seconds=HEARTBEAT_SEC)
+        try:
+            ch.start_consuming()
+        except pika.exceptions.AMQPError as e:
+            log("mq_disconnected", err=str(e)[:200])
+            time.sleep(2)
 
 
 if __name__ == "__main__":

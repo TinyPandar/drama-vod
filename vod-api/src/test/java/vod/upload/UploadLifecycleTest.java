@@ -153,7 +153,49 @@ class UploadLifecycleTest {
         assertEquals("READY", jdbc.queryForObject("SELECT status FROM vod_media_asset WHERE id = ?", String.class, assetId));
     }
 
+    @Test
+    void completedSessionReplayDoesNotIssuePutUrl() throws Exception {
+        JsonNode opened = open("key-a", "done-1", "{}");
+        assertTrue(opened.hasNonNull("put_url"));
+        storage.put("vod-source", sourceKey(opened));
+        long jobId = complete("key-a", opened.get("session_id").asLong(), status().isOk()).get("job_id").asLong();
+
+        JsonNode replay = open("key-a", "done-1", "{}");
+        assertTrue(!replay.has("put_url"), replay.toString());
+        assertTrue(!replay.has("expires_in"), replay.toString());
+        assertEquals(opened.get("session_id").asLong(), replay.get("session_id").asLong());
+        assertEquals(opened.get("asset_id").asLong(), replay.get("asset_id").asLong());
+        assertEquals("COMPLETED", replay.get("session_status").asText());
+        assertEquals(jobId, replay.get("job_id").asLong());
+        assertEquals("PENDING", replay.get("job_status").asText());
+
+        // 会话过期后重放已完成会话：仍只返回信息，不签发 PUT，也不报过期。
+        jdbc.update("UPDATE vod_upload_session SET expires_at = ? WHERE id = ?",
+                Timestamp.from(Instant.now().minusSeconds(1)), opened.get("session_id").asLong());
+        JsonNode late = open("key-a", "done-1", "{}");
+        assertTrue(!late.has("put_url"));
+        assertEquals(jobId, late.get("job_id").asLong());
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_upload_session", Integer.class));
+    }
+
+    @Test
+    void openSessionReplayStillIssuesPutUrl() throws Exception {
+        JsonNode opened = open("key-a", "open-1", "{}");
+        JsonNode replay = open("key-a", "open-1", "{}");
+        assertEquals(opened.get("session_id").asLong(), replay.get("session_id").asLong());
+        assertTrue(replay.get("put_url").asText().contains(sourceKey(opened)));
+        assertTrue(replay.get("expires_in").asInt() > 0);
+        assertTrue(!replay.has("session_status"));
+    }
+
     // 3. HEAD 校验
+
+    @Test
+    void s3BinaryOctetStreamIsAcceptedByDefault() throws Exception {
+        JsonNode opened = open("key-a", null, "{}");
+        storage.put("vod-source", sourceKey(opened), 128, "binary/octet-stream");
+        complete("key-a", opened.get("session_id").asLong(), status().isOk());
+    }
 
     @Test
     void oversizedObjectIsRejectedAndCreatesNoJob() throws Exception {

@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import vod.auth.ApiKeyFilter;
 import vod.auth.TenantPrincipal;
+import vod.job.JobService;
 import vod.upload.UploadService;
 
 import java.util.Map;
@@ -18,13 +19,15 @@ import java.util.Map;
 @RestController
 public class V1Controller {
     private final UploadService uploads;
+    private final JobService jobService;
     private final int defaultPageSize;
     private final int maxPageSize;
 
-    public V1Controller(UploadService uploads,
+    public V1Controller(UploadService uploads, JobService jobService,
                         @Value("${vod.api.page-size-default:20}") int defaultPageSize,
                         @Value("${vod.api.page-size-max:100}") int maxPageSize) {
         this.uploads = uploads;
+        this.jobService = jobService;
         this.defaultPageSize = defaultPageSize;
         this.maxPageSize = maxPageSize;
     }
@@ -70,6 +73,14 @@ public class V1Controller {
     @GetMapping("/api/v1/jobs/{jobId}")
     public Map<String, Object> job(HttpServletRequest request, @PathVariable long jobId) {
         return uploads.job(tenant(request, "job").tenantId(), jobId);
+    }
+
+    /** 取消 Core 任务：200 返回取消后的任务详情（已取消重复调用同样 200），终态 409。 */
+    @PostMapping("/api/v1/jobs/{jobId}/cancel")
+    public Map<String, Object> cancel(HttpServletRequest request, @PathVariable long jobId) {
+        long tenantId = tenant(request, "job").tenantId();
+        jobService.cancel(tenantId, jobId);
+        return uploads.job(tenantId, jobId);
     }
 
     private static TenantPrincipal tenant(HttpServletRequest request, String scope) {

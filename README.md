@@ -8,7 +8,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 ## 分支方案：Phase 3 转码任务可靠性
 
-本分支：`plan/phase-3`，基线 `main` = `5a8b76a`。这里只放修改方案，不直接改业务代码。
+本分支：`plan/phase-3`，基线 `main` = `5a8b76a`。下面先是修改方案，实现已在本分支提交（见「实现说明」），待检查后再合并。
 
 协作方式：其他 agent 请在**本分支**上按下面清单做最小改动开发；不要自行合并到 `main`，也不要另开平行分支。开发完后由「短剧视频服务器开发bot」检查，没问题再合并。
 
@@ -107,6 +107,60 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 - 需要 Docker：`docker compose up -d --build` 后跑真实 MySQL 围栏脚本和 `scripts/fault_inject.py`。
 - 没跑过的不要声称通过，写明原因。
 
+### 实现说明
+
+**取消接口**：`POST /api/v1/jobs/{id}/cancel`，scope `job`。一条条件 UPDATE 把 `PENDING`/`RETRYING`/`RUNNING` 改成 `CANCELLED`，同时 `claim_version+1`、清 `locked_until`/`next_attempt_at`；资产不是 `READY` 时同事务改为 `CANCELLED`。返回 200 和取消后的任务详情；已取消再调用仍 200（版本不再 +1）；`SUCCEEDED`/`FAILED` 返回 409；别的租户或不存在返回 404；scope 不足 403。只有 Core 任务，旧 Demo 不提供取消。Worker 心跳续租因 `status='RUNNING'` 条件失败而发现围栏丢失，0.5 秒轮询内杀掉 FFmpeg 子进程，不写 `READY`、不进 retry/DLQ；成功事务与取消争用同一任务行锁，不会出现「任务已取消、资产却 READY」。
+
+**上传会话重放（第 9 项）**：同一 `Idempotency-Key` 重放非 `OPEN` 会话（例如已 `COMPLETED`）返回 200，但不含 `put_url`/`expires_in`，只返回 `session_id`、`asset_id`、`session_status`、`expires_at`、`job_id`、`job_status`（还没建任务时后两项为 null）。`OPEN` 会话重放行为不变（过期仍 409）。
+
+**迁移 V9**（`V9__job_reliability.sql`，只改 `vod_*` 表）：`vod_transcode_job.error_code`、`next_attempt_at`；`vod_outbox.locked_until`、`locked_by`、`created_at`；索引 `(status, updated_at)`、`(status, created_at)`。Core 任务状态变化时显式写 `updated_at`（旧表本来有 `ON UPDATE`）。`GET /api/v1/jobs/{id}` 新增 `error_code`、`next_attempt_at`。
+
+**`error_code`**（`worker/retry_policy.py`）：不可重试，首次即 `FAILED` + 死信：`INPUT_INVALID`（ffprobe 解析失败）、`NO_VIDEO_STREAM`、`SOURCE_MISSING`（源对象 404）。可重试，按 `min(上限, 基数 × 2^(次数-1))` 再随机缩短最多 jitter 比例：`STORAGE_ERROR`、`DB_ERROR`、`TIMEOUT`（ffprobe/ffmpeg 超时）、`TRANSCODE_FAILED`（ffmpeg 非 0 退出）、`OUTPUT_INVALID`（本地 HLS 校验失败）、`IO_ERROR`、`INTERNAL`。旧 Demo 任务不分类，仍按次数重试，也不写这两列。
+
+**Worker 围栏**：去掉 `steal`，重投时租约内的任务走 requeue；上传产物前、上传 `master.m3u8` 前各同步续租一次，失败就停。续租在同一秒内重复时 PyMySQL 返回 0 行（只统计实际变化的行），所以 0 行时再查一次围栏。Worker 镜像改为 `COPY *.py`（之前漏拷了 `fencing.py`）；RabbitMQ 断线或重启后 Worker 自动重连。
+
+**OutboxPublisher 多实例**：每行发布前用条件 UPDATE 写 `locked_by`（每次领取唯一）/`locked_until` 领取，领到才发布；领取过期后别的实例可接手。发布成功但标记前崩溃会再发一次（至少一次，Worker 按 `job_id` + claim 幂等）。complete 后的快速发布和 Worker sweeper 兜底保留。时间用各实例 JVM 时钟，实例间时钟偏差应远小于领取时长。
+
+**配置项**（默认值只是开发默认，不是基准或承诺）：
+
+| 位置 | 名称 | 默认 | 含义 |
+|---|---|---|---|
+| Worker 环境变量 | `WORKER_LEASE_SECONDS` | 1800 | 租约时长 |
+| | `WORKER_HEARTBEAT_SECONDS` | 60 | 续租间隔；超过租约 1/3 时自动压到 1/3 |
+| | `WORKER_FFPROBE_TIMEOUT_SECONDS` / `WORKER_FFMPEG_TIMEOUT_SECONDS` | 120 / 3600 | 超时后杀子进程，记 `TIMEOUT`（可重试） |
+| | `WORKER_RETRY_BASE_MS` / `WORKER_RETRY_MAX_MS` / `WORKER_RETRY_JITTER` | 10000 / 600000 / 0.5 | 退避基数、上限、随机缩短比例 |
+| | `WORKER_REQUEUE_DELAY_MS` | 60000 | 别的 Worker 租约内时多久后再看 |
+| | `WORKER_SWEEP_INTERVAL_SECONDS` / `WORKER_SWEEP_PENDING_AGE_SECONDS` | 60 / 120 | 补偿扫描间隔、PENDING / 逾期 RETRYING 的宽限 |
+| | `WORKER_METRICS_PORT` | 9100 | `/metrics` 端口 |
+| vod-api `vod.outbox.*` | `batch-size` / `max-backoff-seconds` / `claim-seconds` / `publish-interval-ms` | 20 / 300 / 60 / 5000 | 环境变量 `VOD_OUTBOX_BATCH_SIZE` 等 |
+| vod-api `vod.metrics.*` | `refresh-interval-ms` | 15000 | 积压 gauge 刷新间隔，环境变量 `VOD_METRICS_REFRESH_INTERVAL_MS` |
+
+**指标名**：
+
+- vod-api `/actuator/prometheus`：`vod_jobs_backlog{status="PENDING|RETRYING|RUNNING"}`、`vod_jobs_oldest_age_seconds{status="PENDING|RETRYING"}`（进入该状态最久的任务已等多少秒，RETRYING 含退避）、`vod_outbox_pending`、`vod_outbox_oldest_pending_age_seconds`。
+- Worker `:9100/metrics`：原有 `vod_transcode_jobs_total{result}`、`vod_transcode_seconds`、`vod_transcode_inflight`，新增 `vod_worker_heartbeat_timestamp_seconds`（最近一次成功续租或补偿扫描访问数据库的时间）、`vod_worker_lease_lost_total`、`vod_worker_drop_fenced_total`。
+- RabbitMQ：`rabbitmq/enabled_plugins` 显式启用 `rabbitmq_prometheus`，Prometheus 抓 `rabbitmq:15692/metrics/per-object`，队列深度看 `rabbitmq_queue_messages_ready{queue="transcode|transcode.retry|transcode.dlq"}`。
+- `prometheus/prometheus.yml` 对 worker 用 `dns_sd_configs`，`--scale worker=N` 时抓所有副本。不设告警阈值。
+
+**DLQ 运维**（不是租户 API）：
+
+```bash
+docker compose run --rm --no-deps -v "$PWD/scripts:/scripts:ro" worker python /scripts/dlq.py list
+docker compose run --rm --no-deps -v "$PWD/scripts:/scripts:ro" worker python /scripts/dlq.py replay --job-id 12
+```
+
+`list` 读完全部放回队列；`replay` 只接受库里 `FAILED` 的 Core 任务（其他状态退出码 2，不改数据），在一个事务里重置任务（`PENDING`、`attempts=0`、清 `error_code`/`last_error`、`claim_version+1`）、资产改回 `UPLOADED`、插入新 `vod_outbox` 行，提交后再从 DLQ 移除该任务的消息。
+
+**故障注入**：`python3 scripts/fault_inject.py [--only kill,dup,minio,rabbitmq,cancel]`，在仓库根目录、compose 已启动时运行。脚本用缩短的租约/心跳把 worker 重建成 2 个副本，结束后恢复成 1 个默认配置的副本；每个场景先打印预期结局，再打印 PASS/FAIL 和实际状态。
+
+**新增测试**：`scripts/test_worker_reliability.py`、`scripts/test_dlq.py`（不需要 Docker，前者需要 Python 3.10+）；`scripts/test_fencing_mysql.py`（真实 MySQL，会新建并删除 `vod_fence_test` 库，需要建库权限，compose 下用 root）；Java 新增 `JobCancelTest`、`OutboxPublisherTest`、`JobMetricsTest`，以及设置 `VOD_TEST_MYSQL_URL` 后才运行的 `MysqlSemanticsTest`（Connector/J 连真实 MySQL）。
+
+**affected rows 语义**：PyMySQL 默认只统计实际变化的行；Connector/J 默认 `useAffectedRows=false`，返回匹配行数。Worker 的条件 UPDATE 都让「匹配」必然伴随「变化」（`claim_version+1` 或状态变化），做不到的（资产状态、续租）在 0 行时回查；vod-api 的配额条件 UPDATE 依赖匹配行数（加 0 字节时值不变），不要在 JDBC URL 里打开 `useAffectedRows`。
+
+**可选小项**：默认 MIME 白名单加了 `binary/octet-stream`（`application.yml` 与 `UploadPolicy` 的默认值），只改配置。
+
+**本分支验证情况**（开发机无 Docker）：`mvn test`（Java 21、H2）52 个用例中 48 个通过、4 个 MySQL 用例按设计跳过；设置 `VOD_TEST_MYSQL_URL` 连本机 MySQL 8.4.10 后 52 个全部通过。`test_fencing_mysql.py` 在同一 MySQL 8.4.10 上 14 个通过。`test_worker_fencing.py`、`test_worker_reliability.py`、`test_dlq.py`、`contract_check.py`、`test_bridge.py`、`test_hls_verify.py`、`test_vod_client.py` 通过。**未运行**：`fault_inject.py`、`e2e.py`、compose 栈下的 Worker 镜像构建、`rabbitmq_prometheus` 与 Prometheus DNS 发现的实际抓取，都需要 Docker，合并前须在 compose 环境补跑。
+
 ## Phase 2 收尾（已合并到 `main`，`5a8b76a`）
 
 当前上传与资产接口的行为：
@@ -164,7 +218,13 @@ python scripts/contract_check.py
 python scripts/test_bridge.py
 python scripts/test_hls_verify.py
 python scripts/test_vod_client.py
+python scripts/test_worker_fencing.py
+python scripts/test_worker_reliability.py   # Python 3.10+
+python scripts/test_dlq.py
 python scripts/e2e.py        # 需要 Docker 服务和本机 FFmpeg
+# 需要 Docker：真实 MySQL 围栏与故障注入
+MYSQL_HOST=127.0.0.1 MYSQL_USER=root MYSQL_PASSWORD=<root 口令> python scripts/test_fencing_mysql.py
+python scripts/fault_inject.py
 ```
 
 Java 控制面测试：在 `vod-api/` 下运行 `mvn test`（需要 Java 21 和 Maven）。控制台生产构建：在 `console/` 下运行 `npm ci && npm run build`。

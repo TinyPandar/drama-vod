@@ -14,6 +14,13 @@ vod:
     # Keep the scheduled loop out of the way; tests call publishPending() directly.
     publish-interval-ms: 3600000
     publish-initial-delay-ms: 3600000
+    batch-size: 20
+    max-backoff-seconds: 300
+    claim-seconds: 60
+  metrics:
+    # 测试里手动调用 refresh()。
+    refresh-interval-ms: 3600000
+    refresh-initial-delay-ms: 3600000
   upload:
     session-ttl-seconds: 900
     # 测试用小上限，MemoryStorage 默认对象 128 字节。
@@ -23,3 +30,8 @@ vod:
   api:
     page-size-default: 20
     page-size-max: 50
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus

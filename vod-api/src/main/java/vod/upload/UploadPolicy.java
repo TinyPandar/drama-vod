@@ -21,7 +21,7 @@ public class UploadPolicy {
             @Value("${vod.upload.session-ttl-seconds:900}") int sessionTtlSeconds,
             @Value("${vod.upload.max-object-bytes:0}") long maxObjectBytes,
             @Value("${vod.upload.allowed-extensions:mp4,mov,m4v,mkv,webm}") String extensions,
-            @Value("${vod.upload.allowed-content-types:video/mp4,video/quicktime,video/x-m4v,video/x-matroska,video/webm,application/octet-stream}")
+            @Value("${vod.upload.allowed-content-types:video/mp4,video/quicktime,video/x-m4v,video/x-matroska,video/webm,application/octet-stream,binary/octet-stream}")
             String contentTypes) {
         if (sessionTtlSeconds <= 0) throw new IllegalStateException("vod.upload.session-ttl-seconds must be > 0");
         this.sessionTtlSeconds = sessionTtlSeconds;

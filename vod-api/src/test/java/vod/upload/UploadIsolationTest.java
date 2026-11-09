@@ -100,8 +100,13 @@ class UploadIsolationTest {
         mvc.perform(get("/api/v1/usage").header("X-Api-Key", "key-b"))
                 .andExpect(jsonPath("$.transcode_jobs").value(0));
 
-        JsonNode again = open("key-a", "up-1");
-        assertEquals(assetId, again.get("asset_id").asLong());
+        // 会话已 COMPLETED：同一 Idempotency-Key 重放返回原资产，但不再签发 put_url（Phase 3 第 9 项）。
+        String replay = mvc.perform(post("/api/v1/uploads").header("X-Api-Key", "key-a").header("Idempotency-Key", "up-1")
+                        .contentType("application/json").content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.put_url").doesNotExist())
+                .andReturn().getResponse().getContentAsString();
+        assertEquals(assetId, json.readTree(replay).get("asset_id").asLong());
     }
 
     @Test

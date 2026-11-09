@@ -6,5 +6,6 @@ COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY common.py worker.py hls_verify.py job_route.py ./
+# 复制全部模块（fencing.py、retry_policy.py 等），避免新增模块漏拷导致启动即 ImportError
+COPY *.py ./
 CMD ["python", "-u", "worker.py"]
