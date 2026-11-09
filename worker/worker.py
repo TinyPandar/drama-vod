@@ -7,7 +7,8 @@
   4. 一条 ffmpeg 命令出 3 档码率，强制关键帧对齐，首片 1s、之后 4s
   5. 上传分片和子 m3u8，最后才上传 master.m3u8（master 出现 = 产物完整）
   6. 一个事务里：任务 SUCCEEDED、资产 READY、集指向新资产；删 Redis 缓存
-  失败：attempts < max -> 进延迟重试队列（指数退避）；否则 FAILED + 进死信队列
+  资产状态（TRANSCODING/FAILED）只在仍持有当前 claim_version 时更新，旧 worker 不会盖掉新结果
+  失败：attempts < max -> 进延迟重试队列（指数退避）；否则 FAILED + 进死信队列；围栏丢了则直接丢弃
 """
 import json, mimetypes, os, shutil, socket, subprocess, threading, time
 
@@ -15,6 +16,7 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from common import (HLS_BUCKET, Q_DLQ, Q_MAIN, Q_RETRY, db, log, mq_channel, publish, rds, s3,
                     transcode_message, wait_for)
+from fencing import apply_failure, update_asset_status
 from hls_verify import verify_hls
 from job_route import hls_prefix, job_table, updates_episode
 
@@ -154,6 +156,10 @@ def process(job_id, trace_id, origin="legacy", steal=False):
         a["episode_id"] = None
     asset_id = a["id"]
     version = a["claim_version"]
+    if update_asset_status(c, origin, asset_id, job_id, version, "TRANSCODING") != 1:
+        log("drop_fenced", job_id=job_id, claim_version=version, trace_id=trace_id)
+        conn.close()
+        return "drop"
     fenced = threading.Event()
 
     def beat():
@@ -162,10 +168,6 @@ def process(job_id, trace_id, origin="legacy", steal=False):
                 fenced.set()
                 log("lease_lost", job_id=job_id, claim_version=version, trace_id=trace_id)
     threading.Thread(target=beat, daemon=True).start()
-    if origin == "core":
-        c.execute("UPDATE vod_media_asset SET status='TRANSCODING' WHERE id=%s", (asset_id,))
-    else:
-        c.execute("UPDATE video_asset SET status='TRANSCODING' WHERE id=%s", (asset_id,))
     work = f"/tmp/job_{job_id}"
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(f"{work}/out")
@@ -229,13 +231,12 @@ def process(job_id, trace_id, origin="legacy", steal=False):
     except Exception as e:
         conn.rollback()
         final = a["attempts"] >= a["max_attempts"]
-        c.execute(f"UPDATE {table} SET status=%s, locked_until=NULL, last_error=%s "
-                  "WHERE id=%s AND claim_version=%s",
-                  ("FAILED" if final else "RETRYING", str(e)[-2000:], job_id, version))
-        if final and origin == "core":
-            c.execute("UPDATE vod_media_asset SET status='FAILED' WHERE id=%s", (asset_id,))
-        elif final:
-            c.execute("UPDATE video_asset SET status='FAILED' WHERE id=%s", (asset_id,))
+        changed = c.execute(f"UPDATE {table} SET status=%s, locked_until=NULL, last_error=%s "
+                            "WHERE id=%s AND claim_version=%s",
+                            ("FAILED" if final else "RETRYING", str(e)[-2000:], job_id, version))
+        if not apply_failure(c, origin, asset_id, job_id, version, changed, final):
+            log("drop_fenced", job_id=job_id, claim_version=version, trace_id=trace_id)
+            return "drop"
         JOBS.labels("failed" if final else "retry").inc()
         log("job_error", job_id=job_id, attempt=a["attempts"], final=final, err=str(e)[-300:], trace_id=trace_id)
         return "dlq" if final else ("retry", 10_000 * 2 ** (a["attempts"] - 1))
