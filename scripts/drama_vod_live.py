@@ -35,7 +35,8 @@ def main():
     paid = http("POST", f"/api/dramas/{drama}/episodes", {"ep_no": 2, "title": "paid", "is_paid": True})[1]["episode_id"]
     up = http("POST", f"/api/episodes/{free}/vod-upload")
     assert up[0] == 200 and up[1].get("put_url"), up
-    put = urllib.request.Request(up[1]["put_url"], data=open("/tmp/demo.mp4", "rb").read(), method="PUT")
+    put = urllib.request.Request(up[1]["put_url"], data=open("/tmp/demo.mp4", "rb").read(), method="PUT",
+                                 headers={"Content-Type": "video/mp4"})
     with urllib.request.urlopen(put, timeout=60) as resp:
         assert resp.status in (200, 204)
     done = http("POST", f"/api/episodes/{free}/vod-complete")

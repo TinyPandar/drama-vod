@@ -1,5 +1,6 @@
 package vod.usage;
 
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -9,9 +10,28 @@ import java.util.Map;
 @Service
 public class UsageService {
     private final JdbcTemplate jdbc;
+    private final long defaultStorageQuotaBytes;
 
-    public UsageService(JdbcTemplate jdbc) {
+    /** defaultStorageQuotaBytes 用于 vod_tenant.storage_quota_bytes 为 NULL 的租户；<= 0 表示不限制。 */
+    public UsageService(JdbcTemplate jdbc,
+                        @Value("${vod.quota.default-storage-bytes:0}") long defaultStorageQuotaBytes) {
         this.jdbc = jdbc;
+        this.defaultStorageQuotaBytes = defaultStorageQuotaBytes;
+    }
+
+    /**
+     * 原子占用存储配额：单条条件 UPDATE 同时判断上限并累加，并发 complete 不会一起越过上限。
+     * 必须在调用方事务里执行，后续失败回滚时占用一并回滚。
+     */
+    public void reserveStorage(long tenantId, long bytes) {
+        int updated = jdbc.update("UPDATE vod_tenant SET storage_used_bytes = storage_used_bytes + ? "
+                        + "WHERE id = ? AND (COALESCE(storage_quota_bytes, ?) <= 0 "
+                        + "OR storage_used_bytes + ? <= COALESCE(storage_quota_bytes, ?))",
+                bytes, tenantId, defaultStorageQuotaBytes, bytes, defaultStorageQuotaBytes);
+        if (updated == 1) return;
+        Integer tenants = jdbc.queryForObject("SELECT COUNT(*) FROM vod_tenant WHERE id = ?", Integer.class, tenantId);
+        if (tenants != null && tenants > 0) throw new QuotaExceededException();
+        // 没有租户行时无从记账，也不拦截；正常凭证都挂在已有租户下。
     }
 
     public void addUpload(long tenantId, long bytes) {
@@ -46,5 +66,11 @@ public class UsageService {
             return Map.of("day", day, "storage_bytes", 0, "play_requests", 0, "transcode_jobs", 0);
         }
         return rows.get(0);
+    }
+
+    public static class QuotaExceededException extends RuntimeException {
+        public QuotaExceededException() {
+            super("storage quota exceeded");
+        }
     }
 }

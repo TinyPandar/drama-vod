@@ -14,3 +14,12 @@ vod:
     # Keep the scheduled loop out of the way; tests call publishPending() directly.
     publish-interval-ms: 3600000
     publish-initial-delay-ms: 3600000
+  upload:
+    session-ttl-seconds: 900
+    # 测试用小上限，MemoryStorage 默认对象 128 字节。
+    max-object-bytes: 1048576
+  quota:
+    default-storage-bytes: 0
+  api:
+    page-size-default: 20
+    page-size-max: 50

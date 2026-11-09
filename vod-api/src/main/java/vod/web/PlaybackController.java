@@ -33,7 +33,7 @@ public class PlaybackController {
 
     @GetMapping("/api/v1/assets/{assetId}/playback")
     public Map<String, Object> playback(HttpServletRequest request, @PathVariable long assetId) {
-        TenantPrincipal tenant = (TenantPrincipal) request.getAttribute(ApiKeyFilter.ATTR);
+        TenantPrincipal tenant = ((TenantPrincipal) request.getAttribute(ApiKeyFilter.ATTR)).require("asset");
         var rows = jdbc.query(
                 "SELECT tenant_id, status FROM vod_media_asset WHERE id = ?",
                 (rs, n) -> Map.of("tenant_id", rs.getLong(1), "status", rs.getString(2)),

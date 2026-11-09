@@ -53,6 +53,7 @@ class UploadIsolationTest {
         jdbc.update("DELETE FROM vod_transcode_job");
         jdbc.update("DELETE FROM vod_upload_session");
         jdbc.update("DELETE FROM vod_media_asset");
+        jdbc.update("DELETE FROM vod_storage_object");
         jdbc.update("DELETE FROM vod_api_credential");
         jdbc.update("DELETE FROM vod_tenant");
         jdbc.update("INSERT INTO vod_tenant(id, name) VALUES (1, 'A'), (2, 'B')");

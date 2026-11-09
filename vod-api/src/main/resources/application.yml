@@ -15,6 +15,21 @@ vod:
   play-ttl-seconds: ${PLAY_URL_TTL:600}
   dev-api-key: ${VOD_DEV_API_KEY:}
   amqp-url: ${AMQP_URL:}
+  # 以下都是可调配置项，默认值只是开发默认，不代表性能基准或容量承诺。
+  upload:
+    # 上传会话与预签名 PUT 的有效期（秒）；过期的会话不能 complete。
+    session-ttl-seconds: ${VOD_UPLOAD_SESSION_TTL_SECONDS:900}
+    # 单个源对象字节上限，complete 时按 HEAD 结果判断；0 表示不限制。
+    max-object-bytes: ${VOD_UPLOAD_MAX_OBJECT_BYTES:5368709120}
+    allowed-extensions: ${VOD_UPLOAD_ALLOWED_EXTENSIONS:mp4,mov,m4v,mkv,webm}
+    # application/octet-stream 兼容不声明类型的客户端；要严格校验可从列表去掉。
+    allowed-content-types: ${VOD_UPLOAD_ALLOWED_CONTENT_TYPES:video/mp4,video/quicktime,video/x-m4v,video/x-matroska,video/webm,application/octet-stream}
+  quota:
+    # vod_tenant.storage_quota_bytes 为 NULL 时使用；0 表示不限制（当前默认不限制）。
+    default-storage-bytes: ${VOD_QUOTA_DEFAULT_STORAGE_BYTES:0}
+  api:
+    page-size-default: ${VOD_API_PAGE_SIZE_DEFAULT:20}
+    page-size-max: ${VOD_API_PAGE_SIZE_MAX:100}
   s3:
     endpoint: ${S3_ENDPOINT:}
     public-endpoint: ${S3_PUBLIC_ENDPOINT:}

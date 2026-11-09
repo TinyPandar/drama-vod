@@ -1,13 +1,10 @@
 package vod.storage;
 
+import java.util.Optional;
+
 public class UnavailableStorage implements ObjectStorage {
     @Override
-    public boolean exists(String bucket, String key) {
-        throw new IllegalStateException("object storage is not configured");
-    }
-
-    @Override
-    public long size(String bucket, String key) {
+    public Optional<ObjectHead> head(String bucket, String key) {
         throw new IllegalStateException("object storage is not configured");
     }
 

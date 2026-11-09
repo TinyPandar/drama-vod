@@ -5,6 +5,7 @@ import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.ChecksumMode;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
@@ -14,6 +15,7 @@ import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignReques
 
 import java.net.URI;
 import java.time.Duration;
+import java.util.Optional;
 
 /** 预签名用浏览器能访问的地址，核对文件用内网地址。大文件不经过本服务。 */
 public final class S3ObjectStorage implements ObjectStorage, AutoCloseable {
@@ -38,21 +40,25 @@ public final class S3ObjectStorage implements ObjectStorage, AutoCloseable {
     }
 
     @Override
-    public boolean exists(String bucket, String key) {
+    public Optional<ObjectHead> head(String bucket, String key) {
         try {
-            internal.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
-            return true;
+            var r = internal.headObject(HeadObjectRequest.builder().bucket(bucket).key(key)
+                    .checksumMode(ChecksumMode.ENABLED).build());
+            String checksum = r.checksumSHA256() == null ? null : "sha256:" + r.checksumSHA256();
+            long size = r.contentLength() == null ? 0 : r.contentLength();
+            return Optional.of(new ObjectHead(size, unquote(r.eTag()), r.contentType(), checksum));
         } catch (NoSuchKeyException e) {
-            return false;
+            return Optional.empty();
         } catch (S3Exception e) {
-            if (e.statusCode() == 404) return false;
+            if (e.statusCode() == 404) return Optional.empty();
             throw e;
         }
     }
 
-    @Override
-    public long size(String bucket, String key) {
-        return internal.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build()).contentLength();
+    private static String unquote(String etag) {
+        if (etag == null) return null;
+        return etag.length() >= 2 && etag.startsWith("\"") && etag.endsWith("\"")
+                ? etag.substring(1, etag.length() - 1) : etag;
     }
 
     @Override

@@ -9,6 +9,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
+import java.sql.Timestamp;
+import java.time.Instant;
 import java.util.List;
 
 @Component
@@ -34,10 +36,12 @@ public class ApiKeyFilter extends OncePerRequestFilter {
             denied(response);
             return;
         }
+        // expires_at 为 NULL 表示不过期；已过期的 key 与未知 key 一样返回 401。
         List<TenantPrincipal> rows = jdbc.query(
-                "SELECT tenant_id, scopes FROM vod_api_credential WHERE key_hash = ? AND status = 'ACTIVE'",
+                "SELECT tenant_id, scopes FROM vod_api_credential WHERE key_hash = ? AND status = 'ACTIVE' "
+                        + "AND (expires_at IS NULL OR expires_at > ?)",
                 (rs, n) -> new TenantPrincipal(rs.getLong(1), rs.getString(2)),
-                ApiKeys.sha256(raw));
+                ApiKeys.sha256(raw), Timestamp.from(Instant.now()));
         if (rows.isEmpty()) {
             denied(response);
             return;

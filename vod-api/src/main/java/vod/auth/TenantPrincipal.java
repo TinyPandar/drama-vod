@@ -8,4 +8,16 @@ public record TenantPrincipal(long tenantId, String scopes) {
         }
         return false;
     }
+
+    /** 接口入口调用：scope 不足时返回 403，不再往下查资源。 */
+    public TenantPrincipal require(String scope) {
+        if (!allows(scope)) throw new ScopeDeniedException();
+        return this;
+    }
+
+    public static final class ScopeDeniedException extends RuntimeException {
+        public ScopeDeniedException() {
+            super("insufficient scope");
+        }
+    }
 }

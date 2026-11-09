@@ -1,9 +1,10 @@
 package vod.storage;
 
-public interface ObjectStorage {
-    boolean exists(String bucket, String key);
+import java.util.Optional;
 
-    long size(String bucket, String key);
+public interface ObjectStorage {
+    /** 对象不存在时返回 empty。 */
+    Optional<ObjectHead> head(String bucket, String key);
 
     String presignPut(String bucket, String key, int expiresSeconds);
 }

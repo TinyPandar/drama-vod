@@ -47,7 +47,8 @@ def upload(seconds, title):
     mp4(f"/tmp/{title}.mp4", seconds)
     status, opened = http("POST", "/api/v1/uploads", {"encrypted": False}, key=KEY)
     assert status == 200, (status, opened)
-    put = urllib.request.Request(opened["put_url"], data=open(f"/tmp/{title}.mp4", "rb").read(), method="PUT")
+    put = urllib.request.Request(opened["put_url"], data=open(f"/tmp/{title}.mp4", "rb").read(), method="PUT",
+                                 headers={"Content-Type": "video/mp4"})
     with urllib.request.urlopen(put, timeout=60) as resp:
         assert resp.status in (200, 204), resp.status
     return opened
