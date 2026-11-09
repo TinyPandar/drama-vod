@@ -161,6 +161,14 @@ docker compose run --rm --no-deps -v "$PWD/scripts:/scripts:ro" worker python /s
 
 **本分支验证情况**（开发机无 Docker）：`mvn test`（Java 21、H2）52 个用例中 48 个通过、4 个 MySQL 用例按设计跳过；设置 `VOD_TEST_MYSQL_URL` 连本机 MySQL 8.4.10 后 52 个全部通过。`test_fencing_mysql.py` 在同一 MySQL 8.4.10 上 14 个通过。`test_worker_fencing.py`、`test_worker_reliability.py`、`test_dlq.py`、`contract_check.py`、`test_bridge.py`、`test_hls_verify.py`、`test_vod_client.py` 通过。**未运行**：`fault_inject.py`、`e2e.py`、compose 栈下的 Worker 镜像构建、`rabbitmq_prometheus` 与 Prometheus DNS 发现的实际抓取，都需要 Docker，合并前须在 compose 环境补跑。
 
+**剩余风险**：
+
+- **Docker 下未验证**：上面「未运行」的几项只做过语法和参数检查，包括故障注入 5 个场景、Worker 镜像能否正常启动、`rabbitmq_prometheus` 与 worker DNS 发现能否抓到数据。
+- **固定前缀并发写**：同一资产的产物仍写在 `assets/{asset_id}/`（Core 为 `assets/v1/{asset_id}/`），新旧 Worker 并发写同一前缀只靠 `claim_version` 围栏和上传前复核收敛：旧 Worker 写不了 `READY`、也不会在围栏丢失后传 master，但在复核之前已经上传的分片可能被覆盖。任务专属前缀加原子切换按方案放到 Phase 4。
+- **Outbox 时钟**：领取时间用各 vod-api 实例的 JVM 时钟，实例间时钟偏差要远小于 `vod.outbox.claim-seconds`，否则可能提前接手别人的领取，导致重复发布（下游幂等，不会出错，只是多发）。
+- **`transcode.retry` 队头阻塞**：延迟用单条消息的 `expiration`（Phase 0 冻结），RabbitMQ 只在消息到达队头时才判断过期，长延迟消息（退避上限、60 秒 requeue）会把后面的短延迟重试一起拖晚，消息本身不会丢失。Core 任务有 sweeper 兜底：`RETRYING` 且 `next_attempt_at` 已过宽限期就重新投递，额外延迟大致不超过「宽限 + 扫描间隔」；旧 Demo 任务没有 `next_attempt_at`，不在这个兜底范围内。彻底解决需要改队列拓扑（按延迟档位分队列）或以数据库调度为主，都要先改契约。
+- **取消窗口期**：取消恰好发生在 master 已上传、成功事务还没提交时，成功事务的围栏 UPDATE 落空并回滚，任务和资产都是 `CANCELLED`（行锁保证不会出现「已取消却 READY」），但对象存储里留下了完整产物，本分支不清理。资产不是 READY，播放接口不会签发地址。
+
 ## Phase 2 收尾（已合并到 `main`，`5a8b76a`）
 
 当前上传与资产接口的行为：
