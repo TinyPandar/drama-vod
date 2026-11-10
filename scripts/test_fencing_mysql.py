@@ -207,6 +207,8 @@ class StaleClaimCannotWrite(Base):
         asset_table = fencing.ASSET_TABLE[origin]
         job_table = "vod_transcode_job" if origin == "core" else "transcode_job"
         job_id, asset_id, episode_id, old, new = self.stale_and_current(origin)
+        if origin == "core":  # 真实流程里上传前一定先记 WRITING；成功事务只激活 WRITING 的前缀
+            output_prefix.insert_writing(self.c, asset_id, job_id, new, "p/")
         self.assertEqual(fencing.update_asset_status(self.c, origin, asset_id, job_id, new, "TRANSCODING"), 1)
         self.assertEqual(fencing.update_asset_status(self.c, origin, asset_id, job_id, old, "FAILED"), 0)
         self.assertEqual(self.asset_status(asset_id, asset_table), "TRANSCODING")
@@ -295,6 +297,7 @@ class SuccessTransaction(Base):
         job_id, asset_id = self.core_job()
         fencing.claim(self.c, "core", job_id, "w1", 60)
         v = self.job(job_id)["claim_version"]
+        output_prefix.insert_writing(self.c, asset_id, job_id, v, "p/")
         self.conn.begin()
         self.assertTrue(fencing.commit_success(self.c, "core", job_id, v, asset_id, "p/", 1, 2, 2))
         result = {}
@@ -502,6 +505,22 @@ class OutputPrefixLifecycle(Base):
         output_prefix.discard(self.c, new_prefix)  # discard 不会降级 ACTIVE
         self.assertEqual(self.prefixes(asset_id)[new_prefix], "ACTIVE")
 
+    def test_garbage_prefix_cannot_be_reactivated(self):
+        job_id, asset_id = self.core_job()
+        fencing.claim(self.c, "core", job_id, "w", 60)
+        v = self.job(job_id)["claim_version"]
+        p = f"assets/v1/{asset_id}/{job_id}-{v}/"
+        output_prefix.insert_writing(self.c, asset_id, job_id, v, p)
+        output_prefix.discard(self.c, p)                       # 已判为垃圾（可能正在被删）
+        self.conn.begin()
+        self.assertFalse(fencing.commit_success(self.c, "core", job_id, v, asset_id, p, 1, 2, 2))
+        self.conn.rollback()
+        self.assertEqual(self.job(job_id)["status"], "RUNNING")  # 任务 SUCCEEDED 一起回滚
+        self.c.execute("SELECT status, hls_prefix FROM vod_media_asset WHERE id=%s", (asset_id,))
+        row = self.c.fetchone()
+        self.assertNotEqual(row["hls_prefix"], p)
+        self.assertEqual(self.prefixes(asset_id)[p], "GARBAGE")
+
     def test_promote_stale_writing(self):
         running, a1 = self.core_job()
         fencing.claim(self.c, "core", running, "w", 60)
@@ -551,6 +570,97 @@ class OutputPrefixLifecycle(Base):
         self.assertEqual(s3.keys, set())
         self.assertEqual(self.prefixes(asset_id)[p], "DELETED")
         self.assertEqual(output_gc.gc_pass(self.c, s3, "vod-hls", 3600, 10, 2), (0, 0, 0))
+
+
+class GcLockOrder(Base):
+    """审阅发现的反向加锁：清理线程不能先锁前缀再去锁任务。取消/成功事务都是任务 → （资产）→ 前缀，
+    这里让它们拿到任务行锁后、改前缀之前停一下，期间跑一轮 promote_stale_writing，两边都不能报死锁。"""
+
+    class PauseBeforePrefix:
+        def __init__(self, c, seconds):
+            self.c, self.seconds, self.paused = c, seconds, False
+
+        def execute(self, sql, params=None):
+            if "vod_output_prefix" in sql and not self.paused:
+                self.paused = True
+                time.sleep(self.seconds)
+            return self.c.execute(sql, params)
+
+        def fetchone(self):
+            return self.c.fetchone()
+
+    def stale_and_current(self):
+        job_id, asset_id = self.core_job()
+        fencing.claim(self.c, "core", job_id, "old", 60)
+        self.expire_lease(job_id)
+        fencing.claim(self.c, "core", job_id, "new", 60)
+        v = self.job(job_id)["claim_version"]
+        old_p, cur_p = f"assets/v1/{asset_id}/{job_id}-{v - 1}/", f"assets/v1/{asset_id}/{job_id}-{v}/"
+        output_prefix.insert_writing(self.c, asset_id, job_id, v - 1, old_p)   # 过时的写入方：清理要处理它
+        output_prefix.insert_writing(self.c, asset_id, job_id, v, cur_p)
+        return job_id, asset_id, v, old_p, cur_p
+
+    def run_gc_during(self, tx_body):
+        """tx_body(cursor) 在显式事务里执行；清理在它拿到任务行锁之后启动。返回 (事务异常, 清理异常)。"""
+        errors = {}
+
+        def gc():
+            time.sleep(0.3)
+            conn = connect(DB)
+            try:
+                with conn.cursor() as gc_c:
+                    output_gc.promote_stale_writing(gc_c)
+            except Exception as e:
+                errors["gc"] = repr(e)
+            finally:
+                conn.close()
+
+        t = threading.Thread(target=gc)
+        tx = connect(DB, autocommit=False)
+        try:
+            t.start()
+            tx.begin()
+            tx_body(self.PauseBeforePrefix(tx.cursor(), 1.0))
+            tx.commit()
+        except Exception as e:
+            errors["tx"] = repr(e)
+            tx.rollback()
+        finally:
+            tx.close()
+            t.join(15)
+        return errors.get("tx"), errors.get("gc")
+
+    def prefix_status(self, prefix):
+        self.c.execute("SELECT status FROM vod_output_prefix WHERE prefix=%s", (prefix,))
+        return self.c.fetchone()["status"]
+
+    def test_gc_and_cancel_do_not_deadlock(self):
+        job_id, asset_id, v, old_p, cur_p = self.stale_and_current()
+
+        def cancel(c):
+            c.execute(CANCEL_SQL, (job_id, 1))
+            c.execute(CANCEL_ASSET_SQL, (asset_id, 1))
+            c.execute(CANCEL_PREFIX_SQL, (job_id,))
+
+        tx_err, gc_err = self.run_gc_during(cancel)
+        self.assertIsNone(tx_err)
+        self.assertIsNone(gc_err)
+        self.assertEqual(self.job(job_id)["status"], "CANCELLED")
+        self.assertEqual((self.prefix_status(old_p), self.prefix_status(cur_p)), ("GARBAGE", "GARBAGE"))
+
+    def test_gc_and_success_commit_do_not_deadlock(self):
+        job_id, asset_id, v, old_p, cur_p = self.stale_and_current()
+        result = {}
+
+        def success(c):
+            result["ok"] = fencing.commit_success(c, "core", job_id, v, asset_id, cur_p, 1, 2, 2)
+
+        tx_err, gc_err = self.run_gc_during(success)
+        self.assertIsNone(tx_err)
+        self.assertIsNone(gc_err)
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.job(job_id)["status"], "SUCCEEDED")
+        self.assertEqual((self.prefix_status(old_p), self.prefix_status(cur_p)), ("GARBAGE", "ACTIVE"))
 
 
 class ContentKeys(Base):

@@ -50,15 +50,22 @@ def row(i, asset, prefix):
 
 
 class GcTest(unittest.TestCase):
-    def test_promotes_only_stale_writing(self):
-        c = FakeCursor()
-        output_gc.promote_stale_writing(c)
-        sql = c.calls[0][0]
-        self.assertIn("SET p.status='GARBAGE'", sql)
-        self.assertIn("WHERE p.status='WRITING'", sql)
-        self.assertIn("j.claim_version<>p.claim_version", sql)
-        self.assertIn("j.status<>'RUNNING'", sql)
-        self.assertIn("j.id IS NULL", sql)
+    def test_promote_reads_without_locks_then_updates_prefix_rows_only(self):
+        # 不能是 UPDATE ... JOIN 任务表：那样会先锁前缀再等任务行，和取消/成功事务（先任务后前缀）反向
+        c = FakeCursor(due=[{"id": 3}, {"id": 8}])
+        c.execute = lambda sql, params=None: (c.calls.append((sql, params)), 1)[1]
+        self.assertEqual(output_gc.promote_stale_writing(c), 2)
+        (select, _), *updates = c.calls
+        self.assertTrue(select.startswith("SELECT p.id FROM vod_output_prefix p LEFT JOIN vod_transcode_job"))
+        self.assertNotIn("FOR UPDATE", select)
+        for cond in ("p.status='WRITING'", "j.claim_version<>p.claim_version", "j.status<>'RUNNING'", "j.id IS NULL"):
+            self.assertIn(cond, select)
+        self.assertEqual([p for _, p in updates], [(3,), (8,)])
+        for sql, _ in updates:
+            self.assertTrue(sql.startswith("UPDATE vod_output_prefix SET status='GARBAGE'"), sql)
+            self.assertIn("WHERE id=%s AND status='WRITING'", sql)
+            self.assertNotIn("JOIN", sql)
+            self.assertNotIn("vod_transcode_job", sql)
 
     def test_due_selects_only_garbage_past_grace(self):
         c = FakeCursor()
@@ -113,17 +120,26 @@ class PrefixStateTest(unittest.TestCase):
     def test_writing_activate_discard_sql(self):
         c = FakeCursor()
         output_prefix.insert_writing(c, 5, 9, 2, "assets/v1/5/9-2/")
-        output_prefix.activate(c, 5, "assets/v1/5/9-2/")
+        c.execute = lambda sql, params=None, _orig=c.execute: (_orig(sql, params), 1)[1]
+        self.assertTrue(output_prefix.activate(c, 5, "assets/v1/5/9-2/"))
         output_prefix.discard(c, "assets/v1/5/9-3/")
         (ins, ip), (act, ap), (gar, gp), (dis, dp) = c.calls
         self.assertIn("INSERT IGNORE", ins)
         self.assertEqual(ip, (5, 9, 2, "assets/v1/5/9-2/"))
         self.assertIn("SET status='ACTIVE'", act)
+        self.assertIn("status='WRITING'", act)          # 只允许 WRITING → ACTIVE
+        self.assertNotIn("GARBAGE", act)
         self.assertIn("SET status='GARBAGE'", gar)
         self.assertIn("prefix<>%s", gar)
         self.assertIn("SET status='GARBAGE'", dis)
         self.assertIn("status='WRITING'", dis)   # discard 不会把 ACTIVE 降级
         self.assertEqual(dp, ("assets/v1/5/9-3/",))
+
+
+    def test_activate_refuses_non_writing_prefix(self):
+        c = FakeCursor()   # execute 返回 0：自己的前缀已不是 WRITING
+        self.assertFalse(output_prefix.activate(c, 5, "assets/v1/5/9-2/"))
+        self.assertEqual(len(c.calls), 1)  # 不再去改同资产的其他前缀
 
 
 class GraceTest(unittest.TestCase):

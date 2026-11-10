@@ -132,8 +132,10 @@ def commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, width, 
     else:
         c.execute("UPDATE vod_media_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s "
                   "WHERE id=%s", (prefix, dur_ms, width, height, asset_id))
-        # 原子切换点就是这个事务：hls_prefix 与前缀状态一起提交，同资产别的前缀交给清理线程
-        output_prefix.activate(c, asset_id, prefix)
+        # 原子切换点就是这个事务：hls_prefix 与前缀状态一起提交，同资产别的前缀交给清理线程。
+        # 自己的前缀已不是 WRITING（被判为垃圾、可能正在删）就放弃提交，调用方 rollback。
+        if not output_prefix.activate(c, asset_id, prefix):
+            return False
     return True
 
 

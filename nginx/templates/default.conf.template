@@ -88,6 +88,7 @@ server {
     # Core key 服务（Phase 4）：/keys/v1/{asset_id} 到 vod-api，凭 Core 播放 token。不缓存、限流、可跨域（允许 Authorization 头）。
     # 前缀比 /keys/ 长，优先匹配；旧 /keys/{asset_id} 仍到 FastAPI，不变。
     location /keys/v1/ {
+        access_log off;                            # ?token= 带着 Core 播放 token，不写进访问日志
         if ($request_method = OPTIONS) {
             add_header Access-Control-Allow-Origin $vod_cors_origin always;
             add_header Access-Control-Allow-Methods "GET, OPTIONS" always;

@@ -101,8 +101,8 @@ FROZEN_KEYS = '''    location /keys/ {
     }'''
 check("legacy /keys/ location frozen", FROZEN_KEYS in TEMPLATE)
 keys_v1 = TEMPLATE.split("location /keys/v1/ {", 1)[1].split("\n    }\n", 1)[0]
-check("/keys/v1/ goes to vod-api, not cached, rate-limited, no-store",
-      all(x in keys_v1 for x in ("set $vod_upstream vod-api:8001;", "proxy_no_cache 1;", "limit_req zone=vod_keys",
+check("/keys/v1/ goes to vod-api, not cached, not logged, rate-limited, no-store",
+      all(x in keys_v1 for x in ("access_log off;", "set $vod_upstream vod-api:8001;", "proxy_no_cache 1;", "limit_req zone=vod_keys",
                                  'add_header Cache-Control "no-store, private" always;')))
 check("qoe location rate-limited", re.search(r"location = /api/v1/qoe \{.*?limit_req zone=vod_qoe", TEMPLATE, re.S) is not None)
 

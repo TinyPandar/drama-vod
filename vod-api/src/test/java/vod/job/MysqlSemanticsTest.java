@@ -6,12 +6,19 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import vod.upload.UploadService;
 import vod.usage.UsageService;
 
+import java.sql.Connection;
+import java.sql.Statement;
 import java.sql.Timestamp;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
@@ -23,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -151,5 +159,52 @@ class MysqlSemanticsTest {
         assertEquals(3, jdbc.queryForObject("SELECT claim_version FROM vod_transcode_job WHERE id = 9", Integer.class));
         jdbc.update("UPDATE vod_transcode_job SET status = 'SUCCEEDED' WHERE id = 9");
         assertThrows(UploadService.ConflictException.class, () -> jobs.cancel(1, 9));
+    }
+
+    /**
+     * 真实死锁（不是模拟异常）：另一个事务先改了很多行、锁住资产，取消事务锁了任务行后去等资产，
+     * 另一个事务再去锁任务行 → InnoDB 检测到死锁，回滚改动少的取消事务。核对 Connector/J 报的错
+     * 经 JdbcTemplate 翻译后是 PessimisticLockingFailureException，cancelWithRetry 能接住并在外层重试成功。
+     */
+    @Test
+    void realDeadlockIsTranslatedAndCancelRetrySucceeds() throws Exception {
+        jdbc.update("INSERT INTO vod_media_asset(id, tenant_id, status, source_bucket, source_key) VALUES (5, 1, 'TRANSCODING', 'b', 'k')");
+        jdbc.update("INSERT INTO vod_transcode_job(id, tenant_id, asset_id, profile, status, claim_version) "
+                + "VALUES (9, 1, 5, 'ladder_v1', 'RUNNING', 2)");
+        var ds = ds(DB, "");
+        var tx = new TransactionTemplate(new DataSourceTransactionManager(ds));
+        var jobs = new JobService(new JdbcTemplate(ds));
+        List<Throwable> failures = Collections.synchronizedList(new ArrayList<>());
+        var pool = Executors.newSingleThreadExecutor();
+        try (Connection other = ds.getConnection()) {
+            other.setAutoCommit(false);
+            try (Statement st = other.createStatement()) {
+                for (int i = 0; i < 200; i++) {   // 让它比取消事务「重」，InnoDB 选取消当牺牲者
+                    st.executeUpdate("INSERT INTO vod_outbox(tenant_id, event_type, payload, status) VALUES (1, 'x', 'y', 'PUBLISHED')");
+                }
+                st.executeUpdate("UPDATE vod_media_asset SET width = 1 WHERE id = 5");
+            }
+            var cancel = pool.submit(() -> JobService.cancelWithRetry(() -> {
+                try {
+                    tx.executeWithoutResult(status -> jobs.cancel(1, 9));
+                } catch (RuntimeException e) {
+                    failures.add(e);
+                    throw e;
+                }
+            }));
+            Thread.sleep(500);  // 取消已锁任务行、在等资产行
+            try (Statement st = other.createStatement()) {
+                st.executeUpdate("UPDATE vod_transcode_job SET worker_id = 'other' WHERE id = 9");  // 形成环
+            }
+            Thread.sleep(300);  // 重试的取消现在在等 other 的任务行锁
+            other.commit();
+            cancel.get(30, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(1, failures.size(), "exactly one deadlock victim attempt: " + failures);
+        assertInstanceOf(PessimisticLockingFailureException.class, failures.get(0));
+        assertEquals("CANCELLED", jdbc.queryForObject("SELECT status FROM vod_transcode_job WHERE id = 9", String.class));
+        assertEquals("CANCELLED", jdbc.queryForObject("SELECT status FROM vod_media_asset WHERE id = 5", String.class));
     }
 }

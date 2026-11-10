@@ -113,7 +113,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 |---|---|---|
 | `POST /api/v1/assets/{id}/playback-token` | API Key，scope `asset` | 跨租户/不存在 404，非 `READY` 409。可选 body `ttl_seconds`（≤0 为 400，超上限截到上限）、`viewer_id`（`[A-Za-z0-9_.:-]{1,64}`，只进日志）。返回 `asset_id`、`token`（`vpt1.` 前缀，HMAC 用 `VOD_PLAY_TOKEN_SECRET`）、`master_url`、`expires_at`、`encrypted`；`Cache-Control: no-store`；记一次播放用量。 |
 | `GET /api/v1/assets/{id}/playback` | 同上 | 保留（Demo 在用），与上面共用签名逻辑：`hls_prefix` 是任务专属前缀就签带 gen 的地址，否则沿用旧地址。 |
-| `GET /keys/v1/{asset_id}` | Core token：`Authorization: Bearer` 或 `?token=` | 不走 API Key。token 有效、asset 一致、资产属于 token 租户、`encrypted=1` 且 `READY` 才返回 16 字节；否则 401，无 key 404；全部 `no-store, private`。Nginx 不缓存、`limit_req`、CORS 允许 `Authorization`。 |
+| `GET /keys/v1/{asset_id}` | Core token：`Authorization: Bearer` 或 `?token=` | 不走 API Key。token 有效、asset 一致、资产属于 token 租户、`encrypted=1` 且 `READY` 才返回 16 字节；否则 401，无 key 404；全部 `no-store, private`。Nginx 不缓存、不写访问日志（`?token=` 里有 token）、`limit_req`、CORS 允许 `Authorization`。 |
 | `POST /api/v1/qoe` | body 里的 Core token（过期后有宽限） | 不走 API Key（`sendBeacon` 不能带头）。事件 `startup`/`rebuffer`（`ms`）、`error`（`code`）、`ended`；租户与资产只从 token 取。超限 413，坏 JSON 400，token 无效 401，成功 204 + `no-store`。Nginx `limit_req`、`client_max_body_size`。 |
 
 **各项行为变化**
@@ -121,7 +121,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 1. Core token：`vod.media.CorePlayToken`，格式见 `docs/phase-0-contract.md`「播放签名」的 Core 小节；旧 `PlayToken` 与它互不接受（格式和密钥都不同）。
 2. Key 链路：V10 `vod_content_key`；Worker 对 `origin=core` 用这张表、Key URI 写 `/keys/v1/{id}`（`worker/key_provider.py`），旧 Demo 仍是 `content_key` 与 `/keys/{id}`；vod-api 侧 `vod.key.KeyProvider` + 开发用明文实现 `PlaintextKeyProvider`，不做 KMS。
 3. 任务专属前缀：Core 写到 `assets/v1/{asset}/{job_id}-{claim_version}/`；上传完按本地清单 list 远端（名字、大小、无多余对象）不一致就按 `STORAGE_ERROR` 重试、不提交；切换点仍是带 `claim_version` 的成功事务（`hls_prefix`、`READY`、前缀 `ACTIVE` 同事务）。Nginx 新增带 gen 的 `/hls/v1/` location（排在原 `/hls/v1/` 之前），签名明文 `{exp}/v1/{asset}/{gen} {HLS_SECRET}`，缓存键 `v1/$asset/$gen/$file`；Java 与 Nginx 共用 `docs/contracts/hls-sign-vectors.json`。
-4. 旧前缀清理：V11 `vod_output_prefix`（`WRITING/ACTIVE/GARBAGE/DELETED`）。上传前插 `WRITING`；成功事务自己 `ACTIVE`、同资产其他 `GARBAGE`；失败、围栏丢失（Worker）与取消（vod-api 取消事务）把 `WRITING` 置 `GARBAGE`；清理线程先把过时的 `WRITING`（版本落后、任务不在 `RUNNING`、任务不存在）改成 `GARBAGE`，再删过了宽限期的 `GARBAGE`（分页 list + 批量删），删前复核仍是 `GARBAGE`、格式是该资产的任务专属前缀、且不等于当前 `hls_prefix`，删完 `DELETED`。固定前缀与旧 Demo 前缀没有行，也过不了格式检查。另外上传循环在心跳发现围栏丢失后不再传后续文件。
+4. 旧前缀清理：V11 `vod_output_prefix`（`WRITING/ACTIVE/GARBAGE/DELETED`）。上传前插 `WRITING`；成功事务自己 `ACTIVE`、同资产其他 `GARBAGE`；失败、围栏丢失（Worker）与取消（vod-api 取消事务）把 `WRITING` 置 `GARBAGE`；清理线程先把过时的 `WRITING`（版本落后、任务不在 `RUNNING`、任务不存在）改成 `GARBAGE`，再删过了宽限期的 `GARBAGE`（分页 list + 批量删），删前复核仍是 `GARBAGE`、格式是该资产的任务专属前缀、且不等于当前 `hls_prefix`，删完 `DELETED`。固定前缀与旧 Demo 前缀没有行，也过不了格式检查。另外上传循环在心跳发现围栏丢失后不再传后续文件。清理线程从不锁任务行：先用一致性读 SELECT 找过时的 `WRITING`，再按主键逐行单表 UPDATE（审阅发现最初那条 `UPDATE 前缀 JOIN 任务` 先锁前缀再锁任务，和取消/成功事务交错会在 MySQL 上死锁，已修，`test_fencing_mysql.py` 的 `GcLockOrder` 复现并覆盖）。成功事务只允许自己的前缀 `WRITING → ACTIVE`，已是 `GARBAGE` 的前缀不能被重新激活，否则整个成功事务回滚。
 5. 缓存/CORS/Range：只改 Core 的两个 `/hls/v1/` location 与 `/keys/v1/`。gen 路径成功响应 `public, max-age=<配置>, immutable`；固定前缀 m3u8 短 TTL、分片长 TTL；403/410/404 等按状态码给 `no-store`；`/keys/v1/`、QoE、playback-token 都 `no-store`。CORS 白名单由 `VOD_CORS_ORIGINS` 生成 `map`，`OPTIONS` 预检 204。**原配置下缓存命中的 Range 请求实际返回 200**（回源不带 `Accept-Ranges`，Nginx 不对缓存内容做分段），所以在 Core 的两个 location 加了 `proxy_force_ranges on`，回源不变。
 6. 密钥加固：`VOD_ENV`（compose 默认 `dev`）。非 dev 时空、等于 `dev`、短于 `VOD_MIN_SECRET_LENGTH` 的密钥拒绝启动：FastAPI startup 查 `ORIGIN_SECRET`/`HLS_SECRET`/`TOKEN_SECRET`，Spring `SecretGuard` 查 `HLS_SECRET`/`VOD_PLAY_TOKEN_SECRET`，Nginx 入口脚本 `nginx/entrypoint.d/05-vod-env.envsh` 查 `HLS_SECRET`/`ORIGIN_SECRET`（另拒绝会破坏 Nginx 配置的字符）；dev 只警告。compose 去掉 `ORIGIN_SECRET` 的 `:-dev`，dev 下为空时 api 与 Nginx 各自退回 `dev`。回源密钥用 `hmac.compare_digest`。
 7. QoE：见上表；播放页拿到 `vpt1.` token（`vod-play`）时上报首帧、`waiting`→`playing` 卡顿（不含拖动进度条）、致命错误、结束，攒满 20 条或 `pagehide`/切到后台时 `sendBeacon`。不建表、不设阈值。
@@ -150,9 +150,9 @@ Spring 的数值项在 compose 里没有透传（空字符串会让 Spring 启�
 
 **本分支实际跑过的测试**（2026-11-10，macOS，本机没有 Docker）
 
-- `cd vod-api && mvn test`：81 个用例（原 52 + 新增 29），0 失败，未设 `VOD_TEST_MYSQL_URL` 时 4 个跳过；设到本机 MySQL 8.4.10 再跑：81 个全过，0 跳过（Flyway V1–V11 在 MySQL 上执行）。
+- `cd vod-api && mvn test`：82 个用例（原 52 + 新增 30），0 失败，未设 `VOD_TEST_MYSQL_URL` 时 5 个 MySQL 用例跳过；设到本机 MySQL 8.4.10 再跑：82 个全过，0 跳过（Flyway V1–V11 在 MySQL 上执行；其中 `realDeadlockIsTranslatedAndCancelRetrySucceeds` 在真 MySQL 上制造一次真实死锁，核对取消重试能接住驱动报的错）。
 - Python 3.12：`contract_check`、`test_bridge`、`test_hls_verify`、`test_vod_client`、`test_worker_fencing`、`test_worker_reliability`（39）、`test_dlq`，新增 `test_output_gc`（8）、`test_api_playback`（8，需要 fastapi/httpx）、`test_playback_contract` 全过；系统 Python 3.9 跑 3.10 以下能跑的那些也全过。
-- `test_fencing_mysql.py` 连本机 MySQL 8.4.10（非容器）：21 个全过，含新增的 TRANSCODING/取消两连接交错（两种先后顺序都只等待、不死锁）、前缀生命周期与清理 SQL、两张 key 表不撞号。
+- `test_fencing_mysql.py` 连本机 MySQL 8.4.10（非容器）：24 个全过，含 TRANSCODING/取消两连接交错（两种先后顺序都只等待、不死锁）、清理线程与取消/成功事务交错（修复前两条都复现 `1213 Deadlock`，修复后通过）、垃圾前缀不能再激活、前缀生命周期与清理 SQL、两张 key 表不撞号。
 - 新增 `scripts/nginx_local_check.py`：用本机 Homebrew nginx（不是 compose 里的 `nginx:1.27-alpine`）渲染真实模板 + 入口脚本，对假回源跑 33 项（gen 路径 MISS→HIT、缓存键含 gen、immutable、Range 206、资产级签名读不到 gen 目录、403/410/404 no-store、固定前缀 TTL、旧 `/hls/` 和 `/keys/` 不加新头、`/keys/v1/` 预检与 429、QoE 413），全过。
 - **没跑**：`docker compose` 起栈、`scripts/playback_live.py`、`scripts/fault_inject.py`（含新增 `gc` 场景）、`scripts/e2e.py`、浏览器里的 QoE 上报——本机没有 Docker，未验证；播放页 JS 只做了语法检查。
 
@@ -177,7 +177,7 @@ COMPOSE_PROJECT_NAME=drama-vod-p4 python3 scripts/fault_inject.py --only gc
 - `proxy_force_ranges on` 让缓存未命中时也会对回源流做单段 Range；多段 Range 只在命中时支持。
 - QoE 的 `session_id`、事件内容来自客户端，只做格式与数量限制；token 宽限期内可重复上报，指标可能被同一 token 刷高（有 Nginx 限流）。
 - `vod.qoe.max-body-bytes` 与 Nginx `VOD_QOE_MAX_BODY` 是两处配置，改一处要同步另一处。
-- 取消重试只覆盖 `PessimisticLockingFailureException` 一类；MySQL 驱动把死锁翻译成别的异常时仍会 500（本机 MySQL 用例只验证了“同序只等待”，没有制造真实死锁）。
+- 取消重试只覆盖 `PessimisticLockingFailureException` 一类（真 MySQL 上的死锁已验证属于这一类）；别的异常不重试。
 
 ## Phase 3 转码任务可靠性（已合并到 `main`，`05ce971`）
 

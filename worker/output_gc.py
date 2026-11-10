@@ -15,10 +15,23 @@ from job_route import is_generation_prefix
 
 
 def promote_stale_writing(c):
-    return c.execute(
-        "UPDATE vod_output_prefix p LEFT JOIN vod_transcode_job j ON j.id=p.job_id "
-        "SET p.status='GARBAGE', p.updated_at=CURRENT_TIMESTAMP "
-        "WHERE p.status='WRITING' AND (j.id IS NULL OR j.claim_version<>p.claim_version OR j.status<>'RUNNING')")
+    """过时的 WRITING → GARBAGE。返回改了几行。
+
+    加锁顺序：取消、成功、失败事务都是先锁任务行、再动前缀行。这里绝不能反过来（先锁前缀再等任务行），
+    否则和它们交错会死锁。所以先用普通 SELECT（一致性读，不加锁）找候选，再按主键逐行单表 UPDATE，
+    只锁前缀行本身、不碰任务行。
+
+    「过时」是单调的：claim_version 只增不减，一旦和前缀行不同就永远不同；任务不在 RUNNING 时要再跑必须重新领取，
+    claim_version 也会变；任务行不存在也不会再出现。所以 SELECT 之后不必锁任务行复核。
+    UPDATE 带 status='WRITING' 条件，期间被成功事务激活或被取消改掉的行不会被覆盖。
+    """
+    c.execute("SELECT p.id FROM vod_output_prefix p LEFT JOIN vod_transcode_job j ON j.id=p.job_id "
+              "WHERE p.status='WRITING' AND (j.id IS NULL OR j.claim_version<>p.claim_version OR j.status<>'RUNNING')")
+    changed = 0
+    for row in list(c.fetchall()):
+        changed += c.execute("UPDATE vod_output_prefix SET status='GARBAGE', updated_at=CURRENT_TIMESTAMP "
+                             "WHERE id=%s AND status='WRITING'", (row["id"],))
+    return changed
 
 
 def due_garbage(c, grace_seconds, limit):
