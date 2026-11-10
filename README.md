@@ -8,7 +8,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 ## 分支方案：Phase 4 播放与分发
 
-本分支：`plan/phase-4`，基线 `main` = `05ce971`。本节只是方案，代码尚未实现。
+本分支：`plan/phase-4`，基线 `main` = `05ce971`。下面 1–10 项已在本分支实现（可选小项未做），实现后的接口、配置、指标、测试结果和剩余风险见下一节「Phase 4 实现说明」。
 
 协作方式：其他 agent 请在**本分支**上按下面清单做最小改动开发；不要自行合并到 `main`，也不要另开平行分支。开发完后由「短剧视频服务器开发bot」检查，没问题再合并。
 
@@ -103,6 +103,82 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 - 需要 Docker：用独立项目名起栈，例如 `docker compose -p drama-vod-p4 up -d --build`；compose 里有固定宿主端口（3306、6379、9001、15672 和 `HTTP_PORT`/`UPLOAD_PORT`），和已在跑的栈冲突时先改端口或用 override 文件，不要动已有容器和数据卷。然后跑 `test_fencing_mysql.py`、`scripts/playback_live.py`、`scripts/fault_inject.py`、`scripts/e2e.py`（旧 Demo 回归）。
 - 没跑过的不要声称通过，写明原因。
 
+## Phase 4 实现说明（本分支，未合并到 `main`）
+
+只改 Core；旧 Demo 的 `/hls/{sig}/{exp}/{asset}/`、签名算法与缓存键、`/keys/{asset_id}`、`TOKEN_SECRET` token、`assets/{id}/` 前缀、`content_key`、`/play` 字段都没动（`scripts/test_playback_contract.py` 逐字核对旧 location）。消息 v1 未改。
+
+**新接口**
+
+| 接口 | 鉴权 | 行为 |
+|---|---|---|
+| `POST /api/v1/assets/{id}/playback-token` | API Key，scope `asset` | 跨租户/不存在 404，非 `READY` 409。可选 body `ttl_seconds`（≤0 为 400，超上限截到上限）、`viewer_id`（`[A-Za-z0-9_.:-]{1,64}`，只进日志）。返回 `asset_id`、`token`（`vpt1.` 前缀，HMAC 用 `VOD_PLAY_TOKEN_SECRET`）、`master_url`、`expires_at`、`encrypted`；`Cache-Control: no-store`；记一次播放用量。 |
+| `GET /api/v1/assets/{id}/playback` | 同上 | 保留（Demo 在用），与上面共用签名逻辑：`hls_prefix` 是任务专属前缀就签带 gen 的地址，否则沿用旧地址。 |
+| `GET /keys/v1/{asset_id}` | Core token：`Authorization: Bearer` 或 `?token=` | 不走 API Key。token 有效、asset 一致、资产属于 token 租户、`encrypted=1` 且 `READY` 才返回 16 字节；否则 401，无 key 404；全部 `no-store, private`。Nginx 不缓存、`limit_req`、CORS 允许 `Authorization`。 |
+| `POST /api/v1/qoe` | body 里的 Core token（过期后有宽限） | 不走 API Key（`sendBeacon` 不能带头）。事件 `startup`/`rebuffer`（`ms`）、`error`（`code`）、`ended`；租户与资产只从 token 取。超限 413，坏 JSON 400，token 无效 401，成功 204 + `no-store`。Nginx `limit_req`、`client_max_body_size`。 |
+
+**各项行为变化**
+
+1. Core token：`vod.media.CorePlayToken`，格式见 `docs/phase-0-contract.md`「播放签名」的 Core 小节；旧 `PlayToken` 与它互不接受（格式和密钥都不同）。
+2. Key 链路：V10 `vod_content_key`；Worker 对 `origin=core` 用这张表、Key URI 写 `/keys/v1/{id}`（`worker/key_provider.py`），旧 Demo 仍是 `content_key` 与 `/keys/{id}`；vod-api 侧 `vod.key.KeyProvider` + 开发用明文实现 `PlaintextKeyProvider`，不做 KMS。
+3. 任务专属前缀：Core 写到 `assets/v1/{asset}/{job_id}-{claim_version}/`；上传完按本地清单 list 远端（名字、大小、无多余对象）不一致就按 `STORAGE_ERROR` 重试、不提交；切换点仍是带 `claim_version` 的成功事务（`hls_prefix`、`READY`、前缀 `ACTIVE` 同事务）。Nginx 新增带 gen 的 `/hls/v1/` location（排在原 `/hls/v1/` 之前），签名明文 `{exp}/v1/{asset}/{gen} {HLS_SECRET}`，缓存键 `v1/$asset/$gen/$file`；Java 与 Nginx 共用 `docs/contracts/hls-sign-vectors.json`。
+4. 旧前缀清理：V11 `vod_output_prefix`（`WRITING/ACTIVE/GARBAGE/DELETED`）。上传前插 `WRITING`；成功事务自己 `ACTIVE`、同资产其他 `GARBAGE`；失败、围栏丢失（Worker）与取消（vod-api 取消事务）把 `WRITING` 置 `GARBAGE`；清理线程先把过时的 `WRITING`（版本落后、任务不在 `RUNNING`、任务不存在）改成 `GARBAGE`，再删过了宽限期的 `GARBAGE`（分页 list + 批量删），删前复核仍是 `GARBAGE`、格式是该资产的任务专属前缀、且不等于当前 `hls_prefix`，删完 `DELETED`。固定前缀与旧 Demo 前缀没有行，也过不了格式检查。另外上传循环在心跳发现围栏丢失后不再传后续文件。
+5. 缓存/CORS/Range：只改 Core 的两个 `/hls/v1/` location 与 `/keys/v1/`。gen 路径成功响应 `public, max-age=<配置>, immutable`；固定前缀 m3u8 短 TTL、分片长 TTL；403/410/404 等按状态码给 `no-store`；`/keys/v1/`、QoE、playback-token 都 `no-store`。CORS 白名单由 `VOD_CORS_ORIGINS` 生成 `map`，`OPTIONS` 预检 204。**原配置下缓存命中的 Range 请求实际返回 200**（回源不带 `Accept-Ranges`，Nginx 不对缓存内容做分段），所以在 Core 的两个 location 加了 `proxy_force_ranges on`，回源不变。
+6. 密钥加固：`VOD_ENV`（compose 默认 `dev`）。非 dev 时空、等于 `dev`、短于 `VOD_MIN_SECRET_LENGTH` 的密钥拒绝启动：FastAPI startup 查 `ORIGIN_SECRET`/`HLS_SECRET`/`TOKEN_SECRET`，Spring `SecretGuard` 查 `HLS_SECRET`/`VOD_PLAY_TOKEN_SECRET`，Nginx 入口脚本 `nginx/entrypoint.d/05-vod-env.envsh` 查 `HLS_SECRET`/`ORIGIN_SECRET`（另拒绝会破坏 Nginx 配置的字符）；dev 只警告。compose 去掉 `ORIGIN_SECRET` 的 `:-dev`，dev 下为空时 api 与 Nginx 各自退回 `dev`。回源密钥用 `hmac.compare_digest`。
+7. QoE：见上表；播放页拿到 `vpt1.` token（`vod-play`）时上报首帧、`waiting`→`playing` 卡顿（不含拖动进度条）、致命错误、结束，攒满 20 条或 `pagehide`/切到后台时 `sendBeacon`。不建表、不设阈值。
+8. Demo 桥接：`vod_client` 把连接失败、超时、非 JSON 响应转成 `(502, {"detail": ...})`；新增 `playback_token()`；`vod-play` 改调新接口，返回 Core token 和真实 `encrypted`，付费解锁仍由 `can_play`（402 在调 Core 之前）。旧 `/play` 代码没动（Core 宕机时它原来会抛 500，现在 `vod_client` 返回 502，`/play` 保持旧地址）。播放页对 Core 资产不再走旧的 iPhone 改写接口。
+9. 加锁顺序：Worker 写 `TRANSCODING` 改为显式事务 `SELECT … FROM 任务 WHERE id=? FOR UPDATE` → 校验 `claim_version`/`RUNNING` → `UPDATE 资产`（`fencing.mark_transcoding`，Core 与旧 Demo 都走它）；取消在 `@Transactional` 外层对 `PessimisticLockingFailureException`（死锁、锁等待超时）重试一次，仍失败 503 + `Retry-After`。
+10. 新增 `scripts/playback_live.py`；`docs/phase-0-contract.md` 增补 Core 小节（旧条目原文未改）。
+
+**配置项**（默认值只是开发默认，不是基准或承诺）
+
+| 位置 | 名称 | 默认 | 含义 |
+|---|---|---|---|
+| 全部 | `VOD_ENV` | `dev` | 非 dev 时弱密钥拒绝启动 |
+| | `VOD_MIN_SECRET_LENGTH` | 32 | 最小密钥长度 |
+| vod-api | `VOD_PLAY_TOKEN_SECRET` | 空（dev 退回 `dev`） | Core 播放 token 的 HMAC 密钥 |
+| | `vod.playback.token-ttl-seconds` / `token-ttl-max-seconds`（`VOD_PLAY_TOKEN_TTL_SECONDS` / `VOD_PLAY_TOKEN_TTL_MAX_SECONDS`） | 600 / 3600 | token 与签名地址有效期、上限 |
+| | `vod.qoe.token-grace-seconds` / `max-body-bytes` / `max-events` / `error-codes` | 3600 / 16384 / 50 / hls.js 常见错误名 | QoE 宽限、body 与批大小、错误码白名单 |
+| Worker | `WORKER_OUTPUT_GC_ENABLED` / `WORKER_OUTPUT_GC_GRACE_SECONDS` / `WORKER_OUTPUT_GC_INTERVAL_SECONDS` | 1 / 86400 / 300 | 清理开关、宽限期（启动时抬到不小于租约；须大于 token 最长有效期）、间隔 |
+| | `WORKER_OUTPUT_GC_PREFIX_BATCH` / `WORKER_OUTPUT_GC_DELETE_BATCH` | 20 / 500 | 每轮前缀数、每批对象数（≤1000） |
+| Nginx | `VOD_CORS_ORIGINS` / `VOD_CORS_MAX_AGE` | `http://localhost:8080,http://127.0.0.1:8080` / 600 | 允许的 Origin（逗号分隔或 `*`）、预检缓存 |
+| | `VOD_KEY_RATE` / `VOD_KEY_BURST`，`VOD_QOE_RATE` / `VOD_QOE_BURST` / `VOD_QOE_MAX_BODY` | `20r/s` / 40，`10r/s` / 20 / `16k` | 限流与 QoE body 上限 |
+| | `VOD_HLS_IMMUTABLE_MAX_AGE` / `VOD_HLS_PLAYLIST_MAX_AGE` / `VOD_HLS_SEGMENT_MAX_AGE` / `VOD_HLS_EDGE_CACHE_VALID` | 86400 / 10 / 86400 / `7d` | 客户端缓存（gen 路径、固定前缀 m3u8、固定前缀分片）、gen 路径边缘缓存 |
+
+Spring 的数值项在 compose 里没有透传（空字符串会让 Spring 启动失败），需要时在 override 文件里给 vod-api 设环境变量。生产密钥：`openssl rand -hex 32` 生成，写进 `.env`（已在 `.gitignore`），仓库里不出现真实值。
+
+**新指标**：vod-api `vod_qoe_startup_seconds`（histogram）、`vod_qoe_rebuffer_total`、`vod_qoe_rebuffer_seconds`（count/sum/max）、`vod_qoe_playback_errors_total{code}`（白名单外归 `other`，不带 asset/session/租户标签）、`vod_core_key_requests_total{result}`；Worker `vod_worker_output_gc_prefixes_total`。
+
+**本分支实际跑过的测试**（2026-11-10，macOS，本机没有 Docker）
+
+- `cd vod-api && mvn test`：81 个用例（原 52 + 新增 29），0 失败，未设 `VOD_TEST_MYSQL_URL` 时 4 个跳过；设到本机 MySQL 8.4.10 再跑：81 个全过，0 跳过（Flyway V1–V11 在 MySQL 上执行）。
+- Python 3.12：`contract_check`、`test_bridge`、`test_hls_verify`、`test_vod_client`、`test_worker_fencing`、`test_worker_reliability`（39）、`test_dlq`，新增 `test_output_gc`（8）、`test_api_playback`（8，需要 fastapi/httpx）、`test_playback_contract` 全过；系统 Python 3.9 跑 3.10 以下能跑的那些也全过。
+- `test_fencing_mysql.py` 连本机 MySQL 8.4.10（非容器）：21 个全过，含新增的 TRANSCODING/取消两连接交错（两种先后顺序都只等待、不死锁）、前缀生命周期与清理 SQL、两张 key 表不撞号。
+- 新增 `scripts/nginx_local_check.py`：用本机 Homebrew nginx（不是 compose 里的 `nginx:1.27-alpine`）渲染真实模板 + 入口脚本，对假回源跑 33 项（gen 路径 MISS→HIT、缓存键含 gen、immutable、Range 206、资产级签名读不到 gen 目录、403/410/404 no-store、固定前缀 TTL、旧 `/hls/` 和 `/keys/` 不加新头、`/keys/v1/` 预检与 429、QoE 413），全过。
+- **没跑**：`docker compose` 起栈、`scripts/playback_live.py`、`scripts/fault_inject.py`（含新增 `gc` 场景）、`scripts/e2e.py`、浏览器里的 QoE 上报——本机没有 Docker，未验证；播放页 JS 只做了语法检查。
+
+```bash
+python3 scripts/test_output_gc.py
+python3 scripts/test_playback_contract.py
+python3 scripts/test_api_playback.py         # Python 3.10+，需要 fastapi、httpx
+python3 scripts/nginx_local_check.py         # 需要本机 nginx（带 secure_link），不需要 Docker
+# 需要 Docker（独立项目名，端口冲突时改 HTTP_PORT/UPLOAD_PORT 或用 override）
+docker compose -p drama-vod-p4 up -d --build
+COMPOSE_PROJECT_NAME=drama-vod-p4 python3 scripts/playback_live.py
+COMPOSE_PROJECT_NAME=drama-vod-p4 python3 scripts/fault_inject.py --only gc
+```
+
+**剩余风险**
+
+- compose 栈下的端到端行为（MinIO 匿名直读被拒、真实转码产物、ffmpeg 解密、Prometheus 抓 QoE、`fault_inject` 的 `gc` 场景能否抓到“正在上传”的窗口）都没在本机验证；Nginx 只在 Homebrew 版本上跑过，未在 `nginx:1.27-alpine` 镜像里跑入口脚本。
+- 已经 READY 的旧 Core 加密资产 Key URI 仍是 `/keys/{id}`，需要旧 token 且查的是 `content_key`（可能撞号），未迁移，依旧不可正确播放；需要重新转码才会写成 `/keys/v1/`（重新转码接口属于 Phase 5）。
+- Core 加密资产没有 iPhone 原生改写列表，iPhone 原生播放器取不到 key；Demo 付费集仍走旧链路。
+- `vod_content_key` 明文存 key，只是开发用 `KeyProvider`。
+- 清理依赖宽限期：已被判为垃圾的旧写入方最多在一个心跳间隔内（或 master 前复核前）还可能往自己的前缀补传文件；宽限期默认远大于此，但调得过短时可能留下孤儿对象。清理按库里的行删，`vod_output_prefix` 之外的孤儿对象不会被发现。
+- `proxy_force_ranges on` 让缓存未命中时也会对回源流做单段 Range；多段 Range 只在命中时支持。
+- QoE 的 `session_id`、事件内容来自客户端，只做格式与数量限制；token 宽限期内可重复上报，指标可能被同一 token 刷高（有 Nginx 限流）。
+- `vod.qoe.max-body-bytes` 与 Nginx `VOD_QOE_MAX_BODY` 是两处配置，改一处要同步另一处。
+- 取消重试只覆盖 `PessimisticLockingFailureException` 一类；MySQL 驱动把死锁翻译成别的异常时仍会 500（本机 MySQL 用例只验证了“同序只等待”，没有制造真实死锁）。
+
 ## Phase 3 转码任务可靠性（已合并到 `main`，`05ce971`）
 
 当前任务链路的行为（细节见 `git show 05ce971:README.md`）：
@@ -171,6 +247,8 @@ docker compose run --rm --no-deps -v "$PWD/scripts:/scripts:ro" worker python /s
 需要 Docker 与 Compose 插件。完整端到端脚本需要 Python 3 和本机 FFmpeg；重建控制台需要 Node.js/npm。
 
 ```bash
+# 可选：生产或共享环境先生成密钥写进 .env（不要提交）；dev 下不写也能起，只会打警告
+#   HLS_SECRET=$(openssl rand -hex 32) TOKEN_SECRET=… ORIGIN_SECRET=… VOD_PLAY_TOKEN_SECRET=…，非 dev 再设 VOD_ENV=prod
 docker compose up -d --build
 docker compose ps
 # 可选监控
@@ -202,7 +280,12 @@ python scripts/test_vod_client.py
 python scripts/test_worker_fencing.py
 python scripts/test_worker_reliability.py   # Python 3.10+
 python scripts/test_dlq.py
+python scripts/test_output_gc.py
+python scripts/test_playback_contract.py
+python scripts/test_api_playback.py         # Python 3.10+，需要 fastapi、httpx
+python scripts/nginx_local_check.py         # 需要本机 nginx（带 secure_link）
 python scripts/e2e.py        # 需要 Docker 服务和本机 FFmpeg
+python scripts/playback_live.py             # 需要 Docker 服务、本机 FFmpeg 和 PyMySQL：Core 播放链路
 # 需要 Docker：真实 MySQL 围栏与故障注入
 MYSQL_HOST=127.0.0.1 MYSQL_USER=root MYSQL_PASSWORD=<root 口令> python scripts/test_fencing_mysql.py
 python scripts/fault_inject.py

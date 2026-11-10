@@ -94,6 +94,35 @@ token   = payload + "." + hex(hmac_sha256(TOKEN_SECRET, payload))
 
 默认有效期 `PLAY_URL_TTL=600` 秒。
 
+### Core（Phase 4 新增，上面的旧 Demo 条目不变）
+
+Core 资产走 `/hls/v1/`，签名明文多一段 `v1`，避免和旧资产 id 的签名混用。两种形状：
+
+```
+# Phase 4 起新转码的资产：hls_prefix = assets/v1/{asset_id}/{gen}/，gen = {job_id}-{claim_version}（只含数字和一个 -）
+明文 = "{exp}/v1/{asset_id}/{gen} {HLS_SECRET}"
+URL  = /hls/v1/{签名}/{exp}/{asset_id}/{gen}/master.m3u8
+
+# Phase 4 之前 READY 的资产：hls_prefix 仍是固定前缀 assets/v1/{asset_id}/，URL 不变
+明文 = "{exp}/v1/{asset_id} {HLS_SECRET}"
+URL  = /hls/v1/{签名}/{exp}/{asset_id}/master.m3u8
+```
+
+签名算法与旧 Demo 相同（md5 → base64url 去掉 `=`）。只有为某个 gen 签的地址能读该 gen 目录：资产级签名打到带 gen 的路径会命中带 gen 的 location，按含 gen 的明文校验，403。Nginx 里带 gen 的 location 必须排在不带 gen 的 `/hls/v1/` 正则之前。共享测试向量在 [contracts/hls-sign-vectors.json](contracts/hls-sign-vectors.json)，Java（`PlaybackSignVectorsTest`）与 `scripts/test_playback_contract.py`（代入 Nginx 模板里的 `secure_link_md5` 表达式）都核对它。
+
+Core 播放 token 和旧 token 互不通用：
+
+```
+payload = base64url(无填充)( {"t": tenant_id, "a": asset_id, "exp": exp[, "v": viewer_id]} )   紧凑 JSON
+token   = "vpt1." + payload + "." + base64url(无填充)( hmac_sha256(VOD_PLAY_TOKEN_SECRET, "vpt1." + payload) )
+```
+
+由 `POST /api/v1/assets/{id}/playback-token`（scope `asset`，跨租户/不存在 404，非 READY 409）签发，响应 `token`、`master_url`（与 token 同一个 `exp`）、`expires_at`、`encrypted`，`Cache-Control: no-store`。`viewer_id` 是调用方给的不透明串，只进日志，不入库，不参与授权。`GET /api/v1/assets/{id}/playback` 保留（只给 `master_url`、`expires_at`），与新接口共用签名逻辑。
+
+- `GET /keys/v1/{asset_id}`（vod-api，不走 API Key）：`Authorization: Bearer` 或 `?token=` 带 Core token；token 无效/过期、asset 不一致、资产不属于 token 的租户、未加密、非 READY 都是 **401**，资产没有 key **404**，合法返回 **16 字节**；所有响应 `Cache-Control: no-store, private`。旧 token 在这里无效，Core token 在旧 `/keys/{asset_id}` 也无效。
+- `POST /api/v1/qoe`：不走 API Key，body 里带 Core token；token 过期后在 `vod.qoe.token-grace-seconds` 内仍接受。
+- 有效期、上限、宽限期都是配置项（`vod.playback.*`、`vod.qoe.*`），不冻结具体秒数。
+
 ## 对象与 HLS
 
 | 对象 | 位置 |
@@ -109,6 +138,19 @@ token   = payload + "." + hex(hmac_sha256(TOKEN_SECRET, payload))
 付费资产的 `#EXT-X-KEY` URI 是 `/keys/{asset_id}`。重试复用同一把 key。首片不超过约 1 秒，其后约 4 秒（e2e）。
 
 Nginx 把 `/hls/{sig}/{exp}/{asset}/{file}` 回源到 `vod-hls/assets/{asset}/{file}`。
+
+### Core（Phase 4 新增，上面的旧 Demo 条目不变）
+
+| 对象 | 位置 |
+|---|---|
+| HLS（Phase 4 起） | 桶 `vod-hls`，每次 claim 一个前缀 `assets/v1/{asset_id}/{job_id}-{claim_version}/`，下面的 master / 子列表 / 分片布局与旧 Demo 相同 |
+| HLS（Phase 4 之前已 READY） | 固定前缀 `assets/v1/{asset_id}/`，不迁移、不清理 |
+| 当前播放版本 | `vod_media_asset.hls_prefix`；只在带 `claim_version` 的成功事务里与 `READY`、前缀状态一起切换 |
+| 加密 Key URI | `/keys/v1/{asset_id}`（Phase 4 之前已 READY 的 Core 加密资产仍是 `/keys/{asset_id}`，不迁移） |
+
+- Worker 上传前在 `vod_output_prefix` 记 `WRITING`，master 最后传，传完按本地清单 list 远端核对名字和大小，一致才提交；成功事务把本前缀置 `ACTIVE`、同资产其他前缀置 `GARBAGE`。失败、取消、围栏丢失时本前缀置 `GARBAGE`。
+- Worker 的清理线程只删 `GARBAGE` 且过了 `WORKER_OUTPUT_GC_GRACE_SECONDS` 的任务专属前缀，删前再确认它不是资产当前 `hls_prefix`；删完置 `DELETED`。固定前缀与旧 Demo 前缀永远不删。
+- 边缘：`/hls/v1/{sig}/{exp}/{asset}/{gen}/{file}` 回源 `/internal/origin/v1/{asset}/{gen}/{file}`（对象 `assets/v1/{asset}/{gen}/{file}`），缓存键 `v1/{asset}/{gen}/{file}`；不带 gen 的 `/hls/v1/` 仍是 `v1/{asset}/{file}`。只有 Core 路由给客户端 `Cache-Control`（gen 路径 `public, max-age=…, immutable`；固定前缀 m3u8 短、分片长；403/410 等 `no-store`）和 CORS；旧 `/hls/` 不加这些头。
 
 ## 消息 v1
 
@@ -150,12 +192,15 @@ Schema：[contracts/transcode-message.v1.schema.json](contracts/transcode-messag
 
 `claim_version` 落地后消息 v1 不用改，消费者本来就按 `job_id` 查库。已知缺口：同一资产的产物仍写在固定前缀 `assets/{asset_id}/`（Core 为 `assets/v1/{asset_id}/`），并发写靠上面的围栏和上传前复核收敛，任务专属前缀加原子切换放在 Phase 4。
 
+Phase 4 已对 Core 落地：任务专属前缀见「对象与 HLS」的 Core 小节；旧 Demo 仍是固定前缀（冻结）。Core 写 `TRANSCODING` 改为显式事务、先 `SELECT … FOR UPDATE` 锁任务行再改资产，和取消事务同序。
+
 ## 表归谁
 
 | 表 | 归属 | Phase 0 决定 |
 |---|---|---|
 | `video_asset` `asset_rendition` `transcode_job` `content_key` | Core | 列可以加，不能改唯一键 `(asset_id, profile)` 和 `(asset_id, name)`。`content_key` 明文是不承诺项，以后改成信封加密时，key 接口的 16 字节响应不变。 |
 | `drama` `episode` `user_unlock` `episode_play_stat` | Demo | Core 的新表不要复制这些名字。`episode.asset_id` 是 Demo 指向 Core 的外键，拆库前保留。 |
+| `vod_content_key`（V10） `vod_output_prefix`（V11） | Core（`vod_*`） | Phase 4 新增，只进 Flyway，不进 `mysql/init.sql`。`vod_content_key` 以 `vod_media_asset.id` 为主键，和旧 `content_key`（`video_asset.id`）分开，两套自增 id 不再撞号；明文是不承诺项，key 接口的 16 字节响应不变。`vod_output_prefix` 记录 Core 输出前缀生命周期 `WRITING/ACTIVE/GARBAGE/DELETED`。 |
 
 资产状态：`UPLOADING → UPLOADED → TRANSCODING → READY`，失败为 `FAILED`。任务状态：`PENDING → RUNNING → SUCCEEDED`，中间可有 `RETRYING`，终态失败为 `FAILED`。Core 另有用户取消：任务和（非 `READY` 的）资产为 `CANCELLED`；DLQ 重放把 `FAILED` 的 Core 任务改回 `PENDING`、资产改回 `UPLOADED`。
 

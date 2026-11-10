@@ -7,6 +7,7 @@ MySQL 的 affected rows 语义：PyMySQL 默认不带 CLIENT_FOUND_ROWS，只统
 值本来就相同时返回 0。这里的条件 UPDATE 尽量让「匹配」必然伴随「变化」（claim_version+1、状态变化），
 做不到的（资产状态、续租）在返回 0 时再 SELECT 确认一次。scripts/test_fencing_mysql.py 在真实 MySQL 上核对。
 """
+import output_prefix
 from job_route import job_table, updates_episode
 
 ASSET_TABLE = {"core": "vod_media_asset", "legacy": "video_asset"}
@@ -24,6 +25,29 @@ def update_asset_status(c, origin, asset_id, job_id, version, status):
         # 避免把"重试时资产已经是 TRANSCODING"误判成围栏丢失。
         return 1 if _fence_held(c, origin, asset_id, job_id, version) else 0
     return n
+
+
+def mark_transcoding(conn, c, origin, asset_id, job_id, version):
+    """领取后把资产改成 TRANSCODING。显式事务，先 SELECT ... FOR UPDATE 锁任务行、确认围栏，再改资产。
+
+    加锁顺序与 vod-api 的取消事务（任务 → 资产）、成功/失败事务（先写任务行）一致；
+    以前那条自动提交的 UPDATE 资产 JOIN 任务可能先锁资产再锁任务，与取消交错时会死锁。
+    返回 1 表示围栏仍属于自己，0 表示已丢（被取消或被别人重新领取）。
+    """
+    asset = ASSET_TABLE[origin]
+    conn.begin()
+    try:
+        c.execute(f"SELECT claim_version, status FROM {job_table(origin)} WHERE id=%s FOR UPDATE", (job_id,))
+        row = c.fetchone()
+        if not row or row["claim_version"] != version or row["status"] != "RUNNING":
+            conn.rollback()
+            return 0
+        c.execute(f"UPDATE {asset} SET status='TRANSCODING' WHERE id=%s", (asset_id,))
+        conn.commit()
+        return 1
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _fence_held(c, origin, asset_id, job_id, version):
@@ -86,7 +110,7 @@ def commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, width, 
                    episode_id=None):
     """成功事务的写入部分，调用方负责 begin/commit/rollback。
 
-    先写带 claim_version 的任务 SUCCEEDED：影响 1 行才继续写资产 READY；这条 UPDATE 同时锁住任务行，
+    先写带 claim_version 的任务 SUCCEEDED：影响 1 行才继续写资产 READY（Core 同时把 vod_output_prefix 切到本前缀）；这条 UPDATE 同时锁住任务行，
     并发的取消或新 claim 要等本事务结束，不会出现「任务被取消、资产却 READY」。
     返回 False 表示围栏已丢，调用方 rollback 后丢弃。
     """
@@ -108,6 +132,8 @@ def commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, width, 
     else:
         c.execute("UPDATE vod_media_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s "
                   "WHERE id=%s", (prefix, dur_ms, width, height, asset_id))
+        # 原子切换点就是这个事务：hls_prefix 与前缀状态一起提交，同资产别的前缀交给清理线程
+        output_prefix.activate(c, asset_id, prefix)
     return True
 
 

@@ -30,3 +30,29 @@ def verify_hls(root, renditions, encrypted):
             if not os.path.isfile(path):
                 raise RuntimeError(f"missing segment {name}/{seg}")
     return True
+
+
+def local_manifest(root):
+    """本地产物清单 {相对路径: 字节数}，相对路径用 / 分隔，与对象键后缀一致。"""
+    out = {}
+    for d, _, files in os.walk(root):
+        for f in files:
+            path = os.path.join(d, f)
+            out[os.path.relpath(path, root).replace(os.sep, "/")] = os.path.getsize(path)
+    return out
+
+
+def verify_remote(local, remote, prefix):
+    """上传完、提交前核对远端：remote 是 {对象键: 大小}（list_objects_v2 的结果）。
+    名字集合和大小都必须与本地一致；任务专属前缀里不应有多余对象。不一致抛 RuntimeError。"""
+    expected = {prefix + rel: size for rel, size in local.items()}
+    missing = sorted(k for k in expected if k not in remote)
+    if missing:
+        raise RuntimeError(f"remote missing {len(missing)} objects, e.g. {missing[:3]}")
+    wrong = sorted(k for k, size in expected.items() if remote[k] != size)
+    if wrong:
+        raise RuntimeError(f"remote size mismatch for {len(wrong)} objects, e.g. {wrong[:3]}")
+    extra = sorted(k for k in remote if k not in expected)
+    if extra:
+        raise RuntimeError(f"remote has {len(extra)} unexpected objects, e.g. {extra[:3]}")
+    return True

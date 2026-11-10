@@ -11,11 +11,29 @@ spring:
     baseline-on-migrate: true
     baseline-version: 0
 vod:
+  # dev 以外（如 prod）启动时校验密钥：为空、等于 dev 或短于 security.min-secret-length 就拒绝启动；dev 只警告。
+  env: ${VOD_ENV:dev}
   hls-secret: ${HLS_SECRET:dev}
+  # Core 播放 token 的 HMAC 密钥，和旧 Demo 的 TOKEN_SECRET 分开；dev 下为空时退回 dev。用 openssl rand -hex 32 生成。
+  play-token-secret: ${VOD_PLAY_TOKEN_SECRET:}
   play-ttl-seconds: ${PLAY_URL_TTL:600}
   dev-api-key: ${VOD_DEV_API_KEY:}
   amqp-url: ${AMQP_URL:}
   # 以下都是可调配置项，默认值只是开发默认，不代表性能基准或容量承诺。
+  security:
+    min-secret-length: ${VOD_MIN_SECRET_LENGTH:32}
+  playback:
+    # POST /assets/{id}/playback-token 的 token 与签名地址有效期；body.ttl_seconds 超过上限时截到上限。
+    # 上限应小于 Worker 的 WORKER_OUTPUT_GC_GRACE_SECONDS。
+    token-ttl-seconds: ${VOD_PLAY_TOKEN_TTL_SECONDS:600}
+    token-ttl-max-seconds: ${VOD_PLAY_TOKEN_TTL_MAX_SECONDS:3600}
+  qoe:
+    # token 过期后 QoE 上报仍接受的秒数（播放时长常超过 token 有效期）。
+    token-grace-seconds: ${VOD_QOE_TOKEN_GRACE_SECONDS:3600}
+    max-body-bytes: ${VOD_QOE_MAX_BODY_BYTES:16384}
+    max-events: ${VOD_QOE_MAX_EVENTS:50}
+    # vod_qoe_playback_errors_total{code} 的白名单，其余归 other。
+    error-codes: ${VOD_QOE_ERROR_CODES:manifestLoadError,manifestLoadTimeOut,manifestParsingError,levelLoadError,levelLoadTimeOut,fragLoadError,fragLoadTimeOut,fragParsingError,fragDecryptError,keyLoadError,keyLoadTimeOut,bufferAppendError,bufferStalledError,mediaError,networkError,native}
   upload:
     # 上传会话与预签名 PUT 的有效期（秒）；过期的会话不能 complete。
     session-ttl-seconds: ${VOD_UPLOAD_SESSION_TTL_SECONDS:900}

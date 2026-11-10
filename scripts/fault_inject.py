@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Phase 3 故障注入：docker compose + Core /api/v1 链路。每个场景打印预期结局和 PASS/FAIL。
+"""Phase 3/4 故障注入：docker compose + Core /api/v1 链路。每个场景打印预期结局和 PASS/FAIL。
 
   python3 scripts/fault_inject.py                       # 跑全部场景
-  python3 scripts/fault_inject.py --only cancel,dup     # 只跑部分：kill,dup,minio,rabbitmq,cancel
+  python3 scripts/fault_inject.py --only cancel,dup     # 只跑部分：kill,dup,minio,rabbitmq,cancel,gc
+
+独立项目名起的栈（docker compose -p drama-vod-p4 ...）先 export COMPOSE_PROJECT_NAME=drama-vod-p4，
+脚本里的 docker compose 都会用它；宿主端口改过时同时设 HTTP_PORT / MYSQL_PORT。
 
 前提：在仓库根目录、`docker compose up -d --build` 已经起好；本机有 ffmpeg（生成测试视频）和 PyMySQL。
 脚本会用缩短的租约/心跳（--lease-seconds/--heartbeat-seconds）重建 worker 并 --scale worker=2，
@@ -125,11 +128,15 @@ def worker_env(args, default=False):
     if default:
         return {k: "" for k in ("WORKER_LEASE_SECONDS", "WORKER_HEARTBEAT_SECONDS", "WORKER_REQUEUE_DELAY_MS",
                                 "WORKER_RETRY_BASE_MS", "WORKER_RETRY_MAX_MS", "WORKER_SWEEP_INTERVAL_SECONDS",
-                                "WORKER_SWEEP_PENDING_AGE_SECONDS")}
+                                "WORKER_SWEEP_PENDING_AGE_SECONDS", "WORKER_OUTPUT_GC_GRACE_SECONDS",
+                                "WORKER_OUTPUT_GC_INTERVAL_SECONDS")}
     return {"WORKER_LEASE_SECONDS": str(args.lease_seconds), "WORKER_HEARTBEAT_SECONDS": str(args.heartbeat_seconds),
             "WORKER_REQUEUE_DELAY_MS": str(args.requeue_ms), "WORKER_RETRY_BASE_MS": str(args.retry_base_ms),
             "WORKER_RETRY_MAX_MS": str(args.retry_base_ms * 8), "WORKER_SWEEP_INTERVAL_SECONDS": "10",
-            "WORKER_SWEEP_PENDING_AGE_SECONDS": "20"}
+            "WORKER_SWEEP_PENDING_AGE_SECONDS": "20",
+            # 缩短的清理宽限期（Worker 会把它抬到不小于租约）
+            "WORKER_OUTPUT_GC_GRACE_SECONDS": str(args.gc_grace_seconds),
+            "WORKER_OUTPUT_GC_INTERVAL_SECONDS": str(args.gc_interval_seconds)}
 
 
 def scale_workers(n, env):
@@ -326,8 +333,73 @@ def scenario_cancel(args, media):
                f"worker events={fenced}, cancel again={again}, cancel SUCCEEDED job={conflict}"
 
 
+def hls_object_count(prefix):
+    """在 worker 容器里用同一份 common.py 数 HLS 桶里某前缀下的对象（MinIO 不对宿主暴露 9000）。"""
+    script = (
+        "import json, sys\n"
+        "sys.path.insert(0, '/app')\n"
+        "from common import HLS_BUCKET, s3\n"
+        f"prefix = json.loads({json.dumps(json.dumps(prefix))})\n"
+        "c, n, kw = s3(), 0, {'Bucket': HLS_BUCKET, 'Prefix': prefix}\n"
+        "while True:\n"
+        "    page = c.list_objects_v2(**kw)\n"
+        "    n += len(page.get('Contents', []))\n"
+        "    if not page.get('IsTruncated'):\n"
+        "        break\n"
+        "    kw['ContinuationToken'] = page['NextContinuationToken']\n"
+        "print(n)\n")
+    return int(sh(["docker", "compose", "exec", "-T", "worker", "python", "-"], stdin=script).strip() or -1)
+
+
+def prefixes_of(job_id):
+    conn = db()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT prefix, claim_version, status FROM vod_output_prefix WHERE job_id=%s ORDER BY id", (job_id,))
+            return c.fetchall()
+    finally:
+        conn.close()
+
+
+def scenario_gc(args, media):
+    """两个 worker 同一任务：worker A 开始往自己的前缀上传（WRITING）时冻结它，租约过期后 worker B 接手并成功 →
+    vod_output_prefix 只有一个 ACTIVE 且等于资产 hls_prefix；A 的前缀变 GARBAGE，缩短的宽限期后被清理线程删光（DELETED）；
+    B 的前缀对象还在、播放地址可拉到 master。抓不到 A 正在上传的窗口时判 FAIL（加大 --video-seconds 重试）。"""
+    asset_id, job_id = submit(media, args.video_seconds)
+    writing = wait(lambda: one("SELECT prefix, claim_version FROM vod_output_prefix "
+                               "WHERE job_id=%s AND status='WRITING'", job_id), args.timeout, 0.1)
+    if not writing:
+        return False, f"never saw a WRITING prefix for job {job_id}: {prefixes_of(job_id)} job={job(job_id)}"
+    running = job(job_id)
+    cid = container_for(running["worker_id"]) if running and running["worker_id"] else None
+    if not cid or running["claim_version"] != writing["claim_version"]:
+        return False, f"window missed: job={running} writing={writing}"
+    sh(["docker", "pause", cid])
+    try:
+        one("UPDATE vod_transcode_job SET locked_until = NOW() - INTERVAL 1 SECOND WHERE id=%s AND claim_version=%s",
+            job_id, writing["claim_version"])
+        final = wait_terminal(asset_id, args.timeout * 2)
+    finally:
+        sh(["docker", "unpause", cid], check=False)
+    rows = prefixes_of(job_id)
+    hls = (one("SELECT hls_prefix FROM vod_media_asset WHERE id=%s", asset_id) or {}).get("hls_prefix")
+    active = [r["prefix"] for r in rows if r["status"] == "ACTIVE"]
+    a_prefix = writing["prefix"]
+    switched = final == "READY" and active == [hls] and hls != a_prefix
+    deleted = wait(lambda: any(r["prefix"] == a_prefix and r["status"] == "DELETED" for r in prefixes_of(job_id)),
+                   max(args.gc_grace_seconds, args.lease_seconds) + args.gc_interval_seconds * 3 + args.timeout, 2)
+    a_left = hls_object_count(a_prefix)
+    b_left = hls_object_count(hls) if hls else -1
+    status, token = http("POST", f"/api/v1/assets/{asset_id}/playback-token")
+    master = http("GET", token.get("master_url", "/missing"), key=None)[0] if status == 200 else status
+    gen_url = status == 200 and f"/{hls.split('/')[-2]}/master.m3u8" in token.get("master_url", "")
+    ok = switched and bool(deleted) and a_left == 0 and b_left > 0 and master == 200 and gen_url
+    return ok, f"asset {asset_id}={final} hls_prefix={hls} prefixes={[(r['prefix'], r['status']) for r in prefixes_of(job_id)]} " \
+               f"A({a_prefix}) objects left={a_left}, B objects={b_left}, master via nginx={master}, gen url={gen_url}"
+
+
 SCENARIOS = {"kill": scenario_kill, "dup": scenario_dup, "minio": scenario_minio,
-             "rabbitmq": scenario_rabbitmq, "cancel": scenario_cancel}
+             "rabbitmq": scenario_rabbitmq, "cancel": scenario_cancel, "gc": scenario_gc}
 
 
 def main():
@@ -344,6 +416,8 @@ def main():
     ap.add_argument("--copies", type=int, default=3, help="extra deliveries per job in the dup scenario")
     ap.add_argument("--outage-seconds", type=int, default=15)
     ap.add_argument("--observe-seconds", type=int, default=20, help="extra time to watch a cancelled job")
+    ap.add_argument("--gc-grace-seconds", type=int, default=30, help="shortened WORKER_OUTPUT_GC_GRACE_SECONDS")
+    ap.add_argument("--gc-interval-seconds", type=int, default=5, help="shortened WORKER_OUTPUT_GC_INTERVAL_SECONDS")
     ap.add_argument("--no-restore", action="store_true")
     args = ap.parse_args()
     chosen = [s.strip() for s in args.only.split(",") if s.strip()]

@@ -650,8 +650,40 @@ function rememberQuery(id) {
   history.replaceState(null, '', u);
 }
 
+// ---------- QoE（Phase 4）：拿到 Core 播放 token（vod-play 返回 vpt1.…）时上报到 /api/v1/qoe ----------
+// 首帧、waiting→playing 的卡顿、致命错误、结束；攒一批或 pagehide 时用 sendBeacon 冲刷。上报失败不影响播放。
+const qoe = { token: null, session: null, events: [], stallAt: null, started: false };
+function qoeSessionId() {
+  const a = new Uint8Array(12);
+  crypto.getRandomValues(a);
+  return Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+}
+function qoeFlush() {
+  if (!qoe.token || !qoe.events.length) return;
+  const body = JSON.stringify({ token: qoe.token, session_id: qoe.session, events: qoe.events.splice(0, 50) });
+  try {
+    const sent = navigator.sendBeacon && navigator.sendBeacon('/api/v1/qoe', new Blob([body], { type: 'text/plain' }));
+    if (!sent) fetch('/api/v1/qoe', { method: 'POST', body, keepalive: true, headers: { 'Content-Type': 'text/plain' } }).catch(() => {});
+  } catch (e) { /* 忽略 */ }
+}
+function qoeStart(info) {
+  qoeFlush();
+  const core = info && info.via === 'vod-api' && typeof info.token === 'string' && info.token.startsWith('vpt1.');
+  qoe.token = core ? info.token : null;
+  qoe.session = core ? qoeSessionId() : null;
+  qoe.events = [];
+  qoe.stallAt = null;
+  qoe.started = false;
+}
+function qoePush(ev) {
+  if (!qoe.token) return;
+  qoe.events.push(ev);
+  if (qoe.events.length >= 20) qoeFlush();
+}
+
 async function play(epId, opts) {
   opts = opts || {};
+  qoeStart(null);
   if (epId) state.episodeId = +epId;
   const gen = ++playGen;
   showWatch();
@@ -700,6 +732,7 @@ async function play(epId, opts) {
     return;
   }
   log('拿到签名地址', info.master_url, '加密=', info.encrypted);
+  qoeStart(info);
   state.token = info.token;
   state.assetId = info.asset_id;
   nextEp = info.next ? info.next.episode_id : null;
@@ -764,6 +797,7 @@ function attachHls(v, info) {
   hls.on(Hls.Events.ERROR, (_, d) => {
     log('ERROR', d.type, d.details, d.response && d.response.code || '');
     window.vodState.errors.push(d.details);
+    if (d.fatal) qoePush({ type: 'error', code: String(d.details || 'other') });
     if (d.fatal) showGate('播放中断', d.details || '', '重试', () => play(state.episodeId, { gesture: true }));
   });
   window._preloaded = false;
@@ -772,6 +806,18 @@ function attachHls(v, info) {
 }
 
 async function attachNative(v, info) {
+  // Core 资产（vod-play）没有原生改写列表：直接用签名地址，加密 Core 资产在 iPhone 原生播放器上取不到 key（已知限制）。
+  if (info.via === 'vod-api') {
+    v.src = info.master_url;
+    $('opening').hidden = true;
+    v.onerror = () => {
+      window.vodState.errors.push('native');
+      qoePush({ type: 'error', code: 'native' });
+      showGate('手机播放失败', '这个视频暂时只能在电脑或安卓上播放。', '重试', () => play(state.episodeId, { gesture: true }));
+    };
+    log('native HLS (vod-api)', info.master_url);
+    return;
+  }
   // iPhone 不能给 key 请求加头。改写后的列表仍把分片指回原来的签名地址。
   const url = '/api/playback/' + info.asset_id + '/master.m3u8?token=' + encodeURIComponent(info.token);
   const probe = await fetch(url, { method: 'GET' });
@@ -913,12 +959,29 @@ $('v').addEventListener('timeupdate', () => {
 });
 $('v').addEventListener('play', updatePlayIcon);
 $('v').addEventListener('pause', updatePlayIcon);
-$('v').addEventListener('ended', () => { if (nextEp) play(nextEp, { gesture: true }); else updatePlayIcon(); });
+$('v').addEventListener('ended', () => {
+  qoePush({ type: 'ended' });
+  qoeFlush();
+  if (nextEp) play(nextEp, { gesture: true }); else updatePlayIcon();
+});
+$('v').addEventListener('waiting', () => {
+  // 首帧之后、不是拖动进度条引起的等待才算卡顿
+  if (qoe.started && qoe.stallAt === null && !$('v').seeking) qoe.stallAt = performance.now();
+});
+window.addEventListener('pagehide', qoeFlush);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') qoeFlush(); });
 $('v').onplaying = () => {
   $('opening').hidden = true;
   hideGate();
   const ms = Math.round(performance.now() - t0);
   if (window.vodState.firstFrameMs === null) window.vodState.firstFrameMs = ms;
+  if (!qoe.started) {
+    qoe.started = true;
+    qoePush({ type: 'startup', ms });
+  } else if (qoe.stallAt !== null) {
+    qoePush({ type: 'rebuffer', ms: Math.round(performance.now() - qoe.stallAt) });
+    qoe.stallAt = null;
+  }
   log('开始播放，点击到首帧', ms, 'ms');
   updatePlayIcon();
 };

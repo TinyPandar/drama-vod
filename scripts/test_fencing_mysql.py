@@ -18,7 +18,10 @@ import pymysql  # noqa: E402
 from pymysql.constants import CLIENT  # noqa: E402
 
 import fencing  # noqa: E402
+import output_gc  # noqa: E402
+import output_prefix  # noqa: E402
 from dlq import ReplayRefused, replay_job  # noqa: E402
+from key_provider import PlaintextKeyStore  # noqa: E402
 
 DB = os.environ.get("FENCE_TEST_DB", "vod_fence_test")
 if not re.fullmatch(r"[A-Za-z0-9_]+", DB):
@@ -28,6 +31,9 @@ if not re.fullmatch(r"[A-Za-z0-9_]+", DB):
 CANCEL_SQL = ("UPDATE vod_transcode_job SET status='CANCELLED', claim_version=claim_version+1, locked_until=NULL, "
               "next_attempt_at=NULL, updated_at=CURRENT_TIMESTAMP "
               "WHERE id=%s AND tenant_id=%s AND status IN ('PENDING','RETRYING','RUNNING')")
+CANCEL_ASSET_SQL = "UPDATE vod_media_asset SET status='CANCELLED' WHERE id=%s AND tenant_id=%s AND status <> 'READY'"
+CANCEL_PREFIX_SQL = ("UPDATE vod_output_prefix SET status='GARBAGE', updated_at=CURRENT_TIMESTAMP "
+                     "WHERE job_id=%s AND status='WRITING'")
 
 
 def connect(database=None, found_rows=False, autocommit=True):
@@ -85,7 +91,7 @@ class Base(unittest.TestCase):
         self.conn = connect(DB)
         self.c = self.conn.cursor()
         for t in ("vod_outbox", "vod_transcode_job", "vod_media_asset", "transcode_job", "video_asset",
-                  "asset_rendition", "episode", "drama"):
+                  "asset_rendition", "episode", "drama", "vod_output_prefix", "vod_content_key", "content_key"):
             self.c.execute(f"DELETE FROM {t}")
 
     def tearDown(self):
@@ -374,6 +380,189 @@ class DlqReplay(Base):
             replay_job(tx, job_id, message)  # 现在是 RUNNING，拒绝
         tx.close()
         self.c.execute("SELECT COUNT(*) AS n FROM vod_outbox")
+        self.assertEqual(self.c.fetchone()["n"], 1)
+
+
+class TranscodingLockOrder(Base):
+    """Phase 3 遗留第 9 项：TRANSCODING 显式事务先锁任务行，与取消事务（任务 → 资产）同序，交错时只等待、不死锁。"""
+
+    def test_cancel_waits_for_transcoding_transaction(self):
+        job_id, asset_id = self.core_job()
+        fencing.claim(self.c, "core", job_id, "w1", 60)
+        v = self.job(job_id)["claim_version"]
+        worker_conn = connect(DB)
+        wc = worker_conn.cursor()
+        worker_conn.begin()
+        wc.execute("SELECT claim_version, status FROM vod_transcode_job WHERE id=%s FOR UPDATE", (job_id,))
+        result = {}
+
+        def cancel():
+            other = connect(DB, autocommit=False)
+            try:
+                with other.cursor() as oc:
+                    other.begin()
+                    result["job"] = oc.execute(CANCEL_SQL, (job_id, 1))   # 等 Worker 释放任务行锁
+                    oc.execute(CANCEL_ASSET_SQL, (asset_id, 1))
+                    oc.execute(CANCEL_PREFIX_SQL, (job_id,))
+                other.commit()
+            except Exception as e:  # 不应出现死锁
+                result["error"] = repr(e)
+            finally:
+                other.close()
+
+        t = threading.Thread(target=cancel)
+        t.start()
+        time.sleep(0.5)
+        self.assertTrue(t.is_alive())  # 被任务行锁挡住
+        wc.execute("UPDATE vod_media_asset SET status='TRANSCODING' WHERE id=%s", (asset_id,))
+        worker_conn.commit()
+        t.join(10)
+        worker_conn.close()
+        self.assertNotIn("error", result)
+        self.assertEqual(result["job"], 1)
+        self.assertEqual(self.job(job_id)["status"], "CANCELLED")
+        self.assertEqual(self.asset_status(asset_id), "CANCELLED")
+        # 之后 Worker 的围栏已丢
+        self.assertEqual(fencing.mark_transcoding(self.conn, self.c, "core", asset_id, job_id, v), 0)
+        self.assertEqual(self.asset_status(asset_id), "CANCELLED")
+
+    def test_transcoding_waits_for_cancel_then_sees_lost_fence(self):
+        job_id, asset_id = self.core_job()
+        fencing.claim(self.c, "core", job_id, "w1", 60)
+        v = self.job(job_id)["claim_version"]
+        canceller = connect(DB, autocommit=False)
+        cc = canceller.cursor()
+        canceller.begin()
+        self.assertEqual(cc.execute(CANCEL_SQL, (job_id, 1)), 1)   # 取消事务先拿到任务行锁
+        result = {}
+
+        def transcoding():
+            wconn = connect(DB)
+            try:
+                result["n"] = fencing.mark_transcoding(wconn, wconn.cursor(), "core", asset_id, job_id, v)
+            except Exception as e:
+                result["error"] = repr(e)
+            finally:
+                wconn.close()
+
+        t = threading.Thread(target=transcoding)
+        t.start()
+        time.sleep(0.5)
+        self.assertTrue(t.is_alive())  # FOR UPDATE 在等任务行
+        cc.execute(CANCEL_ASSET_SQL, (asset_id, 1))
+        canceller.commit()
+        canceller.close()
+        t.join(10)
+        self.assertNotIn("error", result)
+        self.assertEqual(result["n"], 0)
+        self.assertEqual(self.asset_status(asset_id), "CANCELLED")
+
+    def test_mark_transcoding_happy_path_and_same_status(self):
+        job_id, asset_id = self.core_job(asset_status="TRANSCODING")  # 重试时资产已是 TRANSCODING
+        fencing.claim(self.c, "core", job_id, "w1", 60)
+        v = self.job(job_id)["claim_version"]
+        self.assertEqual(fencing.mark_transcoding(self.conn, self.c, "core", asset_id, job_id, v), 1)
+        self.assertEqual(fencing.mark_transcoding(self.conn, self.c, "core", asset_id, job_id, v - 1), 0)
+        legacy_job, legacy_asset, _ = self.legacy_job()
+        fencing.claim(self.c, "legacy", legacy_job, "w1", 60)
+        lv = self.job(legacy_job, "transcode_job")["claim_version"]
+        self.assertEqual(fencing.mark_transcoding(self.conn, self.c, "legacy", legacy_asset, legacy_job, lv), 1)
+        self.assertEqual(self.asset_status(legacy_asset, "video_asset"), "TRANSCODING")
+
+
+class OutputPrefixLifecycle(Base):
+    """Phase 4 第 3、4 项：任务专属前缀、成功事务切换、取消/替换后的垃圾判定与删前复核。"""
+
+    def prefixes(self, asset_id):
+        self.c.execute("SELECT prefix, status FROM vod_output_prefix WHERE asset_id=%s ORDER BY id", (asset_id,))
+        return {r["prefix"]: r["status"] for r in self.c.fetchall()}
+
+    def test_two_claims_only_one_active_and_stale_writer_becomes_garbage(self):
+        job_id, asset_id = self.core_job()
+        fencing.claim(self.c, "core", job_id, "old", 60)
+        old = self.job(job_id)["claim_version"]
+        old_prefix = f"assets/v1/{asset_id}/{job_id}-{old}/"
+        output_prefix.insert_writing(self.c, asset_id, job_id, old, old_prefix)
+        output_prefix.insert_writing(self.c, asset_id, job_id, old, old_prefix)  # 幂等
+        self.expire_lease(job_id)
+        fencing.claim(self.c, "core", job_id, "new", 60)
+        new = old + 1
+        new_prefix = f"assets/v1/{asset_id}/{job_id}-{new}/"
+        output_prefix.insert_writing(self.c, asset_id, job_id, new, new_prefix)
+        # 旧 Worker 提交失败，新 Worker 提交成功
+        self.conn.begin()
+        self.assertFalse(fencing.commit_success(self.c, "core", job_id, old, asset_id, old_prefix, 1, 2, 2))
+        self.conn.rollback()
+        self.conn.begin()
+        self.assertTrue(fencing.commit_success(self.c, "core", job_id, new, asset_id, new_prefix, 1, 2, 2))
+        self.conn.commit()
+        self.assertEqual(self.prefixes(asset_id), {old_prefix: "GARBAGE", new_prefix: "ACTIVE"})
+        self.c.execute("SELECT hls_prefix FROM vod_media_asset WHERE id=%s", (asset_id,))
+        self.assertEqual(self.c.fetchone()["hls_prefix"], new_prefix)
+        output_prefix.discard(self.c, new_prefix)  # discard 不会降级 ACTIVE
+        self.assertEqual(self.prefixes(asset_id)[new_prefix], "ACTIVE")
+
+    def test_promote_stale_writing(self):
+        running, a1 = self.core_job()
+        fencing.claim(self.c, "core", running, "w", 60)
+        v = self.job(running)["claim_version"]
+        output_prefix.insert_writing(self.c, a1, running, v, f"assets/v1/{a1}/{running}-{v}/")        # 在跑：保留
+        output_prefix.insert_writing(self.c, a1, running, v - 1, f"assets/v1/{a1}/{running}-{v - 1}/")  # 被接手：垃圾
+        failed, a2 = self.core_job("FAILED", "FAILED")
+        output_prefix.insert_writing(self.c, a2, failed, 0, f"assets/v1/{a2}/{failed}-0/")              # 终态：垃圾
+        output_prefix.insert_writing(self.c, a2, 999999, 1, f"assets/v1/{a2}/999999-1/")                  # 任务不存在：垃圾
+        output_gc.promote_stale_writing(self.c)
+        self.assertEqual(self.prefixes(a1), {f"assets/v1/{a1}/{running}-{v}/": "WRITING",
+                                             f"assets/v1/{a1}/{running}-{v - 1}/": "GARBAGE"})
+        self.assertEqual(set(self.prefixes(a2).values()), {"GARBAGE"})
+
+    def test_cancel_marks_writing_garbage_and_gc_respects_grace_and_current_prefix(self):
+        job_id, asset_id = self.core_job()
+        fencing.claim(self.c, "core", job_id, "w", 60)
+        v = self.job(job_id)["claim_version"]
+        p = f"assets/v1/{asset_id}/{job_id}-{v}/"
+        output_prefix.insert_writing(self.c, asset_id, job_id, v, p)
+        self.c.execute(CANCEL_SQL, (job_id, 1))
+        self.c.execute(CANCEL_PREFIX_SQL, (job_id,))
+        self.assertEqual(self.prefixes(asset_id)[p], "GARBAGE")
+        self.assertEqual(output_gc.due_garbage(self.c, 3600, 10), [])           # 宽限期内不删
+        self.c.execute("UPDATE vod_output_prefix SET updated_at=NOW() - INTERVAL 2 HOUR WHERE prefix=%s", (p,))
+        due = output_gc.due_garbage(self.c, 3600, 10)
+        self.assertEqual([r["prefix"] for r in due], [p])
+        self.assertTrue(output_gc.still_deletable(self.c, due[0]))
+        # 万一资产当前 hls_prefix 就是它：不删
+        self.c.execute("UPDATE vod_media_asset SET hls_prefix=%s WHERE id=%s", (p, asset_id))
+        self.assertFalse(output_gc.still_deletable(self.c, due[0]))
+        self.c.execute("UPDATE vod_media_asset SET hls_prefix=NULL WHERE id=%s", (asset_id,))
+
+        class S3:
+            def __init__(self):
+                self.keys = {p + "master.m3u8", p + "720p/index.m3u8", p + "720p/seg_00000.ts"}
+
+            def list_objects_v2(self, Bucket, Prefix, MaxKeys):
+                return {"Contents": [{"Key": k} for k in sorted(self.keys) if k.startswith(Prefix)][:MaxKeys]}
+
+            def delete_objects(self, Bucket, Delete):
+                self.keys -= {o["Key"] for o in Delete["Objects"]}
+                return {}
+
+        s3 = S3()
+        self.assertEqual(output_gc.gc_pass(self.c, s3, "vod-hls", 3600, 10, 2), (1, 3, 0))
+        self.assertEqual(s3.keys, set())
+        self.assertEqual(self.prefixes(asset_id)[p], "DELETED")
+        self.assertEqual(output_gc.gc_pass(self.c, s3, "vod-hls", 3600, 10, 2), (0, 0, 0))
+
+
+class ContentKeys(Base):
+    def test_core_and_legacy_keys_do_not_collide(self):
+        store = PlaintextKeyStore()
+        core = store.get_or_create(self.c, "core", 5)
+        legacy = store.get_or_create(self.c, "legacy", 5)   # 同一个数字 id，两套资产
+        self.assertNotEqual(core["key_hex"], legacy["key_hex"])
+        self.assertEqual(store.get_or_create(self.c, "core", 5), core)  # 重试复用同一把 key
+        self.c.execute("SELECT COUNT(*) AS n FROM vod_content_key")
+        self.assertEqual(self.c.fetchone()["n"], 1)
+        self.c.execute("SELECT COUNT(*) AS n FROM content_key")
         self.assertEqual(self.c.fetchone()["n"], 1)
 
 

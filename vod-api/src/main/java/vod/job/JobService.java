@@ -1,5 +1,6 @@
 package vod.job;
 
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -22,6 +23,10 @@ public class JobService {
      * 在跑的 Worker 下次续租或提交时发现围栏丢失并丢弃结果。资产（非 READY）同一事务改为 CANCELLED。
      * 已取消幂等返回；SUCCEEDED/FAILED 抛 409；别的租户或不存在按不可见处理（404）。
      * 匹配到的行状态一定会变，PyMySQL 与 Connector/J 两种 affected rows 语义下都是 1。
+     *
+     * <p>Phase 4：同一事务里把该任务还在 WRITING 的输出前缀标成 GARBAGE（vod_output_prefix），Worker 的清理线程过了宽限期再删。
+     * 加锁顺序是任务 → 资产 → 前缀，和 Worker 的 TRANSCODING / 成功 / 失败事务一致。
+     * 死锁或锁等待超时由调用方在事务外重试一次（{@link #cancelWithRetry}）。
      */
     @Transactional
     public void cancel(long tenantId, long jobId) {
@@ -34,6 +39,8 @@ public class JobService {
             Long assetId = jdbc.queryForObject("SELECT asset_id FROM vod_transcode_job WHERE id = ?", Long.class, jobId);
             jdbc.update("UPDATE vod_media_asset SET status = 'CANCELLED' WHERE id = ? AND tenant_id = ? AND status <> 'READY'",
                     assetId, tenantId);
+            jdbc.update("UPDATE vod_output_prefix SET status = 'GARBAGE', updated_at = CURRENT_TIMESTAMP "
+                    + "WHERE job_id = ? AND status = 'WRITING'", jobId);
             return;
         }
         var rows = jdbc.query("SELECT tenant_id, status FROM vod_transcode_job WHERE id = ?",
@@ -43,5 +50,27 @@ public class JobService {
         String status = rows.get(0).getValue();
         if ("CANCELLED".equals(status)) return;
         throw new UploadService.ConflictException("job is " + status + ", cannot cancel");
+    }
+
+    /**
+     * 在 @Transactional 外层调用：死锁被选为牺牲者或锁等待超时（PessimisticLockingFailureException 及其子类）时整体重试一次，
+     * 仍失败抛 {@link BusyException}（503）。传入的 cancel 必须经过 Spring 代理，才能每次开新事务。
+     */
+    public static void cancelWithRetry(Runnable cancel) {
+        try {
+            cancel.run();
+        } catch (PessimisticLockingFailureException first) {
+            try {
+                cancel.run();
+            } catch (PessimisticLockingFailureException second) {
+                throw new BusyException(second);
+            }
+        }
+    }
+
+    public static class BusyException extends RuntimeException {
+        public BusyException(Throwable cause) {
+            super("lock conflict, retry later", cause);
+        }
     }
 }

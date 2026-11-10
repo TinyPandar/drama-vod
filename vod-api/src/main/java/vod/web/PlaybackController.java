@@ -1,53 +1,58 @@
 package vod.web;
 
 import jakarta.servlet.http.HttpServletRequest;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.http.CacheControl;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import vod.auth.ApiKeyFilter;
 import vod.auth.TenantPrincipal;
-import vod.media.HlsSigner;
-import vod.tenant.TenantGuard;
-import vod.usage.UsageService;
+import vod.media.PlaybackService;
 
-import java.time.Instant;
 import java.util.Map;
 
 @RestController
 public class PlaybackController {
-    private final JdbcTemplate jdbc;
-    private final UsageService usage;
-    private final String hlsSecret;
-    private final long ttlSeconds;
+    private final PlaybackService playback;
 
-    public PlaybackController(JdbcTemplate jdbc, UsageService usage,
-                              @Value("${vod.hls-secret:dev}") String hlsSecret,
-                              @Value("${vod.play-ttl-seconds:600}") long ttlSeconds) {
-        this.jdbc = jdbc;
-        this.usage = usage;
-        this.hlsSecret = hlsSecret;
-        this.ttlSeconds = ttlSeconds;
+    public PlaybackController(PlaybackService playback) {
+        this.playback = playback;
     }
 
     @GetMapping("/api/v1/assets/{assetId}/playback")
     public Map<String, Object> playback(HttpServletRequest request, @PathVariable long assetId) {
-        TenantPrincipal tenant = ((TenantPrincipal) request.getAttribute(ApiKeyFilter.ATTR)).require("asset");
-        var rows = jdbc.query(
-                "SELECT tenant_id, status FROM vod_media_asset WHERE id = ?",
-                (rs, n) -> Map.of("tenant_id", rs.getLong(1), "status", rs.getString(2)),
-                assetId);
-        if (rows.isEmpty()) throw new TenantGuard.ResourceNotVisibleException();
-        TenantGuard.requireVisible(tenant.tenantId(), (Long) rows.get(0).get("tenant_id"));
-        if (!"READY".equals(rows.get(0).get("status"))) throw new NotReady();
-        usage.addPlay(tenant.tenantId());
-        long exp = Instant.now().getEpochSecond() + ttlSeconds;
-        return Map.of(
-                "asset_id", assetId,
-                "master_url", HlsSigner.v1MasterUrl(exp, assetId, hlsSecret),
-                "expires_at", exp);
+        return playback.playback(tenant(request).tenantId(), assetId);
     }
 
-    public static class NotReady extends RuntimeException {}
+    /** 签发 Core 播放 token。可选 body：ttl_seconds（上限走配置）、viewer_id（不透明，只用于日志/QoE）。 */
+    @PostMapping("/api/v1/assets/{assetId}/playback-token")
+    public ResponseEntity<Map<String, Object>> playbackToken(HttpServletRequest request, @PathVariable long assetId,
+                                                             @RequestBody(required = false) Map<String, Object> body) {
+        long tenantId = tenant(request).tenantId();
+        Long ttl = null;
+        String viewer = null;
+        if (body != null) {
+            Object rawTtl = body.get("ttl_seconds");
+            if (rawTtl != null) {
+                if (!(rawTtl instanceof Integer || rawTtl instanceof Long)) {
+                    throw new IllegalArgumentException("ttl_seconds must be an integer");
+                }
+                ttl = ((Number) rawTtl).longValue();
+            }
+            Object rawViewer = body.get("viewer_id");
+            if (rawViewer != null) {
+                if (!(rawViewer instanceof String s)) throw new IllegalArgumentException("viewer_id must be a string");
+                viewer = s;
+            }
+        }
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .body(playback.issueToken(tenantId, assetId, ttl, viewer));
+    }
+
+    private static TenantPrincipal tenant(HttpServletRequest request) {
+        return ((TenantPrincipal) request.getAttribute(ApiKeyFilter.ATTR)).require("asset");
+    }
 }

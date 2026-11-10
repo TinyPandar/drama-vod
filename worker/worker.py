@@ -6,7 +6,10 @@
   3. 付费集：取/建内容密钥（重试复用同一把 key）
   4. 一条 ffmpeg 命令出 3 档码率，强制关键帧对齐，首片 1s、之后 4s
   5. 上传前同步复核围栏；上传分片和子 m3u8，master.m3u8 前再复核一次、最后才上传（master 出现 = 产物完整）
+     Core 每次 claim 写到自己的前缀 assets/v1/{asset}/{job}-{claim_version}/（vod_output_prefix 记 WRITING），
+     传完再按本地清单 list 一遍远端（名字、大小一致）才提交
   6. 一个事务里：先写带 claim_version 的任务 SUCCEEDED，成功才写资产 READY、集指向新资产；删 Redis 缓存
+     Core 的 hls_prefix 和前缀 ACTIVE 在同一事务切换，被替换/失败/取消的前缀由清理线程过宽限期后删除
   资产状态（TRANSCODING/FAILED/READY）只在仍持有当前 claim_version 时更新，旧 worker 不会盖掉新结果
   失败：Core 先分类（retry_policy），不可重试直接 FAILED + 死信；可重试按指数退避 + jitter 进延迟重试队列，
   次数用完 FAILED + 死信；围栏丢了（租约被接手、任务被取消）则杀掉 ffmpeg、什么都不写、直接丢弃
@@ -18,11 +21,13 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from common import (HLS_BUCKET, Q_DLQ, Q_MAIN, Q_RETRY, db, log, mq_channel, publish, rds, s3,
                     transcode_message, wait_for)
-from fencing import apply_failure, claim, commit_success, due_jobs, record_failure, update_asset_status
+import output_gc, output_prefix
+from fencing import apply_failure, claim, commit_success, due_jobs, mark_transcoding, record_failure
 from fencing import renew_lease as renew_lease_sql
-from hls_verify import verify_hls
+from hls_verify import local_manifest, verify_hls, verify_remote
 from job_route import hls_prefix, job_table, updates_episode
-from retry_policy import (INPUT_INVALID, NO_VIDEO_STREAM, OUTPUT_INVALID, SOURCE_MISSING, TIMEOUT,
+from key_provider import PlaintextKeyStore, key_uri
+from retry_policy import (INPUT_INVALID, NO_VIDEO_STREAM, OUTPUT_INVALID, SOURCE_MISSING, STORAGE_ERROR, TIMEOUT,
                           TRANSCODE_FAILED, FenceLost, JobError, plan_failure)
 
 
@@ -49,6 +54,12 @@ REQUEUE_DELAY_MS = env_int("WORKER_REQUEUE_DELAY_MS", 60_000)  # 别人租约内
 SWEEP_INTERVAL_SEC = env_int("WORKER_SWEEP_INTERVAL_SECONDS", 60)
 SWEEP_PENDING_AGE_SEC = env_int("WORKER_SWEEP_PENDING_AGE_SECONDS", 120)
 METRICS_PORT = env_int("WORKER_METRICS_PORT", 9100)
+# 垃圾输出前缀清理（Phase 4）。宽限期须大于租约与播放 URL/token 的最长有效期（vod.playback.token-ttl-max-seconds）。
+OUTPUT_GC_ENABLED = os.environ.get("WORKER_OUTPUT_GC_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+OUTPUT_GC_GRACE_SEC = env_int("WORKER_OUTPUT_GC_GRACE_SECONDS", 86_400)
+OUTPUT_GC_INTERVAL_SEC = env_int("WORKER_OUTPUT_GC_INTERVAL_SECONDS", 300)
+OUTPUT_GC_PREFIX_BATCH = env_int("WORKER_OUTPUT_GC_PREFIX_BATCH", 20)    # 每轮最多处理几个前缀
+OUTPUT_GC_DELETE_BATCH = env_int("WORKER_OUTPUT_GC_DELETE_BATCH", 500)   # 每次 list/delete_objects 的对象数（≤1000）
 POLL_SEC = 0.5                                               # 子进程轮询间隔：围栏丢失后多快杀掉 ffmpeg
 
 FIRST_SEG, SEG = 1, 4   # 首片 1s（秒开），之后 4s
@@ -62,6 +73,9 @@ HEARTBEAT = Gauge("vod_worker_heartbeat_timestamp_seconds",
                   "unix time of the last successful lease renewal or sweeper DB pass")
 LEASE_LOST = Counter("vod_worker_lease_lost_total", "heartbeat found the claim fence lost (taken over or cancelled)")
 DROP_FENCED = Counter("vod_worker_drop_fenced_total", "results dropped because the claim fence was lost")
+GC_PREFIXES = Counter("vod_worker_output_gc_prefixes_total", "garbage output prefixes deleted")
+
+KEYS = PlaintextKeyStore()
 
 s3c = s3()
 r = rds()
@@ -167,18 +181,45 @@ def build_ffmpeg(src, out, ladder, has_audio, keyinfo, portrait):
     return cmd + [f"{out}/%v/index.m3u8"]
 
 
-def get_or_create_key(c, asset_id):
-    c.execute("INSERT IGNORE INTO content_key(asset_id, key_hex, iv_hex) VALUES(%s,%s,%s)",
-              (asset_id, os.urandom(16).hex(), os.urandom(16).hex()))
-    c.execute("SELECT key_hex, iv_hex FROM content_key WHERE asset_id=%s", (asset_id,))
-    return c.fetchone()
+def get_or_create_key(c, asset_id, origin="legacy"):
+    """旧 Demo 用 content_key，Core 用 vod_content_key（两套资产 id 会撞号，不能共表）。"""
+    return KEYS.get_or_create(c, origin, asset_id)
 
 
-def upload_dir(local, prefix, before_master=None):
-    """master 最后传；before_master 在传 master 之前调用，抛异常就不传 master。"""
+def remote_listing(prefix):
+    """前缀下的远端对象 {键: 大小}，分页。"""
+    out, token = {}, None
+    while True:
+        kw = {"Bucket": HLS_BUCKET, "Prefix": prefix}
+        if token:
+            kw["ContinuationToken"] = token
+        page = s3c.list_objects_v2(**kw)
+        for o in page.get("Contents", []):
+            out[o["Key"]] = o["Size"]
+        if not page.get("IsTruncated"):
+            return out
+        token = page.get("NextContinuationToken")
+
+
+def check_remote(local_root, prefix):
+    try:
+        listing = remote_listing(prefix)
+    except Exception as e:
+        raise JobError(STORAGE_ERROR, f"list {prefix} failed: {e}") from e
+    try:
+        verify_remote(local_manifest(local_root), listing, prefix)
+    except RuntimeError as e:
+        raise JobError(STORAGE_ERROR, f"remote verify {prefix}: {e}") from e
+
+
+def upload_dir(local, prefix, before_master=None, stop=None):
+    """master 最后传；before_master 在传 master 之前调用，抛异常就不传 master。
+    stop（心跳发现围栏丢失）被置位后不再传后续文件，减少写进已被判为垃圾的前缀的对象。"""
     files = sorted(os.path.relpath(os.path.join(d, f), local) for d, _, fs in os.walk(local) for f in fs)
     files.sort(key=lambda f: f == "master.m3u8")  # master 最后传
     for rel in files:
+        if stop is not None and stop.is_set():
+            raise FenceLost("fence lost during upload")
         if rel == "master.m3u8" and before_master:
             before_master()
         ctype = "application/vnd.apple.mpegurl" if rel.endswith(".m3u8") else (
@@ -225,9 +266,11 @@ def process(job_id, trace_id, origin="legacy"):
         a["episode_id"] = None
     asset_id = a["id"]
     version = a["claim_version"]
-    if update_asset_status(c, origin, asset_id, job_id, version, "TRANSCODING") != 1:
+    if mark_transcoding(conn, c, origin, asset_id, job_id, version) != 1:
         conn.close()
         return drop_fenced(job_id, version, trace_id, "asset_transcoding")
+    prefix = hls_prefix(origin, asset_id, job_id, version)  # 旧 Demo 仍是固定 assets/{id}/
+    prefix_recorded = False
     lost, done = threading.Event(), threading.Event()
 
     def beat():
@@ -271,24 +314,29 @@ def process(job_id, trace_id, origin="legacy"):
             ladder = [(f"{even}p", even, 600)]
         keyinfo = None
         if a["encrypted"]:
-            k = get_or_create_key(c, asset_id)
+            k = get_or_create_key(c, asset_id, origin)
             with open(f"{work}/enc.key", "wb") as f:
                 f.write(bytes.fromhex(k["key_hex"]))
             keyinfo = f"{work}/keyinfo"
             with open(keyinfo, "w") as f:  # 三行：写进 m3u8 的 key URI / 本地 key 文件 / IV
-                f.write(f"/keys/{asset_id}\n{work}/enc.key\n{k['iv_hex']}\n")
+                f.write(f"{key_uri(origin, asset_id)}\n{work}/enc.key\n{k['iv_hex']}\n")
         run(build_ffmpeg(src, f"{work}/out", ladder, has_audio, keyinfo, portrait), FFMPEG_TIMEOUT_SEC, lost)
         try:
             verify_hls(f"{work}/out", [name for name, _, _ in ladder], bool(a["encrypted"]))
         except RuntimeError as e:
             raise JobError(OUTPUT_INVALID, str(e)) from e
         check_fence()
-        prefix = hls_prefix(origin, asset_id)
-        nfiles = upload_dir(f"{work}/out", prefix, before_master=check_fence)
+        if origin == "core":
+            output_prefix.insert_writing(c, asset_id, job_id, version, prefix)
+            prefix_recorded = True
+        nfiles = upload_dir(f"{work}/out", prefix, before_master=check_fence, stop=lost)
+        if origin == "core":
+            check_remote(f"{work}/out", prefix)
         conn.begin()
         if not commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, w, h,
                               renditions_of(ladder, w, h, portrait), a["episode_id"]):
             conn.rollback()
+            discard_prefix(c, prefix, prefix_recorded)
             return drop_fenced(job_id, version, trace_id, "commit_success")
         conn.commit()
         if a.get("episode_id"):
@@ -300,6 +348,7 @@ def process(job_id, trace_id, origin="legacy"):
         return "ok"
     except FenceLost as e:
         conn.rollback()
+        discard_prefix(c, prefix, prefix_recorded)
         return drop_fenced(job_id, version, trace_id, str(e))
     except Exception as e:
         conn.rollback()
@@ -309,7 +358,10 @@ def process(job_id, trace_id, origin="legacy"):
         changed = record_failure(c, origin, job_id, version, final, str(e)[-2000:], code, delay)
         if not apply_failure(c, origin, asset_id, job_id, version, changed, final):
             conn.rollback()
+            discard_prefix(c, prefix, prefix_recorded)
             return drop_fenced(job_id, version, trace_id, "record_failure")
+        if prefix_recorded:
+            output_prefix.discard(c, prefix)  # 同一事务：重试会换新的 claim_version，也就换新前缀
         conn.commit()
         JOBS.labels("failed" if final else "retry").inc()
         log("job_error", job_id=job_id, attempt=a["attempts"], final=final, error_code=code, delay_ms=delay,
@@ -320,6 +372,16 @@ def process(job_id, trace_id, origin="legacy"):
         INFLIGHT.dec()
         conn.close()
         shutil.rmtree(work, ignore_errors=True)
+
+
+def discard_prefix(c, prefix, recorded):
+    """没提交成功的前缀置 GARBAGE（自动提交）。失败只打日志：清理线程也会按 claim_version 认出过时的 WRITING。"""
+    if not recorded:
+        return
+    try:
+        output_prefix.discard(c, prefix)
+    except Exception as e:
+        log("prefix_discard_error", prefix=prefix, err=str(e)[:200])
 
 
 def finish(ch, method, msg, res):
@@ -387,16 +449,47 @@ def sweeper():
         time.sleep(SWEEP_INTERVAL_SEC)
 
 
+def output_gc_loop():
+    """删除过了宽限期的垃圾输出前缀（只有 Core 任务专属前缀）。见 output_gc.py。"""
+    while True:
+        time.sleep(OUTPUT_GC_INTERVAL_SEC)
+        try:
+            conn = db()
+            try:
+                with conn.cursor() as c:
+                    n, objects, skipped = output_gc.gc_pass(c, s3c, HLS_BUCKET, OUTPUT_GC_GRACE_SEC,
+                                                            OUTPUT_GC_PREFIX_BATCH, OUTPUT_GC_DELETE_BATCH, log)
+            finally:
+                conn.close()
+            if n:
+                GC_PREFIXES.inc(n)
+                log("output_gc_pass", prefixes=n, objects=objects, skipped=skipped)
+        except Exception as e:
+            log("output_gc_error", err=str(e)[:300])
+
+
+def gc_grace_seconds(grace, lease):
+    """宽限期不能短于租约：前缀被判成垃圾时，原来的写入方可能还没发现围栏丢失、仍在往里传文件。"""
+    return max(int(grace), int(lease))
+
+
 def main():
+    global OUTPUT_GC_GRACE_SEC
     start_http_server(METRICS_PORT)
     wait_for("mysql", lambda: db().close())
     ensure_claim_version()
     threading.Thread(target=sweeper, daemon=True).start()
+    if OUTPUT_GC_ENABLED:
+        if OUTPUT_GC_GRACE_SEC < LEASE_SEC:
+            log("output_gc_grace_raised", configured=OUTPUT_GC_GRACE_SEC, lease_seconds=LEASE_SEC)
+        OUTPUT_GC_GRACE_SEC = gc_grace_seconds(OUTPUT_GC_GRACE_SEC, LEASE_SEC)
+        threading.Thread(target=output_gc_loop, daemon=True).start()
     while True:  # RabbitMQ 重启或断线后重连；在跑的任务靠租约和围栏收尾
         mconn, ch = wait_for("rabbitmq", mq_channel)
         ch.basic_qos(prefetch_count=1)  # 一个 worker 同时只拿一条，转码是 CPU 密集，靠多开 worker 横向扩
         ch.basic_consume(Q_MAIN, on_message)
-        log("worker_started", worker=WORKER_ID, lease_seconds=LEASE_SEC, heartbeat_seconds=HEARTBEAT_SEC)
+        log("worker_started", worker=WORKER_ID, lease_seconds=LEASE_SEC, heartbeat_seconds=HEARTBEAT_SEC,
+            output_gc=OUTPUT_GC_ENABLED, output_gc_grace_seconds=OUTPUT_GC_GRACE_SEC)
         try:
             ch.start_consuming()
         except pika.exceptions.AMQPError as e:

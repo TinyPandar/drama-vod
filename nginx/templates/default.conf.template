@@ -1,4 +1,6 @@
 # 这个文件由 nginx 镜像启动时 envsubst 渲染（只替换已定义的环境变量，如 ${HLS_SECRET}）
+# Phase 4 新增的 VOD_* 变量由 nginx/entrypoint.d/05-vod-env.envsh 补默认值（开发默认，不是基准或承诺）；
+# CORS 白名单由同一脚本生成 /etc/nginx/conf.d/00-vod-cors.conf 里的 map $http_origin $vod_cors_origin。
 
 # ---------- "CDN 边缘"缓存 ----------
 # keys_zone 存缓存索引，max_size 限制磁盘，inactive 内没被访问就淘汰
@@ -11,12 +13,47 @@ upstream minio_origin { server minio:9000; }
 upstream api_backend  { server api:8000; keepalive 16; }
 resolver 127.0.0.11 valid=10s ipv6=off;
 
+# ---------- Phase 4：只作用于 Core 路由（旧 /hls/、/keys/ 冻结，不加这些头） ----------
+# 限流：key 接口和 QoE 上报，按客户端 IP。速率与突发都是配置项。
+limit_req_zone $binary_remote_addr zone=vod_keys:10m rate=${VOD_KEY_RATE};
+limit_req_zone $binary_remote_addr zone=vod_qoe:10m rate=${VOD_QOE_RATE};
+limit_req_status 429;
+
+# 带 gen 的 Core 路径内容不可变：成功响应给客户端长缓存 + immutable；403/410/404 等一律 no-store。
+map $status $vod_gen_cache_control {
+    ~^(200|206|304)$ "public, max-age=${VOD_HLS_IMMUTABLE_MAX_AGE}, immutable";
+    default          "no-store";
+}
+# Phase 4 之前的固定前缀 Core 路径：m3u8 短 TTL，分片长 TTL；错误 no-store。
+map "$status:$uri" $vod_v1_cache_control {
+    "~^(200|206|304):.*\.m3u8$" "public, max-age=${VOD_HLS_PLAYLIST_MAX_AGE}";
+    "~^(200|206|304):"          "public, max-age=${VOD_HLS_SEGMENT_MAX_AGE}";
+    default                     "no-store";
+}
+
 server {
     listen 8080;
     access_log /var/log/nginx/access.log vod;
 
     # 测试播放页
     location / { root /usr/share/nginx/html; index index.html; }
+
+    # QoE 上报（Phase 4）：sendBeacon 打过来，body 小、要限流；鉴权在 vod-api 用 body 里的 Core 播放 token。
+    location = /api/v1/qoe {
+        limit_req zone=vod_qoe burst=${VOD_QOE_BURST} nodelay;
+        client_max_body_size ${VOD_QOE_MAX_BODY};
+        set $vod_upstream vod-api:8001;
+        proxy_pass http://$vod_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_set_header X-Request-ID $request_id;
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+        proxy_hide_header Cache-Control;
+        add_header Cache-Control "no-store" always;
+        add_header X-Request-ID $request_id always;
+    }
 
     # 新控制面。比 /api/ 更具体，不会抢走旧接口。
     location /api/v1/ {
@@ -48,6 +85,38 @@ server {
         proxy_cache_bypass 1;
     }
 
+    # Core key 服务（Phase 4）：/keys/v1/{asset_id} 到 vod-api，凭 Core 播放 token。不缓存、限流、可跨域（允许 Authorization 头）。
+    # 前缀比 /keys/ 长，优先匹配；旧 /keys/{asset_id} 仍到 FastAPI，不变。
+    location /keys/v1/ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin $vod_cors_origin always;
+            add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Authorization" always;
+            add_header Access-Control-Max-Age ${VOD_CORS_MAX_AGE} always;
+            add_header Vary Origin always;
+            add_header Cache-Control "no-store" always;
+            return 204;
+        }
+        # 不用 limit_except：它会换掉 location 配置，上面的 OPTIONS 分支就不执行了
+        if ($request_method !~ ^(GET|HEAD)$) {
+            add_header Cache-Control "no-store" always;
+            return 405;
+        }
+        limit_req zone=vod_keys burst=${VOD_KEY_BURST} nodelay;
+        set $vod_upstream vod-api:8001;
+        proxy_pass http://$vod_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_set_header X-Request-ID $request_id;
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+        proxy_hide_header Cache-Control;
+        add_header Cache-Control "no-store, private" always;
+        add_header Access-Control-Allow-Origin $vod_cors_origin always;
+        add_header Vary Origin always;
+    }
+
     # HLS：/hls/<签名>/<过期时间>/<资产id>/<文件>
     # 签名覆盖"过期时间 + 资产目录"，m3u8 里的相对路径分片会自动继承这个前缀，所以每个分片都被校验
     location ~ ^/hls/(?<sl_sig>[A-Za-z0-9_-]+)/(?<sl_exp>[0-9]+)/(?<asset>[0-9]+)/(?<file>[A-Za-z0-9_./-]+)$ {
@@ -69,8 +138,56 @@ server {
         add_header X-Cache-Status $upstream_cache_status always;
     }
 
-    # 核心资产：签名明文带 v1，对象在 assets/v1/ 下，避免和旧资产 id 撞车
+    # 核心资产 Phase 4：任务专属前缀 /hls/v1/<签名>/<过期>/<资产id>/<gen>/<文件>，gen = {job_id}-{claim_version}。
+    # 必须放在下面不带 gen 的 /hls/v1/ 正则之前（正则 location 按出现顺序匹配，那条的 file 也能吞下 gen/...）。
+    # 签名明文 "{exp}/v1/{asset}/{gen} {HLS_SECRET}"：只有为这个 gen 签的地址能读它，资产级签名读不到任何 gen 目录。
+    # 缓存键带 gen：同一资产换代后不会命中旧内容；内容不可变，客户端 immutable。
+    location ~ ^/hls/v1/(?<sl_sig>[A-Za-z0-9_-]+)/(?<sl_exp>[0-9]+)/(?<asset>[0-9]+)/(?<gen>[0-9]+-[0-9]+)/(?<file>[A-Za-z0-9_./-]+)$ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin $vod_cors_origin always;
+            add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range" always;
+            add_header Access-Control-Max-Age ${VOD_CORS_MAX_AGE} always;
+            add_header Vary Origin always;
+            add_header Cache-Control "no-store" always;
+            return 204;
+        }
+        secure_link $sl_sig,$sl_exp;
+        secure_link_md5 "$sl_exp/v1/$asset/$gen ${HLS_SECRET}";
+        if ($secure_link = "")  { return 403; }
+        if ($secure_link = "0") { return 410; }
+
+        proxy_cache hls;
+        proxy_cache_key "v1/$asset/$gen/$file";
+        proxy_cache_valid 200 ${VOD_HLS_EDGE_CACHE_VALID};
+        proxy_cache_lock on;
+        proxy_cache_use_stale error timeout updating;
+        proxy_ignore_headers Set-Cookie Cache-Control Expires;
+        proxy_hide_header Set-Cookie;
+        proxy_hide_header Cache-Control;
+        proxy_force_ranges on;                     # 回源（FastAPI 流式响应）不带 Accept-Ranges；不开它缓存命中也只回 200
+        proxy_set_header X-Origin-Secret ${ORIGIN_SECRET};
+        rewrite ^ /internal/origin/v1/$asset/$gen/$file break;
+        proxy_pass http://api_backend;
+        add_header X-Cache-Status $upstream_cache_status always;
+        add_header Cache-Control $vod_gen_cache_control always;
+        add_header Access-Control-Allow-Origin $vod_cors_origin always;
+        add_header Access-Control-Expose-Headers "Content-Length, Content-Range" always;
+        add_header Vary Origin always;
+    }
+
+    # 核心资产：签名明文带 v1，对象在 assets/v1/ 下，避免和旧资产 id 撞车。
+    # Phase 4 之前写下的固定前缀资产继续用这条；只加客户端缓存头和 CORS，签名与缓存键不变。
     location ~ ^/hls/v1/(?<sl_sig>[A-Za-z0-9_-]+)/(?<sl_exp>[0-9]+)/(?<asset>[0-9]+)/(?<file>[A-Za-z0-9_./-]+)$ {
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin $vod_cors_origin always;
+            add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Range" always;
+            add_header Access-Control-Max-Age ${VOD_CORS_MAX_AGE} always;
+            add_header Vary Origin always;
+            add_header Cache-Control "no-store" always;
+            return 204;
+        }
         secure_link $sl_sig,$sl_exp;
         secure_link_md5 "$sl_exp/v1/$asset ${HLS_SECRET}";
         if ($secure_link = "")  { return 403; }
@@ -83,10 +200,16 @@ server {
         proxy_cache_use_stale error timeout updating;
         proxy_ignore_headers Set-Cookie Cache-Control Expires;
         proxy_hide_header Set-Cookie;
+        proxy_hide_header Cache-Control;
+        proxy_force_ranges on;                     # 回源（FastAPI 流式响应）不带 Accept-Ranges；不开它缓存命中也只回 200
         proxy_set_header X-Origin-Secret ${ORIGIN_SECRET};
         rewrite ^ /internal/origin/v1/$asset/$file break;
         proxy_pass http://api_backend;
         add_header X-Cache-Status $upstream_cache_status always;
+        add_header Cache-Control $vod_v1_cache_control always;
+        add_header Access-Control-Allow-Origin $vod_cors_origin always;
+        add_header Access-Control-Expose-Headers "Content-Length, Content-Range" always;
+        add_header Vary Origin always;
     }
 
     location = /nginx_status { stub_status; allow 127.0.0.1; allow 172.16.0.0/12; deny all; }

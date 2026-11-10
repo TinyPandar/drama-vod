@@ -22,6 +22,22 @@ public final class HlsSigner {
         return "/hls/v1/" + v1Signature(expires, assetId, secret) + "/" + expires + "/" + assetId + "/master.m3u8";
     }
 
+    /** Phase 4 任务专属前缀 gen = {job_id}-{claim_version}，与 Worker、Nginx 的正则一致：只含数字和一个 -。 */
+    public static boolean validGeneration(String gen) {
+        return gen != null && gen.matches("[0-9]+-[0-9]+");
+    }
+
+    /** 明文 "{exp}/v1/{asset}/{gen} {HLS_SECRET}"，对应 Nginx 带 gen 的 /hls/v1/ location 的 secure_link_md5。 */
+    public static String v1GenSignature(long expires, long assetId, String gen, String secret) {
+        if (!validGeneration(gen)) throw new IllegalArgumentException("gen");
+        return signRaw(expires + "/v1/" + assetId + "/" + gen + " " + secret);
+    }
+
+    public static String v1GenMasterUrl(long expires, long assetId, String gen, String secret) {
+        return "/hls/v1/" + v1GenSignature(expires, assetId, gen, secret) + "/" + expires + "/" + assetId + "/" + gen
+                + "/master.m3u8";
+    }
+
     private static String signRaw(String raw) {
         try {
             byte[] md5 = MessageDigest.getInstance("MD5").digest(raw.getBytes(StandardCharsets.UTF_8));

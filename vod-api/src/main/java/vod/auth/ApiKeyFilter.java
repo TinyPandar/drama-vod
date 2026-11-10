@@ -25,7 +25,8 @@ public class ApiKeyFilter extends OncePerRequestFilter {
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
         String path = request.getRequestURI();
-        return !path.startsWith("/api/v1/") || path.equals("/api/v1/healthz");
+        // /api/v1/qoe 用 body 里的 Core 播放 token 鉴权（sendBeacon 不能带头），见 vod.qoe.QoeController。
+        return !path.startsWith("/api/v1/") || path.equals("/api/v1/healthz") || path.equals("/api/v1/qoe");
     }
 
     @Override

@@ -65,7 +65,7 @@ class MysqlSemanticsTest {
 
     @BeforeEach
     void clean() {
-        for (String t : List.of("vod_outbox", "vod_transcode_job", "vod_media_asset", "vod_tenant")) {
+        for (String t : List.of("vod_output_prefix", "vod_outbox", "vod_transcode_job", "vod_media_asset", "vod_tenant")) {
             jdbc.update("DELETE FROM " + t);
         }
         jdbc.update("INSERT INTO vod_tenant(id, name, storage_quota_bytes) VALUES (1, 'A', 200)");
@@ -137,8 +137,11 @@ class MysqlSemanticsTest {
         jdbc.update("INSERT INTO vod_media_asset(id, tenant_id, status, source_bucket, source_key) VALUES (5, 1, 'TRANSCODING', 'b', 'k')");
         jdbc.update("INSERT INTO vod_transcode_job(id, tenant_id, asset_id, profile, status, claim_version, locked_until) "
                 + "VALUES (9, 1, 5, 'ladder_v1', 'RUNNING', 2, ?)", Timestamp.from(Instant.now().plusSeconds(600)));
+        jdbc.update("INSERT INTO vod_output_prefix(asset_id, job_id, claim_version, prefix, status) "
+                + "VALUES (5, 9, 2, 'assets/v1/5/9-2/', 'WRITING')");
         var jobs = new JobService(jdbc);
         jobs.cancel(1, 9);
+        assertEquals("GARBAGE", jdbc.queryForObject("SELECT status FROM vod_output_prefix WHERE job_id = 9", String.class));
         Map<String, Object> row = jdbc.queryForMap("SELECT status, claim_version, locked_until FROM vod_transcode_job WHERE id = 9");
         assertEquals("CANCELLED", row.get("status"));
         assertEquals(3, ((Number) row.get("claim_version")).intValue());

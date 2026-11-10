@@ -1,0 +1,42 @@
+{
+  "comment": "播放签名共享测试向量。Java（CompatVectorsTest / PlaybackSignVectorsTest）和 scripts/test_playback_contract.py 都读这份文件；后者把 nginx/templates/default.conf.template 里对应 location 的 secure_link_md5 表达式代入变量后计算，保证 Java 与 Nginx 一致。",
+  "secret": "dev-hls",
+  "vectors": [
+    {
+      "kind": "legacy",
+      "exp": 1700000000,
+      "asset_id": 12,
+      "gen": null,
+      "plaintext": "1700000000/12 dev-hls",
+      "signature": "MH5Il_R3zWa5ZGqMLpd9AQ",
+      "master_url": "/hls/MH5Il_R3zWa5ZGqMLpd9AQ/1700000000/12/master.m3u8"
+    },
+    {
+      "kind": "v1",
+      "exp": 1700000000,
+      "asset_id": 12,
+      "gen": null,
+      "plaintext": "1700000000/v1/12 dev-hls",
+      "signature": "VRcL-NTCKUnaWumH56uOjw",
+      "master_url": "/hls/v1/VRcL-NTCKUnaWumH56uOjw/1700000000/12/master.m3u8"
+    },
+    {
+      "kind": "v1gen",
+      "exp": 1700000000,
+      "asset_id": 12,
+      "gen": "34-2",
+      "plaintext": "1700000000/v1/12/34-2 dev-hls",
+      "signature": "Rl4uRVWeM6XdYkeN9Yzd6Q",
+      "master_url": "/hls/v1/Rl4uRVWeM6XdYkeN9Yzd6Q/1700000000/12/34-2/master.m3u8"
+    },
+    {
+      "kind": "v1gen",
+      "exp": 1800000000,
+      "asset_id": 7,
+      "gen": "105-11",
+      "plaintext": "1800000000/v1/7/105-11 dev-hls",
+      "signature": "XRk5-9wWpNtJtBCYCOI2Sg",
+      "master_url": "/hls/v1/XRk5-9wWpNtJtBCYCOI2Sg/1800000000/7/105-11/master.m3u8"
+    }
+  ]
+}

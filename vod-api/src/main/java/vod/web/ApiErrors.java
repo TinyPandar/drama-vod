@@ -7,7 +7,8 @@ import vod.auth.TenantPrincipal;
 import vod.tenant.TenantGuard;
 import vod.upload.UploadService;
 import vod.usage.UsageService;
-import vod.web.PlaybackController;
+import vod.job.JobService;
+import vod.media.PlaybackService;
 
 import java.util.Map;
 
@@ -38,9 +39,15 @@ public class ApiErrors {
         return ResponseEntity.status(403).body(Map.of("detail", e.getMessage()));
     }
 
-    @ExceptionHandler(PlaybackController.NotReady.class)
+    @ExceptionHandler(PlaybackService.NotReady.class)
     ResponseEntity<Map<String, String>> notReady() {
         return ResponseEntity.status(409).body(Map.of("detail", "asset not ready"));
+    }
+
+    /** 取消撞上死锁/锁超时，重试一次仍失败：503，让客户端稍后再试，而不是 500。 */
+    @ExceptionHandler(JobService.BusyException.class)
+    ResponseEntity<Map<String, String>> busy() {
+        return ResponseEntity.status(503).header("Retry-After", "1").body(Map.of("detail", "busy, retry later"));
     }
 
     @ExceptionHandler(IllegalArgumentException.class)

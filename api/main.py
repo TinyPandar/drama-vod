@@ -13,6 +13,7 @@
   GET  /api/episodes/{id}/play?user_id=    鉴权后发签名播放地址 + 播放 token（还带下一集，供预加载）
   GET  /keys/{asset_id}                    key 服务：凭播放 token 下发 AES-128 密钥
   GET  /api/playback/{asset}/master.m3u8   给不能设请求头的播放器（iPhone）改写播放列表
+  GET  /api/episodes/{id}/vod-play?user_id=  Demo 解锁后经视频云签 Core 播放 token（Core 的 key 走 /keys/v1/，在 vod-api）
   GET  /api/rank/hot  /api/episodes/{id}/stats  /metrics
 """
 import base64, hashlib, hmac, json, os, re, threading, time
@@ -21,6 +22,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from origin_path import object_key
+import secret_guard
 import vod_client
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel
@@ -28,11 +30,14 @@ from pydantic import BaseModel
 from common import (ENV, HLS_BUCKET, Q_MAIN, SOURCE_BUCKET, db, log, mq_channel, publish, rds, s3,
                     transcode_message, wait_for)
 
+VOD_ENV = ENV("VOD_ENV", "dev")
+MIN_SECRET_LENGTH = int(ENV("VOD_MIN_SECRET_LENGTH") or 32)
 HLS_SECRET = ENV("HLS_SECRET", "dev")
 TOKEN_SECRET = ENV("TOKEN_SECRET", "dev").encode()
 PLAY_URL_TTL = int(ENV("PLAY_URL_TTL", "600"))
 PUBLIC_UPLOAD_ENDPOINT = ENV("PUBLIC_UPLOAD_ENDPOINT", "http://localhost:9000")
-ORIGIN_SECRET = ENV("ORIGIN_SECRET", "dev")
+# compose 不再给 :-dev 兜底：dev 下为空时在这里退回 dev（Nginx 的入口脚本同样处理），非 dev 由启动检查拒绝。
+ORIGIN_SECRET = secret_guard.dev_fallback(ENV("ORIGIN_SECRET", ""), VOD_ENV)
 
 app = FastAPI(title="drama-vod api")
 s3_internal = s3()
@@ -70,7 +75,7 @@ def healthz():
 def internal_origin(scope: str, asset_id: str, file_path: str,
                     x_origin_secret: str | None = Header(default=None)):
     """只给 Nginx 回源。对象存储不再匿名可读。"""
-    if not x_origin_secret or x_origin_secret != ORIGIN_SECRET:
+    if not x_origin_secret or not hmac.compare_digest(x_origin_secret.encode(), ORIGIN_SECRET.encode()):
         raise HTTPException(403, "origin denied")
     try:
         key = object_key(scope, asset_id, file_path)
@@ -94,8 +99,17 @@ def internal_origin(scope: str, asset_id: str, file_path: str,
 
 
 # ---------------- 启动：建桶 + 播放计数回刷线程 ----------------
+def check_secrets():
+    """非 dev 下弱密钥直接让 startup 失败（uvicorn 退出）；dev 只警告。"""
+    secret_guard.check_secrets(
+        {"ORIGIN_SECRET": ORIGIN_SECRET, "HLS_SECRET": HLS_SECRET, "TOKEN_SECRET": TOKEN_SECRET.decode()},
+        VOD_ENV, MIN_SECRET_LENGTH, warn=lambda msg: log("weak_secrets", detail=msg))
+
+
 @app.on_event("startup")
 def startup():
+    check_secrets()
+
     def ensure_buckets():
         existing = {b["Name"] for b in s3_internal.list_buckets()["Buckets"]}
         for b in (SOURCE_BUCKET, HLS_BUCKET):
@@ -459,6 +473,8 @@ def vod_complete(episode_id: int):
 
 @app.get("/api/episodes/{episode_id}/vod-play")
 def vod_play(episode_id: int, user_id: int):
+    """付费解锁仍由 Demo 的 can_play 决定；通过后向视频云要 Core 播放 token。
+    token 用于 /keys/v1/{asset}（加密资产）和 /api/v1/qoe 上报；encrypted 取 Core 资产的真实值，不再看 is_paid。"""
     ep = get_episode(episode_id)
     link = vod_link(episode_id)
     if not link:
@@ -466,11 +482,11 @@ def vod_play(episode_id: int, user_id: int):
     if not can_play(user_id, ep):
         PLAY_REQ.labels("need_unlock").inc()
         raise HTTPException(402, "paid episode, unlock first")
-    status, payload = vod_client.playback(link["vod_asset_id"])
-    if status != 200:
+    status, payload = vod_client.playback_token(link["vod_asset_id"])
+    if status != 200 or not payload.get("token") or not payload.get("master_url"):
         raise HTTPException(409 if status == 409 else 502, payload.get("detail", "vod playback failed"))
-    return {"episode_id": episode_id, "asset_id": link["vod_asset_id"], "encrypted": False,
-            "master_url": payload["master_url"], "token": "", "expires_at": payload.get("expires_at"),
+    return {"episode_id": episode_id, "asset_id": link["vod_asset_id"], "encrypted": bool(payload.get("encrypted")),
+            "master_url": payload["master_url"], "token": payload["token"], "expires_at": payload.get("expires_at"),
             "via": "vod-api", "next": None}
 
 

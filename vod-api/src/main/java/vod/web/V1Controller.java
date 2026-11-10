@@ -75,11 +75,11 @@ public class V1Controller {
         return uploads.job(tenant(request, "job").tenantId(), jobId);
     }
 
-    /** 取消 Core 任务：200 返回取消后的任务详情（已取消重复调用同样 200），终态 409。 */
+    /** 取消 Core 任务：200 返回取消后的任务详情（已取消重复调用同样 200），终态 409；锁冲突重试一次仍失败 503。 */
     @PostMapping("/api/v1/jobs/{jobId}/cancel")
     public Map<String, Object> cancel(HttpServletRequest request, @PathVariable long jobId) {
         long tenantId = tenant(request, "job").tenantId();
-        jobService.cancel(tenantId, jobId);
+        JobService.cancelWithRetry(() -> jobService.cancel(tenantId, jobId));
         return uploads.job(tenantId, jobId);
     }
 

@@ -98,11 +98,20 @@ class FakeConn:
 
 
 class FakeS3:
-    def __init__(self):
-        self.uploaded = []
+    """记录上传；list_objects_v2 按已上传对象回答，mutate 可以模拟远端缺文件/大小不符。"""
+
+    def __init__(self, mutate=None):
+        self.uploaded, self.objects, self.mutate = [], {}, mutate
 
     def upload_file(self, local, bucket, key, ExtraArgs=None):
         self.uploaded.append(key)
+        self.objects[key] = os.path.getsize(local)
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None, MaxKeys=None):
+        objects = {k: v for k, v in self.objects.items() if k.startswith(Prefix)}
+        if self.mutate:
+            objects = self.mutate(dict(objects))
+        return {"Contents": [{"Key": k, "Size": v} for k, v in sorted(objects.items())], "IsTruncated": False}
 
 
 def metric_value(m):
@@ -180,6 +189,23 @@ class FencingSqlTest(unittest.TestCase):
         self.assertIn("error_code=NULL", c.calls[0][0])
         self.assertIn("UPDATE vod_media_asset SET status='READY'", c.calls[1][0])
 
+    def test_core_success_switches_prefix_in_same_transaction(self):
+        c = FakeCursor(affected=1)
+        self.assertTrue(fencing.commit_success(c, "core", 3, 5, 7, "assets/v1/7/3-5/", 1000, 720, 1280))
+        sqls = [sql for sql, _ in c.calls]
+        ready = next(i for i, q in enumerate(sqls) if "UPDATE vod_media_asset SET status='READY'" in q)
+        self.assertEqual(c.calls[ready][1][0], "assets/v1/7/3-5/")
+        active = [(q, p) for q, p in c.calls[ready + 1:] if "vod_output_prefix" in q]
+        self.assertIn("SET status='ACTIVE'", active[0][0])
+        self.assertEqual(active[0][1], ("assets/v1/7/3-5/",))
+        self.assertIn("SET status='GARBAGE'", active[1][0])
+        self.assertIn("status IN ('WRITING','ACTIVE')", active[1][0])
+        self.assertEqual(active[1][1], (7, "assets/v1/7/3-5/"))
+        # 围栏丢了就什么前缀都不切
+        c = FakeCursor(affected=0)
+        fencing.commit_success(c, "core", 3, 5, 7, "assets/v1/7/3-5/", 1000, 720, 1280)
+        self.assertFalse(any("vod_output_prefix" in q for q, _ in c.calls))
+
     def test_legacy_success_keeps_frozen_writes(self):
         c = FakeCursor(affected=1)
         self.assertTrue(fencing.commit_success(c, "legacy", 3, 5, 7, "assets/7/", 1000, 720, 1280,
@@ -190,6 +216,7 @@ class FencingSqlTest(unittest.TestCase):
         self.assertTrue(any("INSERT INTO asset_rendition" in s for s in sqls))
         self.assertTrue(any("UPDATE video_asset SET status='READY'" in s for s in sqls))
         self.assertTrue(any("UPDATE episode SET asset_id" in s for s in sqls))
+        self.assertFalse(any("vod_output_prefix" in s for s in sqls))
 
     def test_renew_same_second_still_holds(self):
         # PyMySQL：同一秒内再续租 locked_until 不变 -> 返回 0；回查围栏仍在就算成功
@@ -304,21 +331,88 @@ class ProcessTest(unittest.TestCase):
             calls["apply_failure"].append(a)
             return True
 
-        names = dict(db=lambda: conn, claim=lambda *a: True, update_asset_status=lambda *a: 1,
+        names = dict(db=lambda: conn, claim=lambda *a: True, mark_transcoding=lambda *a: 1,
                      renew_lease=renew, download_source=lambda b, k, d: write(d),
                      probe=lambda path, stop=None: (720, 1280, 8000, False), run=fake_hls,
                      verify_hls=lambda *a: True, s3c=self.s3, commit_success=commit_success,
-                     record_failure=record_failure, apply_failure=apply_failure, HEARTBEAT_SEC=3600)
+                     record_failure=record_failure, apply_failure=apply_failure, HEARTBEAT_SEC=3600,
+                     r=types.SimpleNamespace(delete=lambda *a: None))
         names.update(extra)
         with patched(**names):
+            self.cursor = cur
             return worker.process(job_id, "trace", origin), conn
+
+    def prefix_sql(self):
+        return [(sql, params) for sql, params in self.cursor.calls if "vod_output_prefix" in sql]
 
     def test_success_uploads_master_last_and_commits(self):
         res, conn = self.run_process(101)
         self.assertEqual(res, "ok")
-        self.assertEqual(self.s3.uploaded[-1], "assets/v1/7/master.m3u8")
+        self.assertEqual(self.s3.uploaded[-1], "assets/v1/7/101-2/master.m3u8")
         self.assertEqual(len(self.calls["commit_success"]), 1)
+        self.assertEqual(self.calls["commit_success"][0][4], "assets/v1/7/101-2/")  # hls_prefix 指向任务专属前缀
         self.assertIn("commit", conn.events)
+
+    def test_core_writes_job_scoped_prefix_and_records_writing_first(self):
+        res, _ = self.run_process(111)
+        self.assertEqual(res, "ok")
+        self.assertTrue(all(k.startswith("assets/v1/7/111-2/") for k in self.s3.uploaded), self.s3.uploaded)
+        sql, params = self.prefix_sql()[0]
+        self.assertIn("INSERT IGNORE INTO vod_output_prefix", sql)
+        self.assertIn("'WRITING'", sql)
+        self.assertEqual(params, (7, 111, 2, "assets/v1/7/111-2/"))
+
+    def test_remote_missing_or_wrong_size_does_not_commit(self):
+        for name, mutate in (("missing", lambda o: {k: v for k, v in o.items() if not k.endswith("seg_00000.ts")}),
+                             ("size", lambda o: {k: (v + 1 if k.endswith("index.m3u8") else v) for k, v in o.items()}),
+                             ("extra", lambda o: {**o, "assets/v1/7/112-2/stray.ts": 1})):
+            self.setUp()
+            self.s3 = FakeS3(mutate)
+            res, conn = self.run_process(112)
+            self.assertEqual(res[0], "retry", name)
+            self.assertEqual(self.calls["commit_success"], [], name)
+            self.assertEqual(self.calls["record_failure"][0][:2], (False, rp.STORAGE_ERROR), name)
+            discards = [p for sql, p in self.prefix_sql() if "SET status='GARBAGE'" in sql]
+            self.assertEqual(discards, [("assets/v1/7/112-2/",)], name)  # 自己的 WRITING 置 GARBAGE
+
+    def test_fence_lost_after_writing_discards_prefix(self):
+        answers = [True, False]
+        res, _ = self.run_process(113, renew=lambda *a: answers.pop(0))
+        self.assertEqual(res, "drop")
+        discards = [p for sql, p in self.prefix_sql() if "SET status='GARBAGE'" in sql]
+        self.assertEqual(discards, [("assets/v1/7/113-2/",)])
+
+    def test_legacy_keeps_fixed_prefix_and_skips_prefix_table(self):
+        res, _ = self.run_process(114, origin="legacy", row=dict(JOB_ROW, episode_id=9))
+        self.assertEqual(res, "ok")
+        self.assertEqual(self.s3.uploaded[-1], "assets/7/master.m3u8")
+        self.assertEqual(self.prefix_sql(), [])
+
+    def test_encrypted_key_table_and_uri_by_origin(self):
+        for origin, table, uri in (("core", "vod_content_key", "/keys/v1/7"), ("legacy", "content_key", "/keys/7")):
+            seen = {}
+
+            def capture(cmd, timeout=None, stop=None, fail_code=None):
+                info = cmd[cmd.index("-hls_key_info_file") + 1]
+                seen["keyinfo"] = open(info).read().splitlines()
+                return fake_hls(cmd)
+
+            self.setUp()
+            row = dict(JOB_ROW, encrypted=1, episode_id=9 if origin == "legacy" else None)
+            key_row = {"key_hex": "00" * 16, "iv_hex": "11" * 16}
+            cur = FakeCursor(rows=[row, key_row])
+            conn = FakeConn(cur)
+            with patched(db=lambda: conn, claim=lambda *a: True, mark_transcoding=lambda *a: 1,
+                         renew_lease=lambda *a: True, download_source=lambda b, k, d: write(d),
+                         probe=lambda path, stop=None: (720, 1280, 8000, False), run=capture,
+                         verify_hls=lambda *a: True, s3c=self.s3, commit_success=lambda *a, **k: True,
+                         HEARTBEAT_SEC=3600, r=types.SimpleNamespace(delete=lambda *a: None)):
+                self.assertEqual(worker.process(115, "t", origin), "ok", origin)
+            key_sql = [sql for sql, _ in cur.calls if "key_hex" in sql]
+            self.assertTrue(key_sql and all(table + "(" in sql or "FROM " + table + " " in sql for sql in key_sql),
+                            (origin, key_sql))
+            self.assertEqual(seen["keyinfo"][0], uri, origin)
+            self.assertEqual(seen["keyinfo"][2], "11" * 16)
 
     def test_fence_lost_before_upload_uploads_nothing(self):
         before = metric_value(worker.DROP_FENCED)
@@ -334,7 +428,7 @@ class ProcessTest(unittest.TestCase):
         res, _ = self.run_process(103, renew=lambda *a: answers.pop(0))
         self.assertEqual(res, "drop")
         self.assertTrue(self.s3.uploaded)
-        self.assertNotIn("assets/v1/7/master.m3u8", self.s3.uploaded)
+        self.assertNotIn("assets/v1/7/103-2/master.m3u8", self.s3.uploaded)
         self.assertEqual(self.calls["commit_success"], [])
         self.assertEqual(self.calls["record_failure"], [])
 
@@ -393,6 +487,33 @@ class ProcessTest(unittest.TestCase):
         res, _ = self.run_process(110, origin="legacy", probe=no_video, row=row)
         self.assertEqual(res[0], "retry")
         self.assertEqual(self.calls["record_failure"][0][:2], (False, None))
+
+
+class TranscodingLockOrderTest(unittest.TestCase):
+    """Phase 3 遗留：TRANSCODING 显式事务，先 FOR UPDATE 锁任务行，再改资产（与取消事务同序）。"""
+
+    def test_locks_job_row_before_asset(self):
+        for origin, job, asset in (("core", "vod_transcode_job", "vod_media_asset"),
+                                   ("legacy", "transcode_job", "video_asset")):
+            cur = FakeCursor(rows=[{"claim_version": 5, "status": "RUNNING"}])
+            conn = FakeConn(cur)
+            self.assertEqual(fencing.mark_transcoding(conn, cur, origin, 7, 3, 5), 1)
+            self.assertEqual(conn.events, ["begin", "commit"])
+            (lock_sql, lock_params), (upd_sql, upd_params) = cur.calls
+            self.assertTrue(lock_sql.startswith(f"SELECT claim_version, status FROM {job} "), lock_sql)
+            self.assertTrue(lock_sql.rstrip().endswith("FOR UPDATE"))
+            self.assertEqual(lock_params, (3,))
+            self.assertEqual(upd_sql, f"UPDATE {asset} SET status='TRANSCODING' WHERE id=%s")
+            self.assertNotIn("JOIN", upd_sql)
+            self.assertEqual(upd_params, (7,))
+
+    def test_lost_fence_rolls_back_without_touching_asset(self):
+        for row in ({"claim_version": 6, "status": "RUNNING"}, {"claim_version": 5, "status": "CANCELLED"}, None):
+            cur = FakeCursor(rows=[row] if row else [])
+            conn = FakeConn(cur)
+            self.assertEqual(fencing.mark_transcoding(conn, cur, "core", 7, 3, 5), 0)
+            self.assertEqual(conn.events, ["begin", "rollback"])
+            self.assertEqual(len(cur.calls), 1)
 
 
 class RunTest(unittest.TestCase):

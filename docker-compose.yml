@@ -1,6 +1,9 @@
 name: drama-vod
 
 x-app-env: &app-env
+  # dev（默认）下弱密钥只警告；设成 prod 等其他值时，api / vod-api / nginx 发现空、dev 或过短的密钥会拒绝启动。
+  VOD_ENV: ${VOD_ENV:-dev}
+  VOD_MIN_SECRET_LENGTH: ${VOD_MIN_SECRET_LENGTH:-32}
   MYSQL_HOST: mysql
   MYSQL_USER: vod
   MYSQL_PASSWORD: ${MYSQL_PASSWORD}
@@ -69,7 +72,8 @@ services:
       HLS_SECRET: ${HLS_SECRET}
       TOKEN_SECRET: ${TOKEN_SECRET}
       PLAY_URL_TTL: "600"
-      ORIGIN_SECRET: ${ORIGIN_SECRET:-dev}
+      # 不再用 :-dev 兜底：dev 下为空时 api 与 nginx 各自退回 dev（一条命令仍能起栈），非 dev 为空则拒绝启动
+      ORIGIN_SECRET: ${ORIGIN_SECRET:-}
       VOD_API_BASE: http://vod-api:8001
       VOD_API_KEY: ${VOD_DEV_API_KEY:-dev-demo-key}
     depends_on:
@@ -85,7 +89,11 @@ services:
       MYSQL_USER: vod
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
       MYSQL_DB: vod
+      VOD_ENV: ${VOD_ENV:-dev}
+      VOD_MIN_SECRET_LENGTH: ${VOD_MIN_SECRET_LENGTH:-32}
       HLS_SECRET: ${HLS_SECRET}
+      # Core 播放 token 的 HMAC 密钥（和旧 Demo 的 TOKEN_SECRET 分开）；dev 下为空时 vod-api 退回 dev
+      VOD_PLAY_TOKEN_SECRET: ${VOD_PLAY_TOKEN_SECRET:-}
       PLAY_URL_TTL: "600"
       VOD_DEV_API_KEY: ${VOD_DEV_API_KEY:-dev-demo-key}
       S3_ENDPOINT: http://minio:9000
@@ -112,22 +120,43 @@ services:
       WORKER_REQUEUE_DELAY_MS: ${WORKER_REQUEUE_DELAY_MS:-}
       WORKER_SWEEP_INTERVAL_SECONDS: ${WORKER_SWEEP_INTERVAL_SECONDS:-}
       WORKER_SWEEP_PENDING_AGE_SECONDS: ${WORKER_SWEEP_PENDING_AGE_SECONDS:-}
+      # Phase 4 垃圾输出前缀清理；宽限期须大于租约与播放 token 最长有效期
+      WORKER_OUTPUT_GC_ENABLED: ${WORKER_OUTPUT_GC_ENABLED:-}
+      WORKER_OUTPUT_GC_GRACE_SECONDS: ${WORKER_OUTPUT_GC_GRACE_SECONDS:-}
+      WORKER_OUTPUT_GC_INTERVAL_SECONDS: ${WORKER_OUTPUT_GC_INTERVAL_SECONDS:-}
+      WORKER_OUTPUT_GC_PREFIX_BATCH: ${WORKER_OUTPUT_GC_PREFIX_BATCH:-}
+      WORKER_OUTPUT_GC_DELETE_BATCH: ${WORKER_OUTPUT_GC_DELETE_BATCH:-}
     depends_on:
       api: {condition: service_started}
 
   nginx:                      # 模拟 CDN 边缘：secure_link 鉴权 + proxy_cache 缓存；同时是上传网关
     image: nginx:1.27-alpine
     environment:
+      VOD_ENV: ${VOD_ENV:-dev}
+      VOD_MIN_SECRET_LENGTH: ${VOD_MIN_SECRET_LENGTH:-32}
       HLS_SECRET: ${HLS_SECRET}
-      ORIGIN_SECRET: ${ORIGIN_SECRET:-dev}
+      ORIGIN_SECRET: ${ORIGIN_SECRET:-}
+      # 以下留空用 nginx/entrypoint.d/05-vod-env.envsh 里的开发默认（不是基准或承诺）
+      VOD_CORS_ORIGINS: ${VOD_CORS_ORIGINS:-}
+      VOD_CORS_MAX_AGE: ${VOD_CORS_MAX_AGE:-}
+      VOD_KEY_RATE: ${VOD_KEY_RATE:-}
+      VOD_KEY_BURST: ${VOD_KEY_BURST:-}
+      VOD_QOE_RATE: ${VOD_QOE_RATE:-}
+      VOD_QOE_BURST: ${VOD_QOE_BURST:-}
+      VOD_QOE_MAX_BODY: ${VOD_QOE_MAX_BODY:-}
+      VOD_HLS_IMMUTABLE_MAX_AGE: ${VOD_HLS_IMMUTABLE_MAX_AGE:-}
+      VOD_HLS_PLAYLIST_MAX_AGE: ${VOD_HLS_PLAYLIST_MAX_AGE:-}
+      VOD_HLS_SEGMENT_MAX_AGE: ${VOD_HLS_SEGMENT_MAX_AGE:-}
+      VOD_HLS_EDGE_CACHE_VALID: ${VOD_HLS_EDGE_CACHE_VALID:-}
     volumes:
       - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/entrypoint.d/05-vod-env.envsh:/docker-entrypoint.d/05-vod-env.envsh:ro
       - ./nginx/html:/usr/share/nginx/html:ro
       - nginx-cache:/var/cache/nginx/hls
     ports:
       - "${HTTP_PORT:-8080}:8080"   # 播放页 / API / HLS / key
       - "${UPLOAD_PORT:-9000}:9000" # 预签名直传入口（只放行 PUT）
-    depends_on: [api, minio]
+    depends_on: [api, minio, vod-api]
 
   prometheus:                 # 可选：docker compose --profile obs up -d
     image: prom/prometheus:latest
