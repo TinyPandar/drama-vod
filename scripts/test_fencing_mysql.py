@@ -20,6 +20,7 @@ from pymysql.constants import CLIENT  # noqa: E402
 import fencing  # noqa: E402
 import output_gc  # noqa: E402
 import output_prefix  # noqa: E402
+import transcode_template  # noqa: E402
 from dlq import ReplayRefused, replay_job  # noqa: E402
 from key_provider import PlaintextKeyStore  # noqa: E402
 
@@ -32,6 +33,10 @@ CANCEL_SQL = ("UPDATE vod_transcode_job SET status='CANCELLED', claim_version=cl
               "next_attempt_at=NULL, updated_at=CURRENT_TIMESTAMP "
               "WHERE id=%s AND tenant_id=%s AND status IN ('PENDING','RETRYING','RUNNING')")
 CANCEL_ASSET_SQL = "UPDATE vod_media_asset SET status='CANCELLED' WHERE id=%s AND tenant_id=%s AND status <> 'READY'"
+# 与 vod-api TranscodeService.reset 保持一致（Phase 5 重新转码 / 重试复用同一行）
+RESET_SQL = ("UPDATE vod_transcode_job SET status='PENDING', claim_version=claim_version+1, attempts=0, error_code=NULL, "
+             "last_error=NULL, locked_until=NULL, worker_id=NULL, next_attempt_at=NULL, template_id=%s, "
+             "updated_at=CURRENT_TIMESTAMP WHERE id=%s AND status=%s")
 CANCEL_PREFIX_SQL = ("UPDATE vod_output_prefix SET status='GARBAGE', updated_at=CURRENT_TIMESTAMP "
                      "WHERE job_id=%s AND status='WRITING'")
 
@@ -661,6 +666,117 @@ class GcLockOrder(Base):
         self.assertTrue(result["ok"])
         self.assertEqual(self.job(job_id)["status"], "SUCCEEDED")
         self.assertEqual((self.prefix_status(old_p), self.prefix_status(cur_p)), ("GARBAGE", "ACTIVE"))
+
+
+class Phase5Retranscode(Base):
+    """Phase 5：重新转码复用同一行（claim_version+1、新前缀），READY 资产在重转期间保持可播；
+    成功/失败事件与任务终态同一事务写进 vod_webhook_event，不进 vod_outbox；Worker 按 job_id 读模板。"""
+
+    def setUp(self):
+        super().setUp()
+        self.c.execute("DELETE FROM vod_webhook_event")
+        self.c.execute("DELETE FROM vod_transcode_template WHERE tenant_id <> 0")
+
+    def events(self, job_id):
+        self.c.execute("SELECT event_type, claim_version, error_code, status FROM vod_webhook_event WHERE job_id=%s ORDER BY id",
+                       (job_id,))
+        return self.c.fetchall()
+
+    def run_success(self, job_id, asset_id):
+        self.assertTrue(fencing.claim(self.c, "core", job_id, "w", 60))
+        v = self.job(job_id)["claim_version"]
+        self.assertEqual(fencing.mark_transcoding(self.conn, self.c, "core", asset_id, job_id, v), 1)
+        prefix = f"assets/v1/{asset_id}/{job_id}-{v}/"
+        output_prefix.insert_writing(self.c, asset_id, job_id, v, prefix)
+        self.conn.begin()
+        self.assertTrue(fencing.commit_success(self.c, "core", job_id, v, asset_id, prefix, 1000, 720, 1280))
+        self.conn.commit()
+        return prefix
+
+    def test_retranscode_reuses_row_and_switches_prefix_atomically(self):
+        job_id, asset_id = self.core_job()
+        p1 = self.run_success(job_id, asset_id)
+        self.assertEqual([e["event_type"] for e in self.events(job_id)], ["transcode.succeeded"])
+        v1 = self.job(job_id)["claim_version"]
+        self.assertEqual(self.c.execute(RESET_SQL, (None, job_id, "SUCCEEDED")), 1)
+        self.assertEqual(self.job(job_id)["claim_version"], v1 + 1)
+        # 领取后 TRANSCODING 不会把 READY 资产改掉，旧版本继续可播
+        self.assertTrue(fencing.claim(self.c, "core", job_id, "w2", 60))
+        v2 = self.job(job_id)["claim_version"]
+        self.assertEqual(fencing.mark_transcoding(self.conn, self.c, "core", asset_id, job_id, v2), 1)
+        self.assertEqual(self.asset_status(asset_id), "READY")
+        p2 = f"assets/v1/{asset_id}/{job_id}-{v2}/"
+        self.assertNotEqual(p1, p2)
+        output_prefix.insert_writing(self.c, asset_id, job_id, v2, p2)
+        self.conn.begin()
+        self.assertTrue(fencing.commit_success(self.c, "core", job_id, v2, asset_id, p2, 1000, 720, 1280))
+        self.conn.commit()
+        self.c.execute("SELECT prefix, status FROM vod_output_prefix WHERE asset_id=%s", (asset_id,))
+        self.assertEqual({r["prefix"]: r["status"] for r in self.c.fetchall()}, {p1: "GARBAGE", p2: "ACTIVE"})
+        self.c.execute("SELECT COUNT(*) AS n FROM vod_transcode_job WHERE asset_id=%s", (asset_id,))
+        self.assertEqual(self.c.fetchone()["n"], 1)
+        ev = self.events(job_id)
+        self.assertEqual([e["event_type"] for e in ev], ["transcode.succeeded", "transcode.succeeded"])
+        self.assertEqual(ev[1]["claim_version"], v2)
+        self.c.execute("SELECT COUNT(*) AS n FROM vod_outbox")
+        self.assertEqual(self.c.fetchone()["n"], 0)
+
+    def test_failed_retranscode_keeps_ready_asset_and_records_failed_event(self):
+        job_id, asset_id = self.core_job()
+        p1 = self.run_success(job_id, asset_id)
+        self.c.execute(RESET_SQL, (None, job_id, "SUCCEEDED"))
+        fencing.claim(self.c, "core", job_id, "w2", 60)
+        v = self.job(job_id)["claim_version"]
+        self.conn.begin()
+        changed = fencing.record_failure(self.c, "core", job_id, v, True, "no video", "NO_VIDEO_STREAM")
+        self.assertTrue(fencing.apply_failure(self.c, "core", asset_id, job_id, v, changed, True))
+        self.conn.commit()
+        self.assertEqual(self.asset_status(asset_id), "READY")
+        self.c.execute("SELECT hls_prefix FROM vod_media_asset WHERE id=%s", (asset_id,))
+        self.assertEqual(self.c.fetchone()["hls_prefix"], p1)
+        failed = self.events(job_id)[-1]
+        self.assertEqual((failed["event_type"], failed["error_code"], failed["status"]),
+                         ("transcode.failed", "NO_VIDEO_STREAM", "PENDING"))
+        # 非 READY 资产照旧变 FAILED；重试（RETRYING）不记事件
+        j2, a2 = self.core_job()
+        fencing.claim(self.c, "core", j2, "w", 60)
+        v2 = self.job(j2)["claim_version"]
+        self.conn.begin()
+        ch = fencing.record_failure(self.c, "core", j2, v2, False, "boom", "STORAGE_ERROR", 1000)
+        fencing.apply_failure(self.c, "core", a2, j2, v2, ch, False)
+        self.conn.commit()
+        self.assertEqual(self.events(j2), ())
+        self.c.execute(RESET_SQL, (None, j2, "RETRYING"))  # 只是为了能再领一次
+        fencing.claim(self.c, "core", j2, "w", 60)
+        v3 = self.job(j2)["claim_version"]
+        self.conn.begin()
+        ch = fencing.record_failure(self.c, "core", j2, v3, True, "bad", "INPUT_INVALID")
+        fencing.apply_failure(self.c, "core", a2, j2, v3, ch, True)
+        self.conn.commit()
+        self.assertEqual(self.asset_status(a2), "FAILED")
+        self.assertEqual([e["event_type"] for e in self.events(j2)], ["transcode.failed"])
+
+    def test_lost_fence_writes_no_event(self):
+        job_id, asset_id = self.core_job()
+        fencing.claim(self.c, "core", job_id, "w", 60)
+        v = self.job(job_id)["claim_version"]
+        self.c.execute(CANCEL_SQL, (job_id, 1))
+        self.conn.begin()
+        self.assertFalse(fencing.commit_success(self.c, "core", job_id, v, asset_id, f"assets/v1/{asset_id}/{job_id}-{v}/", 1, 2, 2))
+        self.conn.rollback()
+        self.assertEqual(self.events(job_id), ())
+
+    def test_worker_reads_template_by_job_id(self):
+        job_id, _ = self.core_job()
+        ladder, audio = transcode_template.load(self.c, job_id)
+        self.assertEqual(ladder, transcode_template.DEFAULT_LADDER)
+        self.assertEqual(audio, 96)
+        self.c.execute("INSERT INTO vod_transcode_template(tenant_id, name, ladder_json, audio_kbps) "
+                       "VALUES (1, 'mobile', '[[\"360p\",360,500],[\"540p\",540,900]]', 64)")
+        self.c.execute("UPDATE vod_transcode_job SET template_id=%s, profile='mobile' WHERE id=%s", (self.c.lastrowid, job_id))
+        ladder, audio = transcode_template.load(self.c, job_id)
+        self.assertEqual(ladder, [("540p", 540, 900), ("360p", 360, 500)])
+        self.assertEqual(audio, 64)
 
 
 class ContentKeys(Base):

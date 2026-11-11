@@ -8,7 +8,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 ## 分支方案：Phase 5 平台化控制台
 
-本分支：`plan/phase-5`，基线 `main` = `9cab039`（Phase 4 已合并）。下面只写方案，还没有实现代码。
+本分支：`plan/phase-5`，基线 `main` = `9cab039`（Phase 4 已合并）。下面先是方案原文，实现情况见紧接着的「Phase 5 实现说明」。
 
 协作方式：其他 agent 请在**本分支**上按下面清单做最小改动开发；不要自行合并到 `main`，也不要另开平行分支。开发完后由「短剧视频服务器开发bot」检查，没问题再合并。Range 响应头（缓存命中后要回 206）和故障注入脚本时序是并行小分支，不要放进本分支。
 
@@ -108,6 +108,109 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 每个改动点补测试，并保证现有测试仍通过。有 Java 21 和 Maven 就跑 `cd vod-api && mvn test`（当前 main 上是 82 个用例；未设 `VOD_TEST_MYSQL_URL` 时 MySQL 用例按设计跳过；能连 MySQL 8.4 就设置后再跑一遍）。跑 `python3 scripts/contract_check.py`、`test_bridge.py`、`test_hls_verify.py`、`test_vod_client.py`、`test_worker_fencing.py`、`test_worker_reliability.py`、`test_dlq.py`、`test_output_gc.py`、`test_playback_contract.py`、`test_api_playback.py` 和新增单测。有 Docker 就用独立项目名起栈（如 `docker compose -p drama-vod-p5 up -d --build`，端口冲突时用 override），跑 `test_fencing_mysql.py`、`scripts/platform_live.py`、`scripts/e2e.py`（旧 Demo 回归）；`playback_live.py` 因 Range 问题已知会有一项失败，不要为了让它全过而在本分支改回源。没跑过的不要声称通过，写明原因。改完后在本分支提交（作者 `TinyPandar <meiyoujunlee@foxmail.com>`），可以 push 到 `origin/plan/phase-5`，但不要合并到 `main`。
 
 
+
+## Phase 5 实现说明（`plan/phase-5`，未合并到 `main`）
+
+旧 Demo 链路、消息 v1、`uk_asset_profile`、Flyway V1–V11、`mysql/init.sql` 都没动；新表结构在 `V12__platform_console.sql`（H2 MySQL 模式与 MySQL 8.4 都跑过）。
+
+**新接口**（完整状态码见 `docs/phase-0-contract.md` 的「HTTP · Core（Phase 5 新增）」）
+
+| 接口 | 鉴权 | 说明 |
+|---|---|---|
+| `POST /api/v1/admin/login` | 无（按 IP 限流） | `{username,password}` → `token`（`vadm1.` + HS256 JWT）、`expires_at`；`no-store` |
+| `GET /api/v1/admin/me` | 管理 JWT | 当前管理员 |
+| `GET/POST /api/v1/admin/tenants`，`GET/PATCH /api/v1/admin/tenants/{id}` | 管理 JWT | 租户列表/创建/详情；PATCH 改 `name`、`status`（ACTIVE/DISABLED）、`storage_quota_bytes`、`max_concurrent_jobs`、`max_daily_transcodes`（`null` 回到默认，0 不限） |
+| `GET/POST /api/v1/admin/tenants/{id}/keys` | 管理 JWT | 列 key（不含明文与哈希）/ 新建（`name`、`scopes`、`expires_at` 或 `ttl_seconds`），明文 `api_key` 只在 201 响应里出现一次 |
+| `POST /api/v1/admin/keys/{id}/revoke`，`POST /api/v1/admin/keys/{id}/rotate` | 管理 JWT | 撤销；轮换（可选 `grace_seconds`，0 = 旧 key 立即撤销），新明文只出现一次 |
+| `GET /api/v1/admin/tenants/{id}/usage?days=` | 管理 JWT | 指定租户的用量与配额 |
+| `GET /api/v1/admin/templates?tenant_id=`，`POST /api/v1/admin/tenants/{id}/templates`，`PUT /api/v1/admin/templates/{id}` | 管理 JWT | 模板；系统模板默认只读 |
+| `GET /api/v1/admin/webhook-deliveries?tenant_id=&endpoint_id=&job_id=` | 管理 JWT | 投递记录（不含签名密钥） |
+| `POST /api/v1/assets/{id}/transcodes` | API Key，scope `asset` | 按模板转码/重新转码，`Idempotency-Key`；202 / 重放 200 / 进行中 409 |
+| `POST /api/v1/jobs/{id}/retry` | API Key，scope `job` | 重试 FAILED（默认含 CANCELLED），`Idempotency-Key`；202 / 409 / 跨租户 404 |
+| `GET /api/v1/templates` | API Key，scope `asset` | 系统模板 + 本租户模板 |
+| `POST /api/v1/webhooks/{id}/disable`、`/enable`，`GET /api/v1/webhook-deliveries?endpoint_id=&job_id=&limit=` | API Key | 停用/启用（启用前重新做 SSRF 检查）、投递记录 |
+| `GET /api/v1/usage?days=` | API Key | 原有今日字段 + `quota`、`storage_used_bytes`、`concurrency`、`transcodes_today`、`history` |
+
+**各项行为变化**
+
+1. **管理端鉴权**：加了 `spring-boot-starter-security`，但 `SecurityFilterChain` 只匹配 `/api/v1/admin/**`（`vod.admin.AdminSecurityConfig`），其他路径不进安全过滤链，响应头和放行规则都和以前一样（Spring Security 的防火墙仍会拒绝非规范化路径）。`ApiKeyFilter` 只做了三处小改：跳过 `/api/v1/admin/**`、连带检查租户状态、按租户限流。JWT 是 `vadm1.` 前缀加 HS256（只认 HS256，拒绝 `alg=none`，校验 `aud`/`iss`/`exp`），密钥 `VOD_ADMIN_JWT_SECRET` 走 `SecretGuard`（非 dev 下为空、等于 `dev` 或过短就拒绝启动）。每个请求都会查一次管理用户是否仍 `ACTIVE`，停用后旧 token 立即失效。口令只存 BCrypt；`VOD_ADMIN_USERNAME`/`VOD_ADMIN_PASSWORD` 种子只在用户不存在时建号，仓库和镜像里没有默认口令。不做 RBAC/OAuth。
+2. **租户与 Key**：key 形如 `vk_…`，库里存 SHA-256 和前 10 位 `key_prefix` 用于辨认。scopes 只能是 `upload`/`asset`/`job`/`*`。停用租户后该租户所有 key 都 401，重新启用后恢复。`DevCredentialSeeder` 与 `dev-demo-key` 保留。
+3. **Webhook 事件与可靠投递**：事件名和 payload 见契约。`transcode.requested` 不再在 `afterCommit` 里同步发 HTTP；所有事件都写进 `vod_webhook_event`，不进 `vod_outbox`。成功、最终失败事件由 Worker 在 `fencing.commit_success` / `apply_failure` 的同一事务里插入；取消事件在 vod-api 的取消事务里插入。`WebhookDispatcher` 照 `OutboxPublisher` 的做法：条件 UPDATE 领取，可多实例。分发时把 payload 固定下来，每个端点一条投递；投递时 2xx 记 `DELIVERED`，否则指数退避加 jitter，满次数后 `FAILED`，端点停用记 `SKIPPED`。事务里不发 HTTP。投递记录查询从不返回 secret。
+4. **SSRF / DNS 重绑定**：`WebhookUrlGuard` 补了 IPv6（只收 `2000::/3`，拒绝回环、链路本地、ULA、文档/Teredo/6to4，IPv4 映射与 NAT64 按内嵌 IPv4 判断）以及 CGNAT/保留段。登记和每次投递都走 `WebhookTargetPolicy.resolve`（解析一次 → 全部地址公网 → 返回地址）。`LiveWebhookIo` 用 socket 连到这个 IP，TLS 用原主机名做 SNI 和证书主机名校验，`Host` 头也是原主机名，不跟随重定向，响应只读有限字节。dev 开关 `VOD_WEBHOOK_DEV_ALLOW_HTTP`、`VOD_WEBHOOK_DEV_ALLOW_PRIVATE_HOSTS` 默认关，只在 `VOD_ENV=dev` 生效，非 dev 下设置会拒绝启动；即使在放行名单里，链路本地和 metadata 地址仍会被拒。
+5. **模板与重新转码**：`vod_transcode_template`（`tenant_id=0` 是系统模板；默认 `ladder_v1` = 720/2500、540/1200、360/600、AAC 96k，与原梯队一致）。模板名就是任务的 profile，所以 `(asset, profile)` 仍唯一，租户模板不能和系统模板重名。重新转码在同一事务里依次：锁租户行（配额）→ Idempotency-Key → `SELECT 任务 FOR UPDATE` → 终态才重置（`PENDING`、`claim_version+1`、清 attempts/错误/租约，写 `template_id`）→ 非 READY 资产改回 `UPLOADED` → 新 outbox（消息 v1）→ `transcode.requested` 事件 → 记一次转码用量。Worker 按 `job_id` 读模板（`worker/transcode_template.py`），领取时再 +1 版本并按 Phase 4 插入新的 `WRITING` 前缀。**Worker 改动**：Core 资产已经 `READY` 时，`TRANSCODING`/`FAILED` 不再降级它，旧前缀在新前缀成功切换之前继续可播（旧 Demo 的 SQL 不变）。加密资产沿用已有的 `vod_content_key`（`INSERT IGNORE`）。新增不可重试错误码 `TEMPLATE_INVALID`。
+6. **重试**：与 `dlq.py replay` 同一套重置规则，以数据库为准；`vod.jobs.retry-allow-cancelled` 默认 `true`。DLQ 里的旧消息不会被清理，它对应的任务已不是 FAILED，是无害残留。
+7. **限流与配额**：令牌桶。配了 `REDIS_URL`（compose 已给 vod-api 加上）就用 Redis + Lua，多实例共享额度；Redis 连不上时退回进程内存桶，只打限频日志、不拒绝请求。**没有 Redis 时的内存桶只对单实例有效**。租户 API 按租户（不按 key）限流，管理登录按客户端 IP 限流（读 Nginx 写的 `X-Real-IP`；vod-api 直接对外时请把 `VOD_RATELIMIT_CLIENT_IP_HEADER` 设为空），出站 Webhook 按租户限速（被限速只推迟，不计次数）。转码配额在 complete、重新转码、重试时锁租户行检查，超额 **429 `quota_exceeded`**（存储配额仍是 403）。并发数指未结束（PENDING/RETRYING/RUNNING）的任务，每日次数沿用 `vod_usage_daily.transcode_jobs`（complete、重转、重试各计一次）。代价是同一租户建任务的事务会串行。
+8. **用量**：见上表；`?days=` 上限 `vod.usage.max-history-days`，超过时截到上限。播放计数 GETDEL 问题没做。
+9. **控制台**：`console/` 仍是 Vue 3 + TS + Vite，只加了 `vue-router`（hash 路由，Nginx 不需要回退规则），没有引入 UI 框架。页面有：管理登录、租户（创建、启停、配额）、租户详情（Key 新建/轮换/撤销，明文只显示一次，可选择「在本标签页使用」；用量、租户模板、投递记录）、资产（列表、直传上传、详情、申请播放 token 用 hls.js 试播，加密 key 请求带 Bearer）、任务（取消/重试/按模板重转、该任务的投递）、模板、Webhook（登记、停用/启用、投递记录）、用量与配额。管理接口用 JWT，租户接口用选用的租户 Key，都只存在本标签页的 sessionStorage。构建产物已提交到 `nginx/html/vod-console/`。旧播放页和 `console.html` 没改。开发时 `VOD_CONSOLE_PROXY=http://localhost:8001 npm run dev` 可以直连本机 vod-api（默认仍代理到 8080）。
+10. **验收脚本**：`scripts/platform_live.py` 配合 `docker-compose.platform-live.yml`（只打开上面两个 dev 开关，并给 vod-api 加 `host.docker.internal`）。
+
+**配置项**（默认值只是开发默认，不是基准或承诺；Spring 数值项在 compose 里没透传，需要时用 override 给 vod-api 设环境变量）
+
+| 名称（环境变量） | 默认 | 含义 |
+|---|---|---|
+| `VOD_ADMIN_JWT_SECRET` | 空（dev 退回 `dev`） | 管理 JWT 的 HMAC 密钥，非 dev 必填 |
+| `VOD_ADMIN_JWT_TTL_SECONDS` / `VOD_ADMIN_JWT_LEEWAY_SECONDS` | 3600 / 30 | token 有效期 / 时钟偏差容忍 |
+| `VOD_ADMIN_USERNAME` / `VOD_ADMIN_PASSWORD` | 空 | 开发用管理员种子（都设置时才建号；非 dev 下口令短于最小长度不建） |
+| `VOD_ADMIN_MAX_KEY_TTL_SECONDS` | 0 | 新 key 的最长有效期，0 = 允许不过期 |
+| `VOD_RATELIMIT_ENABLED` / `VOD_RATELIMIT_REDIS_URL`（缺省取 `REDIS_URL`）/ `VOD_RATELIMIT_REDIS_TIMEOUT_MS` | true / 空 / 200 | 开关、Redis 地址、Redis 超时 |
+| `VOD_RATELIMIT_TENANT_RPS` / `_BURST` | 50 / 200 | 租户 API |
+| `VOD_RATELIMIT_LOGIN_RPS` / `_BURST` | 0.2 / 10 | 管理登录（每 IP） |
+| `VOD_RATELIMIT_WEBHOOK_RPS` / `_BURST` | 5 / 20 | 出站 Webhook（每租户） |
+| `VOD_RATELIMIT_CLIENT_IP_HEADER` | `X-Real-IP` | 登录限流取 IP 的头，直接对外时设为空 |
+| `VOD_QUOTA_DEFAULT_MAX_CONCURRENT_JOBS` / `VOD_QUOTA_DEFAULT_MAX_DAILY_TRANSCODES` | 0 / 0 | 租户列为 NULL 时的上限，0 = 不限 |
+| `VOD_USAGE_MAX_HISTORY_DAYS` | 90 | `?days=` 上限 |
+| `VOD_IDEMPOTENCY_TTL_SECONDS` | 86400 | 重转/重试 Idempotency-Key 的有效期 |
+| `VOD_JOBS_RETRY_ALLOW_CANCELLED` | true | 是否允许重试 CANCELLED |
+| `VOD_TEMPLATE_ALLOW_SYSTEM_EDIT` | false | 系统模板是否可改 |
+| `VOD_WEBHOOK_DISPATCH_INTERVAL_MS` / `_BATCH_SIZE` / `_CLAIM_SECONDS` | 2000 / 20 / 120 | 投递循环 |
+| `VOD_WEBHOOK_MAX_ATTEMPTS` / `_BASE_BACKOFF_SECONDS` / `_MAX_BACKOFF_SECONDS` / `_BACKOFF_JITTER` | 8 / 10 / 3600 / 0.5 | 重试次数与退避 |
+| `VOD_WEBHOOK_CONNECT_TIMEOUT_MS` / `_READ_TIMEOUT_MS` / `_MAX_RESPONSE_BYTES` | 3000 / 5000 / 4096 | 投递超时与响应体上限 |
+| `VOD_WEBHOOK_DEV_ALLOW_HTTP` / `VOD_WEBHOOK_DEV_ALLOW_PRIVATE_HOSTS` | false / 空 | 仅 dev 的回调放行开关 |
+
+**事件名**：`transcode.requested`、`transcode.succeeded`、`transcode.failed`、`transcode.cancelled`（取消不复用 failed）。
+
+**新指标**（Micrometer，不带 URL、租户、IP 或密钥标签）：`vod_webhook_deliveries_total{result=delivered|retry|failed|blocked|skipped|rate_limited}`、`vod_ratelimit_rejected_total{scope=tenant|login|webhook}`、`vod_admin_logins_total{result=ok|denied}`。
+
+**本分支实际跑过的测试**（2026-11-11，macOS，本机**没有 Docker**）
+
+- `cd vod-api && mvn test`：111 个用例（原 82 + 新增 29）。未设 `VOD_TEST_MYSQL_URL` 时 0 失败、7 个 MySQL 用例跳过；设到本机 MySQL 8.4.10 再跑，111 个全过、0 跳过。这一轮 Flyway V1–V12 在 MySQL 上执行；`Phase5MysqlTest` 在真 MySQL 上验证了租户行锁下两个并发请求只有一个能过并发配额，也覆盖了事件、投递、幂等和用量历史。真 MySQL 抓到过一个 H2 测不出的问题：TIMESTAMP 会把毫秒四舍五入到秒，新投递写 `next_attempt_at=now` 可能落在查询时刻之后。已改成留空，表示立即到期。
+- 新增 Java 测试：
+  - `AdminApiTest`、`AdminJwtTest`：隔离；伪造、过期、`alg=none` 的 token；Key 生命周期；停用租户。
+  - `TranscodeApiTest`：重转、409、幂等、重试、并发与每日 429、用量。
+  - `WebhookDeliveryTest`：事件不进 outbox、签名、退避与最终失败、停用；**DNS 先返回公网、后改成 127.0.0.1 时不发起连接**；实际连接的正是刚检查过的地址。
+  - `WebhookSsrfGuardTest`。
+  - `PinnedPosterTest`：真实 socket。主机名解析不了时，请求仍到达钉住的 IP，`Host` 头是原主机名；HTTPS 用 keytool 生成的自签证书，主机名对得上握手成功，对不上握手失败。
+  - `RateLimitTest`、`Phase5MysqlTest`。
+- 改了的已有测试：`SecretGuardTest` 的 prod 上下文用例补了 `vod.admin.jwt-secret`（非 dev 现在要求这把密钥）；`test_worker_reliability.py` 对 Core 的 `TRANSCODING` SQL 期望多了 `AND status<>'READY'`（旧 Demo 期望不变）；`FakeWebhookIo` 换成新接口，默认解析到公网地址。
+- Python 3.12：以下全过：`contract_check`、`test_bridge`、`test_hls_verify`、`test_vod_client`、`test_worker_fencing`（7）、`test_worker_reliability`（39）、`test_dlq`（5）、`test_output_gc`（9）、`test_playback_contract`、`test_api_playback`（8）、新增 `test_transcode_template`（3）；`nginx_local_check.py` 用本机 Homebrew nginx 跑，33/33。
+- `test_fencing_mysql.py` 连本机 MySQL 8.4.10：28 个全过。新增的 4 个覆盖：重转复用同一行并切换前缀；重转失败时 READY 不降级，只有最终失败才记 failed 事件；围栏丢失不留事件；Worker 从库里读模板。
+- 本机冒烟（不是 compose 栈）：
+  - 环境：打包后的 jar 连本机 MySQL 8.4 空库（Flyway V1–V12）；`REDIS_URL` 指向不存在的端口，用来验证退回内存桶；打开 dev 开关，在本机起 HTTP 接收端；用真实的 `fencing.py` 模拟 Worker 成功。
+  - 29 项检查全过：登录、隔离、SSRF 拒绝；真实 HTTP 投递 requested/succeeded/cancelled，签名正确，`Host` 是原主机名；重转复用行且资产保持 READY；重试、用量、每日配额 429、停用租户、登录按 IP 429；`vod_outbox` 里没有 Webhook 行。
+  - 这次冒烟发现 `LiveWebhookIo` 有两个构造器，Spring 选不出来导致启动失败（单测用的是假实现，测不到），已修。
+  - Vite dev 服务能起，代理到 vod-api 正常。**本机没有可用的浏览器，控制台页面没有做视觉或交互验证**，只过了 `vue-tsc` 类型检查和生产构建。
+- **没跑**：本机没有 Docker，以下都没验证：`docker compose` 起栈、`scripts/platform_live.py`、`scripts/e2e.py`、`scripts/playback_live.py`、真实 Worker + FFmpeg 按模板转码、真 Redis 上的 Lua 限流（只验证了 Redis 不可达时的回退）。
+
+```bash
+# 需要 Docker：独立项目名；端口冲突时在 .env 改 HTTP_PORT/UPLOAD_PORT 或加 override
+VOD_ADMIN_USERNAME=ops VOD_ADMIN_PASSWORD='<自己生成>' \
+  docker compose -p drama-vod-p5 -f docker-compose.yml -f docker-compose.platform-live.yml up -d --build
+COMPOSE_PROJECT_NAME=drama-vod-p5 VOD_ADMIN_USERNAME=ops VOD_ADMIN_PASSWORD='<同上>' python3 scripts/platform_live.py
+python3 scripts/e2e.py
+```
+
+**剩余风险**
+
+- compose 栈下的整条链路都没在本机验证过：真实上传 → Worker 按模板转码 → 回调 → 重转切换前缀 → GC，以及 `platform_live.py` 本身。脚本只做了语法检查。
+- 每个请求都查一次管理用户状态；JWT 不能单独吊销（只能停用用户或换密钥）。
+- 内存限流桶只对单实例有效。Redis 不可达时 fail-open，也就是退回各实例自己的额度。
+- 转码配额靠锁租户行串行化，同一租户高并发建任务时会排队。并发上限按「未结束任务」计，不是只算 RUNNING。
+- Webhook 是至少一次投递，接收方要按 `X-Vod-Event-Id` 去重。`vod_webhook_event` / `vod_webhook_delivery` 没有保留期清理。投递每轮在单线程里顺序发，慢端点会拖慢同实例的其他投递（每次受超时上限约束）。只连解析结果的第一个地址，不轮换。
+- 签名只覆盖 body，不带时间戳，没有防重放窗口（沿用 Phase 2 格式）。Webhook secret 仍是明文入库（按计划不做加密）。
+- 同一资产多个模板（profile）各自成功后，播放版本是「最后一次成功」的那个；资产上没有单独的「当前模板」字段。
+- 重新转码期间 READY 资产保持 READY，所以资产状态看不出正在重转，要看任务状态。
+- Idempotency-Key 只对重转/重试生效；业务失败（409/429）会连同 key 一起回滚，同一 key 之后可以重新尝试。
+- 控制台没在浏览器里实际点过；hls.js 来自 CDN（与播放页相同）。
 
 ## 分支方案：Phase 4 播放与分发
 
@@ -363,7 +466,8 @@ docker compose --profile obs up -d prometheus
 | 地址 | 用途 |
 |---|---|
 | http://localhost:8080 | 短剧播放页（可用 `?ep=1&uid=7` 打开指定集） |
-| http://localhost:8080/console.html | VOD Core 管理控制台 |
+| http://localhost:8080/vod-console/ | 平台控制台（Vue；管理登录用 `VOD_ADMIN_USERNAME`/`VOD_ADMIN_PASSWORD` 种子的账号） |
+| http://localhost:8080/console.html | 旧版静态控制台（只粘贴 API Key） |
 | http://localhost:8080/api/... | Drama Demo API |
 | http://localhost:8080/api/v1/... | VOD Core API |
 | http://localhost:9000 | 预签名上传网关 |
@@ -386,9 +490,11 @@ python scripts/test_dlq.py
 python scripts/test_output_gc.py
 python scripts/test_playback_contract.py
 python scripts/test_api_playback.py         # Python 3.10+，需要 fastapi、httpx
+python scripts/test_transcode_template.py
 python scripts/nginx_local_check.py         # 需要本机 nginx（带 secure_link）
 python scripts/e2e.py        # 需要 Docker 服务和本机 FFmpeg
 python scripts/playback_live.py             # 需要 Docker 服务、本机 FFmpeg 和 PyMySQL：Core 播放链路
+python scripts/platform_live.py             # 需要 Docker（叠加 docker-compose.platform-live.yml）、FFmpeg、管理员种子：Phase 5 平台验收
 # 需要 Docker：真实 MySQL 围栏与故障注入
 MYSQL_HOST=127.0.0.1 MYSQL_USER=root MYSQL_PASSWORD=<root 口令> python scripts/test_fencing_mysql.py
 python scripts/fault_inject.py

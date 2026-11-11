@@ -14,11 +14,15 @@ ASSET_TABLE = {"core": "vod_media_asset", "legacy": "video_asset"}
 
 
 def update_asset_status(c, origin, asset_id, job_id, version, status):
-    """资产状态 + 任务围栏一起更新。返回影响行数；1 表示围栏仍属于自己。"""
+    """资产状态 + 任务围栏一起更新。返回影响行数；1 表示围栏仍属于自己。
+
+    Phase 5：Core 的 READY 资产不降级（重新转码失败时旧版本仍可播，hls_prefix 不变），旧 Demo 不变。
+    """
     asset = ASSET_TABLE[origin]
+    keep_ready = " AND a.status<>'READY'" if origin == "core" else ""
     n = c.execute(
         f"UPDATE {asset} a JOIN {job_table(origin)} j ON j.asset_id=a.id "
-        "SET a.status=%s WHERE a.id=%s AND j.id=%s AND j.claim_version=%s",
+        f"SET a.status=%s WHERE a.id=%s AND j.id=%s AND j.claim_version=%s{keep_ready}",
         (status, asset_id, job_id, version))
     if n == 0:
         # MySQL 只统计实际变化的行：状态本来就是目标值时也是 0。再确认一次围栏，
@@ -33,6 +37,8 @@ def mark_transcoding(conn, c, origin, asset_id, job_id, version):
     加锁顺序与 vod-api 的取消事务（任务 → 资产）、成功/失败事务（先写任务行）一致；
     以前那条自动提交的 UPDATE 资产 JOIN 任务可能先锁资产再锁任务，与取消交错时会死锁。
     返回 1 表示围栏仍属于自己，0 表示已丢（被取消或被别人重新领取）。
+
+    Phase 5：Core 资产已经 READY（重新转码）时保持 READY，旧版本在新前缀切换前继续可播。
     """
     asset = ASSET_TABLE[origin]
     conn.begin()
@@ -42,7 +48,8 @@ def mark_transcoding(conn, c, origin, asset_id, job_id, version):
         if not row or row["claim_version"] != version or row["status"] != "RUNNING":
             conn.rollback()
             return 0
-        c.execute(f"UPDATE {asset} SET status='TRANSCODING' WHERE id=%s", (asset_id,))
+        keep_ready = " AND status<>'READY'" if origin == "core" else ""
+        c.execute(f"UPDATE {asset} SET status='TRANSCODING' WHERE id=%s{keep_ready}", (asset_id,))
         conn.commit()
         return 1
     except Exception:
@@ -62,12 +69,27 @@ def apply_failure(c, origin, asset_id, job_id, version, job_changed, final):
     """失败收尾：任务 UPDATE 没抢到（围栏已丢）就什么都别写，返回 False。
 
     返回 True 表示围栏仍属于自己，调用方可以照常投递 retry/DLQ。
+    Phase 5：Core 最终失败时在同一事务里记 transcode.failed 事件（重试中的 RETRYING 不记）。
     """
     if job_changed != 1:
         return False
     if final:
         update_asset_status(c, origin, asset_id, job_id, version, "FAILED")
+        if origin == "core":
+            insert_event(c, job_id, EVENT_FAILED)
     return True
+
+
+EVENT_SUCCEEDED = "transcode.succeeded"
+EVENT_FAILED = "transcode.failed"
+
+
+def insert_event(c, job_id, event_type, reason=None):
+    """Phase 5：在调用方事务里记一条 Webhook 事件（vod_webhook_event，V12），由 vod-api 的 WebhookDispatcher 异步投递。
+    任务字段当场从 vod_transcode_job 取（与 vod-api WebhookEvents.recordForJob 同一条 SQL 形状）。不发 HTTP、不写 vod_outbox。"""
+    c.execute("INSERT INTO vod_webhook_event(tenant_id, event_type, job_id, asset_id, claim_version, error_code, reason) "
+              "SELECT tenant_id, %s, id, asset_id, claim_version, error_code, %s FROM vod_transcode_job WHERE id=%s",
+              (event_type, reason, job_id))
 
 
 def _core_touch(origin):
@@ -136,6 +158,8 @@ def commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, width, 
         # 自己的前缀已不是 WRITING（被判为垃圾、可能正在删）就放弃提交，调用方 rollback。
         if not output_prefix.activate(c, asset_id, prefix):
             return False
+        # Phase 5：成功事件和 SUCCEEDED / READY / 前缀切换同一事务提交。
+        insert_event(c, job_id, EVENT_SUCCEEDED)
     return True
 
 

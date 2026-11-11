@@ -503,7 +503,9 @@ class TranscodingLockOrderTest(unittest.TestCase):
             self.assertTrue(lock_sql.startswith(f"SELECT claim_version, status FROM {job} "), lock_sql)
             self.assertTrue(lock_sql.rstrip().endswith("FOR UPDATE"))
             self.assertEqual(lock_params, (3,))
-            self.assertEqual(upd_sql, f"UPDATE {asset} SET status='TRANSCODING' WHERE id=%s")
+            # Phase 5：Core 的 READY 资产（重新转码）保持 READY；旧 Demo 的 SQL 不变。
+            keep_ready = " AND status<>'READY'" if origin == "core" else ""
+            self.assertEqual(upd_sql, f"UPDATE {asset} SET status='TRANSCODING' WHERE id=%s{keep_ready}")
             self.assertNotIn("JOIN", upd_sql)
             self.assertEqual(upd_params, (7,))
 

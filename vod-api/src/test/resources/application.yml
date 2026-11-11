@@ -27,6 +27,19 @@ vod:
     max-object-bytes: 1048576
   quota:
     default-storage-bytes: 0
+  webhook:
+    # 测试里手动调用 WebhookDispatcher.runOnce()。
+    dispatch-interval-ms: 3600000
+    dispatch-initial-delay-ms: 3600000
+  ratelimit:
+    # 测试默认不用 Redis，额度放宽到不影响普通用例；限流用例自己起上下文改小。
+    redis-url: ""
+    tenant:
+      rate-per-second: 1000
+      burst: 100000
+    login:
+      rate-per-second: 1000
+      burst: 100000
   api:
     page-size-default: 20
     page-size-max: 50

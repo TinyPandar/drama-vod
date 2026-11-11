@@ -71,6 +71,45 @@ Core 只应理解媒体资产。`drama`、`episode`、`user_unlock`、`episode_p
 
 `GET /api/playback/{asset}/master.m3u8?token=` 是给不能加请求头的原生 HLS 用的。分片地址必须仍落在原来的 `/hls/{sig}/{exp}/{asset}/` 下面，这样 Nginx 缓存和签名规则不用分叉。播放列表的具体文本可以变，付费集在 iPhone 上要仍能播。
 
+### Core（Phase 5 新增，上面的冻结与 Demo 条目不变）
+
+鉴权分两类，互不通用：
+
+- **租户接口**（`/api/v1/uploads`、`/assets`、`/jobs`、`/templates`、`/webhooks`、`/webhook-deliveries`、`/usage`、播放 token）：`X-Api-Key` 或 `Authorization: Bearer <key>`。key 无效、过期、撤销，或所属租户已停用：**401**。scope 不足：**403**。
+- **管理接口** `/api/v1/admin/**`：`Authorization: Bearer vadm1.<HS256 JWT>`，由 `POST /api/v1/admin/login` 签发（`VOD_ADMIN_JWT_SECRET`，有效期是配置项）。缺失、伪造、过期，或管理用户已停用：**401**。租户 key 调管理接口一律 401，管理 token 调租户接口也一律 401。
+- `/api/v1/healthz`、`/api/v1/qoe`、`/keys/v1/**` 的放行和鉴权方式不变。
+
+| 接口 | 必须保持 |
+|---|---|
+| `POST /api/v1/assets/{id}/transcodes` | scope `asset`。body 可选 `{"template": 名称}`，缺省用 `ladder_v1`。资产不存在、属于别的租户、模板不可见：**404**。源文件还没上传完：**409**。同一 `(资产, 模板)` 的任务处于 `PENDING`/`RETRYING`/`RUNNING`：**409**，不新建行。处于 `SUCCEEDED`/`FAILED`/`CANCELLED`：**复用同一行**，改回 `PENDING`、`claim_version`+1，返回 **202** 和任务详情。 |
+| `POST /api/v1/jobs/{id}/retry` | scope `job`。跨租户或不存在：**404**。只接受 `FAILED`；`CANCELLED` 是否也接受由 `vod.jobs.retry-allow-cancelled` 决定（默认接受）；其他状态 **409**。重置规则与 `scripts/dlq.py replay` 相同，以数据库为准。成功 **202**。 |
+| 上面两个接口的 `Idempotency-Key` | 同一租户、同一接口、同一 key、同一目标的重放：**200**、同一任务、`idempotent_replay: true`，不再写 outbox。同一 key 换了目标：**409**。key 的有效期是配置项。 |
+| 限流 | 租户接口按租户限流，管理登录按客户端 IP 限流。超限：**429**，带 `Retry-After`，body 里 `code: "rate_limited"`。 |
+| 转码配额 | 同时未结束的任务数（`max_concurrent_jobs`）和每日新建、重转、重试的总次数（`max_daily_transcodes`）超限：**429**，body 里 `code: "quota_exceeded"`、`quota: "concurrent_jobs"\|"daily_transcodes"`。每日上限还带 `Retry-After`。存储配额仍是 Phase 2 的 **403**。 |
+| `GET /api/v1/usage` | 今天的 `day`、`storage_bytes`、`play_requests`、`transcode_jobs` 这几个顶层字段不变。新增 `quota`（`null` = 不限）、`storage_used_bytes`、`concurrency`、`transcodes_today`；`?days=N` 时加 `history`。 |
+| `POST /api/v1/webhooks` | URL 和解析结果都要通过 SSRF 检查，否则 **400**。`events` 只接受下面的事件名或 `*`，缺省订阅 succeeded/failed/cancelled。`secret` 只在这次响应里返回，列表、停用、投递记录都不返回。 |
+
+API Key 明文只在管理端创建、轮换的响应里出现一次，库里只存 SHA-256。
+
+**Webhook 事件（名称冻结）**：
+
+| 事件 | 何时写入（同一事务） | payload 额外字段 |
+|---|---|---|
+| `transcode.requested` | complete 建任务、重新转码、重试的事务（vod-api） | `reason`：`upload` / `retranscode` / `retry` |
+| `transcode.succeeded` | Worker 写 `SUCCEEDED` / `READY` / 前缀 `ACTIVE` 的成功事务 | — |
+| `transcode.failed` | Worker 写最终 `FAILED` 的事务（中间的 `RETRYING` 不发） | `error_code` |
+| `transcode.cancelled` | vod-api 的取消事务（已经是 `CANCELLED` 时重复调用不再发） | `reason: "cancelled"` |
+
+取消用独立的 `transcode.cancelled`，不复用 `transcode.failed`。
+
+- payload 是 JSON：`event_id`、`event_type`、`occurred_at`、`tenant_id`、`job_id`、`asset_id`、`claim_version`，以及上表的额外字段。可以加字段。
+- 每次重试发送完全相同的字节。签名不变：`X-Vod-Signature: sha256=hex(hmac_sha256(secret, body))`。另带 `X-Vod-Event`、`X-Vod-Event-Id`、`X-Vod-Delivery-Id`、`X-Vod-Delivery-Attempt`。
+- 至少一次投递：接收方用 `X-Vod-Event-Id` 去重，2xx 算成功。
+- 非 2xx 或连接失败时，指数退避加 jitter 重试，到最大次数后 `FAILED`。端点已停用时 `SKIPPED`。重定向不跟随。次数和间隔都是配置项。
+- 事件在 `vod_webhook_event`，**从不写进 `vod_outbox`**。
+
+**SSRF**：登记和每次投递都要先解析，再要求每个地址都是公网单播（IPv4 内网/保留段；IPv6 只收 `2000::/3` 且排除文档、Teredo、6to4；IPv4 映射与 NAT64 按内嵌 IPv4 判断）。然后连接到这次检查过的 IP，用原主机名做 SNI、证书校验和 `Host`，不按主机名重新解析。dev 开关 `vod.webhook.dev-allow-http`、`dev-allow-private-hosts` 只在 `VOD_ENV=dev` 生效，非 dev 下设置会拒绝启动。
+
 ## 播放签名
 
 Nginx 和 API 必须用同一条算法。e2e 会改签名、改资产 id、改过期时间。
@@ -194,6 +233,14 @@ Schema：[contracts/transcode-message.v1.schema.json](contracts/transcode-messag
 
 Phase 4 已对 Core 落地：任务专属前缀见「对象与 HLS」的 Core 小节；旧 Demo 仍是固定前缀（冻结）。Core 写 `TRANSCODING` 改为显式事务、先 `SELECT … FOR UPDATE` 锁任务行再改资产，和取消事务同序。
 
+Phase 5（Core）：
+
+- **重新转码与重试复用 `(asset_id, profile)` 这一行**，不拆 `uk_asset_profile`。profile 就是模板名（系统默认 `ladder_v1`）。Worker 按 `job_id → template_id`（为空时按 profile 找系统模板）读梯队，消息 v1 不变。默认模板的参数与上面冻结的 720/540/360 一致。
+- 重置时 `claim_version`+1，Worker 领取时再 +1，并按 Phase 4 规则插入新的 `WRITING` 前缀。
+- 成功事务切换前缀。在此之前已 `READY` 的 Core 资产保持 `READY`，旧前缀继续可播；Worker 的 `TRANSCODING`/`FAILED` 不再把 `READY` 的 Core 资产降级（旧 Demo 不变）。
+- 加密资产复用已有的 `vod_content_key`。
+- 成功、最终失败事件与任务终态同一事务写入 `vod_webhook_event`。围栏丢失时整个事务回滚，不留事件。
+
 ## 表归谁
 
 | 表 | 归属 | Phase 0 决定 |
@@ -201,6 +248,7 @@ Phase 4 已对 Core 落地：任务专属前缀见「对象与 HLS」的 Core �
 | `video_asset` `asset_rendition` `transcode_job` `content_key` | Core | 列可以加，不能改唯一键 `(asset_id, profile)` 和 `(asset_id, name)`。`content_key` 明文是不承诺项，以后改成信封加密时，key 接口的 16 字节响应不变。 |
 | `drama` `episode` `user_unlock` `episode_play_stat` | Demo | Core 的新表不要复制这些名字。`episode.asset_id` 是 Demo 指向 Core 的外键，拆库前保留。 |
 | `vod_content_key`（V10） `vod_output_prefix`（V11） | Core（`vod_*`） | Phase 4 新增，只进 Flyway，不进 `mysql/init.sql`。`vod_content_key` 以 `vod_media_asset.id` 为主键，和旧 `content_key`（`video_asset.id`）分开，两套自增 id 不再撞号；明文是不承诺项，key 接口的 16 字节响应不变。`vod_output_prefix` 记录 Core 输出前缀生命周期 `WRITING/ACTIVE/GARBAGE/DELETED`。 |
+| `vod_admin_user` `vod_transcode_template` `vod_idempotency_key` `vod_webhook_event`（V12） | Core（`vod_*`） | Phase 5 新增，只进 Flyway。`vod_tenant` 加 `max_concurrent_jobs`/`max_daily_transcodes`，`vod_api_credential` 加 `name`/`key_prefix`/`revoked_at`，`vod_transcode_job` 加 `template_id`，`vod_webhook_delivery` 加投递状态列（旧行 `event_id` 为空，不会被投递循环领取）。 |
 
 资产状态：`UPLOADING → UPLOADED → TRANSCODING → READY`，失败为 `FAILED`。任务状态：`PENDING → RUNNING → SUCCEEDED`，中间可有 `RETRYING`，终态失败为 `FAILED`。Core 另有用户取消：任务和（非 `READY` 的）资产为 `CANCELLED`；DLQ 重放把 `FAILED` 的 Core 任务改回 `PENDING`、资产改回 `UPLOADED`。
 

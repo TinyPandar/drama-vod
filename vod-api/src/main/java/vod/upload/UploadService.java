@@ -1,20 +1,18 @@
 package vod.upload;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
-import vod.job.TranscodePublisher;
+import vod.job.OutboxWriter;
+import vod.quota.QuotaService;
 import vod.storage.ObjectHead;
 import vod.storage.ObjectStorage;
 import vod.tenant.TenantGuard;
 import vod.usage.UsageService;
+import vod.webhook.WebhookEvents;
 import vod.webhook.WebhookService;
 
 import java.sql.PreparedStatement;
@@ -35,19 +33,20 @@ public class UploadService {
             rs.getTimestamp("expires_at") == null ? null : rs.getTimestamp("expires_at").toInstant());
     private final JdbcTemplate jdbc;
     private final ObjectStorage storage;
-    private final TranscodePublisher publisher;
+    private final OutboxWriter outbox;
     private final UsageService usage;
-    private final WebhookService webhooks;
+    private final QuotaService quotas;
+    private final WebhookEvents events;
     private final UploadPolicy policy;
-    private final ObjectMapper json = new ObjectMapper();
 
-    public UploadService(JdbcTemplate jdbc, ObjectStorage storage, TranscodePublisher publisher,
-                         UsageService usage, WebhookService webhooks, UploadPolicy policy) {
+    public UploadService(JdbcTemplate jdbc, ObjectStorage storage, OutboxWriter outbox,
+                         UsageService usage, QuotaService quotas, WebhookEvents events, UploadPolicy policy) {
         this.jdbc = jdbc;
         this.storage = storage;
-        this.publisher = publisher;
+        this.outbox = outbox;
         this.usage = usage;
-        this.webhooks = webhooks;
+        this.quotas = quotas;
+        this.events = events;
         this.policy = policy;
     }
 
@@ -113,6 +112,9 @@ public class UploadService {
         ObjectHead head = storage.head(source.bucket(), source.key())
                 .orElseThrow(() -> new ConflictException("source object not found, upload first"));
         policy.check(source.key(), head);
+        // Phase 5：锁租户行后检查并发与每日转码配额（429），同一租户建任务的事务从这里开始串行。
+        // 放在 HEAD 之后，不在锁里等对象存储；加锁顺序租户 → 对象 → 资产 → 任务，见 QuotaService。
+        quotas.checkNewTranscode(tenantId);
         jdbc.update("UPDATE vod_storage_object SET size = ?, etag = ?, content_type = ?, checksum = ? WHERE id = ? AND tenant_id = ?",
                 head.size(), head.etag(), head.contentType(), head.checksum(), source.id(), tenantId);
         jdbc.update("UPDATE vod_media_asset SET status = 'UPLOADED', source_size = ? WHERE id = ? AND tenant_id = ?",
@@ -135,14 +137,12 @@ public class UploadService {
         }
         // 配额放在任务插入成功之后：并发重复 complete 只有赢家占用；超限抛异常，整个事务（含任务）回滚。
         usage.reserveStorage(tenantId, head.size());
-        String body = payload(jobId, assetId, traceId);
-        long outboxId = insert(
-                "INSERT INTO vod_outbox(tenant_id, event_type, payload, status) VALUES (?,?,?,?)",
-                tenantId, "transcode.requested", body, "PENDING");
+        outbox.enqueue(tenantId, jobId, assetId, traceId);
         jdbc.update("UPDATE vod_upload_session SET status = 'COMPLETED', checksum = ? WHERE id = ? AND tenant_id = ?",
                 head.checksum(), sessionId, tenantId);
         usage.addUpload(tenantId, head.size());
-        publishAfterCommit(outboxId, body, tenantId);
+        // Phase 5：不再在 afterCommit 里同步发 HTTP；事件随本事务提交，由 WebhookDispatcher 异步投递。
+        events.recordForJob(jobId, WebhookService.REQUESTED, "upload");
         return Map.of("asset_id", assetId, "job_id", jobId, "job_status", "PENDING");
     }
 
@@ -168,10 +168,11 @@ public class UploadService {
 
     public java.util.List<Map<String, Object>> jobs(long tenantId) {
         return jdbc.query(
-                "SELECT id, asset_id, status, attempts, claim_version FROM vod_transcode_job WHERE tenant_id = ? ORDER BY id DESC",
+                "SELECT id, asset_id, profile, status, attempts, claim_version FROM vod_transcode_job WHERE tenant_id = ? ORDER BY id DESC",
                 (rs, n) -> Map.<String, Object>of(
                         "id", rs.getLong("id"),
                         "asset_id", rs.getLong("asset_id"),
+                        "profile", rs.getString("profile"),
                         "status", rs.getString("status"),
                         "attempts", rs.getInt("attempts"),
                         "claim_version", rs.getInt("claim_version")),
@@ -181,7 +182,7 @@ public class UploadService {
     public Map<String, Object> job(long tenantId, long jobId) {
         var rows = jdbc.query(
                 "SELECT id, tenant_id, asset_id, profile, status, attempts, max_attempts, claim_version, "
-                        + "locked_until, last_error, error_code, next_attempt_at, updated_at FROM vod_transcode_job WHERE id = ?",
+                        + "locked_until, last_error, error_code, next_attempt_at, updated_at, template_id FROM vod_transcode_job WHERE id = ?",
                 (rs, n) -> {
                     TenantGuard.requireVisible(tenantId, rs.getLong("tenant_id"));
                     var out = new LinkedHashMap<String, Object>();
@@ -197,6 +198,7 @@ public class UploadService {
                     out.put("error_code", rs.getString("error_code"));
                     out.put("next_attempt_at", iso(rs.getTimestamp("next_attempt_at")));
                     out.put("updated_at", iso(rs.getTimestamp("updated_at")));
+                    out.put("template_id", rs.getObject("template_id") == null ? null : rs.getLong("template_id"));
                     return out;
                 }, jobId);
         if (rows.isEmpty()) throw new TenantGuard.ResourceNotVisibleException();
@@ -290,32 +292,6 @@ public class UploadService {
 
     private static Map<String, Object> jobResult(long assetId, Map<String, Object> job) {
         return Map.of("asset_id", assetId, "job_id", job.get("job_id"), "job_status", job.get("job_status"));
-    }
-
-    private String payload(long jobId, long assetId, String traceId) {
-        try {
-            var body = new LinkedHashMap<String, Object>();
-            body.put("schema_version", 1);
-            body.put("job_id", jobId);
-            body.put("asset_id", assetId);
-            body.put("trace_id", traceId == null ? "" : traceId);
-            body.put("origin", "core");
-            return json.writeValueAsString(body);
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
-    private void publishAfterCommit(long outboxId, String body, long tenantId) {
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                if (publisher.publish(body)) {
-                    jdbc.update("UPDATE vod_outbox SET status = 'PUBLISHED', published_at = CURRENT_TIMESTAMP WHERE id = ?", outboxId);
-                }
-                webhooks.dispatch(tenantId, "transcode.requested", body);
-            }
-        });
     }
 
     private static String blankToNull(String value) {

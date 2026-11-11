@@ -1,0 +1,12 @@
+# Phase 5 验收脚本 scripts/platform_live.py 用的叠加文件（只用于本地 dev 栈，不要用于共享或生产环境）：
+#   docker compose -p drama-vod-p5 -f docker-compose.yml -f docker-compose.platform-live.yml up -d --build
+# 打开 vod-api 的两个 dev 开关，让脚本在宿主机起的 HTTP 接收端（host.docker.internal）能收到回调。
+# 这两个开关只在 VOD_ENV=dev 时生效，非 dev 下设置会让 vod-api 拒绝启动；其他地址的 SSRF 检查不受影响。
+services:
+  vod-api:
+    environment:
+      VOD_WEBHOOK_DEV_ALLOW_HTTP: "true"
+      VOD_WEBHOOK_DEV_ALLOW_PRIVATE_HOSTS: host.docker.internal
+      VOD_WEBHOOK_BASE_BACKOFF_SECONDS: "2"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

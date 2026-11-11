@@ -6,6 +6,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import vod.tenant.TenantGuard;
 import vod.upload.UploadService;
+import vod.webhook.WebhookEvents;
+import vod.webhook.WebhookService;
 
 import java.util.Map;
 
@@ -13,9 +15,17 @@ import java.util.Map;
 @Service
 public class JobService {
     private final JdbcTemplate jdbc;
+    private final WebhookEvents events;
 
+    /** 只给直接 new 的单测用（不经 Spring 代理，事件 SQL 直接执行）。 */
     public JobService(JdbcTemplate jdbc) {
+        this(jdbc, new WebhookEvents(jdbc));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public JobService(JdbcTemplate jdbc, WebhookEvents events) {
         this.jdbc = jdbc;
+        this.events = events;
     }
 
     /**
@@ -27,6 +37,9 @@ public class JobService {
      * <p>Phase 4：同一事务里把该任务还在 WRITING 的输出前缀标成 GARBAGE（vod_output_prefix），Worker 的清理线程过了宽限期再删。
      * 加锁顺序是任务 → 资产 → 前缀，和 Worker 的 TRANSCODING / 成功 / 失败事务一致。
      * 死锁或锁等待超时由调用方在事务外重试一次（{@link #cancelWithRetry}）。
+     *
+     * <p>Phase 5：同一事务里记一条 transcode.cancelled 事件（reason=cancelled），由 WebhookDispatcher 异步投递；
+     * 已取消的重复调用不再记事件。
      */
     @Transactional
     public void cancel(long tenantId, long jobId) {
@@ -41,6 +54,7 @@ public class JobService {
                     assetId, tenantId);
             jdbc.update("UPDATE vod_output_prefix SET status = 'GARBAGE', updated_at = CURRENT_TIMESTAMP "
                     + "WHERE job_id = ? AND status = 'WRITING'", jobId);
+            events.recordForJob(jobId, WebhookService.CANCELLED, "cancelled");
             return;
         }
         var rows = jdbc.query("SELECT tenant_id, status FROM vod_transcode_job WHERE id = ?",

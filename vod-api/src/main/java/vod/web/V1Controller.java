@@ -12,6 +12,8 @@ import org.springframework.web.bind.annotation.RestController;
 import vod.auth.ApiKeyFilter;
 import vod.auth.TenantPrincipal;
 import vod.job.JobService;
+import vod.job.TranscodeService;
+import vod.template.TemplateService;
 import vod.upload.UploadService;
 
 import java.util.Map;
@@ -20,14 +22,18 @@ import java.util.Map;
 public class V1Controller {
     private final UploadService uploads;
     private final JobService jobService;
+    private final TranscodeService transcodes;
+    private final TemplateService templates;
     private final int defaultPageSize;
     private final int maxPageSize;
 
-    public V1Controller(UploadService uploads, JobService jobService,
+    public V1Controller(UploadService uploads, JobService jobService, TranscodeService transcodes, TemplateService templates,
                         @Value("${vod.api.page-size-default:20}") int defaultPageSize,
                         @Value("${vod.api.page-size-max:100}") int maxPageSize) {
         this.uploads = uploads;
         this.jobService = jobService;
+        this.transcodes = transcodes;
+        this.templates = templates;
         this.defaultPageSize = defaultPageSize;
         this.maxPageSize = maxPageSize;
     }
@@ -81,6 +87,46 @@ public class V1Controller {
         long tenantId = tenant(request, "job").tenantId();
         JobService.cancelWithRetry(() -> jobService.cancel(tenantId, jobId));
         return uploads.job(tenantId, jobId);
+    }
+
+    /**
+     * Phase 5：按模板发起转码 / 重新转码。body 可选 {"template": "模板名"}，缺省用默认模板 ladder_v1。scope asset。
+     * 202 + 任务详情；同一 (资产, 模板) 的任务还在 PENDING/RETRYING/RUNNING 时 409；终态任务复用同一行，claim_version+1。
+     * 支持 Idempotency-Key（重放返回 200 + 同一任务，idempotent_replay=true）。
+     */
+    @PostMapping("/api/v1/assets/{assetId}/transcodes")
+    public org.springframework.http.ResponseEntity<Map<String, Object>> transcode(
+            HttpServletRequest request, @PathVariable long assetId,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @RequestHeader(value = "X-Request-ID", required = false) String traceId,
+            @RequestBody(required = false) Map<String, Object> body) {
+        long tenantId = tenant(request, "asset").tenantId();
+        Object template = body == null ? null : body.get("template");
+        if (template != null && !(template instanceof String)) throw new IllegalArgumentException("template must be a string");
+        var result = transcodes.transcode(tenantId, assetId, (String) template, idempotencyKey, traceId);
+        return accepted(tenantId, result);
+    }
+
+    /** Phase 5：重试本租户 FAILED（配置允许时含 CANCELLED）的任务。scope job。跨租户 404，其他状态 409。支持 Idempotency-Key。 */
+    @PostMapping("/api/v1/jobs/{jobId}/retry")
+    public org.springframework.http.ResponseEntity<Map<String, Object>> retry(
+            HttpServletRequest request, @PathVariable long jobId,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @RequestHeader(value = "X-Request-ID", required = false) String traceId) {
+        long tenantId = tenant(request, "job").tenantId();
+        return accepted(tenantId, transcodes.retry(tenantId, jobId, idempotencyKey, traceId));
+    }
+
+    /** Phase 5：当前租户可用的转码模板（系统模板 + 本租户模板）。scope asset。 */
+    @GetMapping("/api/v1/templates")
+    public Map<String, Object> templates(HttpServletRequest request) {
+        return Map.of("templates", templates.visible(tenant(request, "asset").tenantId()));
+    }
+
+    private org.springframework.http.ResponseEntity<Map<String, Object>> accepted(long tenantId, TranscodeService.Result result) {
+        var out = new java.util.LinkedHashMap<String, Object>(uploads.job(tenantId, result.jobId()));
+        out.put("idempotent_replay", result.replayed());
+        return org.springframework.http.ResponseEntity.status(result.replayed() ? 200 : 202).body(out);
     }
 
     private static TenantPrincipal tenant(HttpServletRequest request, String scope) {

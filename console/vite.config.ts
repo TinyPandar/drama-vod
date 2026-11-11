@@ -10,7 +10,8 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": "http://localhost:8080"
+      // 默认走 compose 的 Nginx；直连本机 vod-api 时设 VOD_CONSOLE_PROXY=http://localhost:8001
+      "/api": process.env.VOD_CONSOLE_PROXY || "http://localhost:8080"
     }
   }
 });

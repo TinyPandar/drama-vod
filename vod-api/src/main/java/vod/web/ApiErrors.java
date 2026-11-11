@@ -9,6 +9,9 @@ import vod.upload.UploadService;
 import vod.usage.UsageService;
 import vod.job.JobService;
 import vod.media.PlaybackService;
+import vod.admin.AdminAuthService;
+import vod.admin.TenantAdminService;
+import vod.quota.QuotaService;
 
 import java.util.Map;
 
@@ -48,6 +51,24 @@ public class ApiErrors {
     @ExceptionHandler(JobService.BusyException.class)
     ResponseEntity<Map<String, String>> busy() {
         return ResponseEntity.status(503).header("Retry-After", "1").body(Map.of("detail", "busy, retry later"));
+    }
+
+    @ExceptionHandler(TenantAdminService.NotFound.class)
+    ResponseEntity<Map<String, String>> notFound(TenantAdminService.NotFound e) {
+        return ResponseEntity.status(404).body(Map.of("detail", e.getMessage()));
+    }
+
+    @ExceptionHandler(AdminAuthService.BadCredentials.class)
+    ResponseEntity<Map<String, String>> badCredentials() {
+        return ResponseEntity.status(401).body(Map.of("detail", "invalid credentials"));
+    }
+
+    /** Phase 5 转码配额（并发、每日）：429 + code=quota_exceeded；每日上限带 Retry-After。限流也是 429，code=rate_limited。 */
+    @ExceptionHandler(QuotaService.TranscodeQuotaException.class)
+    ResponseEntity<Map<String, String>> transcodeQuota(QuotaService.TranscodeQuotaException e) {
+        var builder = ResponseEntity.status(429);
+        if (e.retryAfterSeconds() > 0) builder.header("Retry-After", Long.toString(e.retryAfterSeconds()));
+        return builder.body(Map.of("detail", e.getMessage(), "code", "quota_exceeded", "quota", e.quota()));
     }
 
     @ExceptionHandler(IllegalArgumentException.class)

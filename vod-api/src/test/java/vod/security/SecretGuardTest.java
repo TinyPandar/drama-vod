@@ -44,7 +44,9 @@ class SecretGuardTest {
         var runner = new ApplicationContextRunner().withUserConfiguration(SecretGuard.class);
         runner.withPropertyValues("vod.env=prod", "vod.hls-secret=dev", "vod.play-token-secret=" + STRONG)
                 .run(ctx -> assertThat(ctx).hasFailed());
-        runner.withPropertyValues("vod.env=prod", "vod.hls-secret=" + STRONG, "vod.play-token-secret=" + STRONG2)
+        // Phase 5：非 dev 还要求 VOD_ADMIN_JWT_SECRET（vod.admin.jwt-secret）。
+        runner.withPropertyValues("vod.env=prod", "vod.hls-secret=" + STRONG, "vod.play-token-secret=" + STRONG2,
+                        "vod.admin.jwt-secret=" + STRONG.toUpperCase())
                 .run(ctx -> assertThat(ctx).hasNotFailed());
         runner.withPropertyValues("vod.env=dev", "vod.hls-secret=", "vod.play-token-secret=")
                 .run(ctx -> assertThat(ctx).hasNotFailed());

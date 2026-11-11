@@ -33,6 +33,16 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-jdbc</artifactId>
     </dependency>
+    <!-- Phase 5：只用于 /api/v1/admin/** 的 JWT 鉴权；租户接口仍走 ApiKeyFilter。 -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <!-- Phase 5：限流计数放 Redis（多实例共享）；不配 REDIS_URL 时退回单实例内存桶。版本由 Spring Boot 管理。 -->
+    <dependency>
+      <groupId>io.lettuce</groupId>
+      <artifactId>lettuce-core</artifactId>
+    </dependency>
     <dependency>
       <groupId>org.flywaydb</groupId>
       <artifactId>flyway-core</artifactId>

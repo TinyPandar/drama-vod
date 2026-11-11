@@ -21,7 +21,7 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from common import (HLS_BUCKET, Q_DLQ, Q_MAIN, Q_RETRY, db, log, mq_channel, publish, rds, s3,
                     transcode_message, wait_for)
-import output_gc, output_prefix
+import output_gc, output_prefix, transcode_template
 from fencing import apply_failure, claim, commit_success, due_jobs, mark_transcoding, record_failure
 from fencing import renew_lease as renew_lease_sql
 from hls_verify import local_manifest, verify_hls, verify_remote
@@ -150,7 +150,7 @@ def download_source(bucket, key, dest):
         raise
 
 
-def build_ffmpeg(src, out, ladder, has_audio, keyinfo, portrait):
+def build_ffmpeg(src, out, ladder, has_audio, keyinfo, portrait, audio_kbps=96):
     n = len(ladder)
     split = f"[0:v]split={n}" + "".join(f"[s{i}]" for i in range(n))
     scales = ";".join(f"[s{i}]scale={f'{p}:-2' if portrait else f'-2:{p}'}[v{i}]"
@@ -168,7 +168,7 @@ def build_ffmpeg(src, out, ladder, has_audio, keyinfo, portrait):
     for i, (_, _, kbps) in enumerate(ladder):
         cmd += [f"-b:v:{i}", f"{kbps}k", f"-maxrate:v:{i}", f"{int(kbps * 1.1)}k", f"-bufsize:v:{i}", f"{kbps * 2}k"]
     if has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "96k", "-ac", "2", "-ar", "48000"]
+        cmd += ["-c:a", "aac", "-b:a", f"{int(audio_kbps)}k", "-ac", "2", "-ar", "48000"]
     vsm = " ".join(f"v:{i},a:{i},name:{name}" if has_audio else f"v:{i},name:{name}"
                    for i, (name, _, _) in enumerate(ladder))
     # 注意：hls_init_time 在 VOD(列表不滚动)下对后续分片也生效，达不到"只有首片短"的效果，
@@ -308,19 +308,21 @@ def process(job_id, trace_id, origin="legacy"):
         w, h, dur_ms, has_audio = probe(src, lost)
         portrait = h >= w
         short = min(w, h)
-        ladder = [x for x in LADDER if x[1] <= short]
-        if not ladder:  # 小于 360 也不放大，按源的短边出一档
-            even = max(2, short // 2 * 2)
-            ladder = [(f"{even}p", even, 600)]
         keyinfo = None
-        if a["encrypted"]:
+        if a["encrypted"]:  # 重新转码时 INSERT IGNORE 复用已有的 key，不轮换
             k = get_or_create_key(c, asset_id, origin)
             with open(f"{work}/enc.key", "wb") as f:
                 f.write(bytes.fromhex(k["key_hex"]))
             keyinfo = f"{work}/keyinfo"
             with open(keyinfo, "w") as f:  # 三行：写进 m3u8 的 key URI / 本地 key 文件 / IV
                 f.write(f"{key_uri(origin, asset_id)}\n{work}/enc.key\n{k['iv_hex']}\n")
-        run(build_ffmpeg(src, f"{work}/out", ladder, has_audio, keyinfo, portrait), FFMPEG_TIMEOUT_SEC, lost)
+        # Phase 5：Core 按 job_id 读模板（消息里没有梯队）；旧 Demo 仍是冻结的 LADDER。
+        base_ladder, audio_kbps = transcode_template.load(c, job_id) if origin == "core" else (LADDER, 96)
+        ladder = [x for x in base_ladder if x[1] <= short]
+        if not ladder:  # 小于 360 也不放大，按源的短边出一档
+            even = max(2, short // 2 * 2)
+            ladder = [(f"{even}p", even, 600)]
+        run(build_ffmpeg(src, f"{work}/out", ladder, has_audio, keyinfo, portrait, audio_kbps), FFMPEG_TIMEOUT_SEC, lost)
         try:
             verify_hls(f"{work}/out", [name for name, _, _ in ladder], bool(a["encrypted"]))
         except RuntimeError as e:

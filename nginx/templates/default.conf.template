@@ -63,6 +63,8 @@ server {
         proxy_set_header Host $host;
         proxy_set_header Connection "";
         proxy_set_header X-Request-ID $request_id;
+        # Phase 5：管理登录按客户端 IP 限流，vod-api 读这个头（vod.ratelimit.client-ip-header）。覆盖客户端自带的同名头。
+        proxy_set_header X-Real-IP $remote_addr;
         add_header X-Request-ID $request_id always;
     }
 

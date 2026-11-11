@@ -101,9 +101,17 @@ services:
       S3_ACCESS_KEY: ${MINIO_ROOT_USER}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       AMQP_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      # Phase 5：限流计数放 Redis，多实例 vod-api 共享额度（为空时退回单实例内存桶）
+      REDIS_URL: redis://redis:6379/0
+      # 管理端 JWT 密钥；dev 下为空时退回 dev，非 dev 必须设置（openssl rand -hex 32）
+      VOD_ADMIN_JWT_SECRET: ${VOD_ADMIN_JWT_SECRET:-}
+      # 开发用管理员种子：两个都设置且用户不存在时才建，仓库里没有默认口令
+      VOD_ADMIN_USERNAME: ${VOD_ADMIN_USERNAME:-}
+      VOD_ADMIN_PASSWORD: ${VOD_ADMIN_PASSWORD:-}
     depends_on:
       mysql: {condition: service_healthy}
       rabbitmq: {condition: service_healthy}
+      redis: {condition: service_healthy}
 
   worker:                     # FFmpeg 转码 worker，可 scale：docker compose up -d --scale worker=2
     build: {context: ./worker, network: host}

@@ -8,6 +8,7 @@ import random
 INPUT_INVALID = "INPUT_INVALID"        # ffprobe 解析不了源文件
 NO_VIDEO_STREAM = "NO_VIDEO_STREAM"    # 源文件没有视频流
 SOURCE_MISSING = "SOURCE_MISSING"      # 源对象在对象存储里不存在（404）
+TEMPLATE_INVALID = "TEMPLATE_INVALID"  # Phase 5：任务引用的转码模板参数不合法（库里被手工改坏），重跑也一样
 # 可重试：依赖或环境暂时出问题
 STORAGE_ERROR = "STORAGE_ERROR"        # 对象存储读写失败、连不上
 DB_ERROR = "DB_ERROR"
@@ -17,7 +18,7 @@ OUTPUT_INVALID = "OUTPUT_INVALID"      # 本地 HLS 校验没过
 IO_ERROR = "IO_ERROR"
 INTERNAL = "INTERNAL"
 
-NON_RETRYABLE = frozenset({INPUT_INVALID, NO_VIDEO_STREAM, SOURCE_MISSING})
+NON_RETRYABLE = frozenset({INPUT_INVALID, NO_VIDEO_STREAM, SOURCE_MISSING, TEMPLATE_INVALID})
 
 
 class JobError(Exception):

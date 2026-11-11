@@ -46,6 +46,61 @@ vod:
   quota:
     # vod_tenant.storage_quota_bytes 为 NULL 时使用；0 表示不限制（当前默认不限制）。
     default-storage-bytes: ${VOD_QUOTA_DEFAULT_STORAGE_BYTES:0}
+    # Phase 5：vod_tenant.max_concurrent_jobs / max_daily_transcodes 为 NULL 时使用；0 表示不限制。超额 429 + code=quota_exceeded。
+    default-max-concurrent-jobs: ${VOD_QUOTA_DEFAULT_MAX_CONCURRENT_JOBS:0}
+    default-max-daily-transcodes: ${VOD_QUOTA_DEFAULT_MAX_DAILY_TRANSCODES:0}
+  # ---- Phase 5 平台化控制台（默认值都只是开发默认，不是基准或承诺）----
+  admin:
+    # 管理端 JWT 的 HMAC 密钥；非 dev 下为空、等于 dev 或过短拒绝启动（SecretGuard），dev 下为空退回 dev。
+    jwt-secret: ${VOD_ADMIN_JWT_SECRET:}
+    jwt-ttl-seconds: ${VOD_ADMIN_JWT_TTL_SECONDS:3600}
+    jwt-leeway-seconds: ${VOD_ADMIN_JWT_LEEWAY_SECONDS:30}
+    # 只在两个都设置、且该用户名还不存在时建管理用户；仓库里没有默认口令。
+    seed-username: ${VOD_ADMIN_USERNAME:}
+    seed-password: ${VOD_ADMIN_PASSWORD:}
+    # 新建/轮换 API Key 的最长有效期（秒）；0 表示允许不过期。
+    max-key-ttl-seconds: ${VOD_ADMIN_MAX_KEY_TTL_SECONDS:0}
+  ratelimit:
+    enabled: ${VOD_RATELIMIT_ENABLED:true}
+    # 配了就用 Redis 计数（多实例共享）；为空用进程内存桶，只对单实例有效。
+    redis-url: ${VOD_RATELIMIT_REDIS_URL:${REDIS_URL:}}
+    redis-timeout-ms: ${VOD_RATELIMIT_REDIS_TIMEOUT_MS:200}
+    # 登录按客户端 IP 限流时读这个头（Nginx 写 X-Real-IP）；vod-api 直接对外时设成空串。
+    client-ip-header: ${VOD_RATELIMIT_CLIENT_IP_HEADER:X-Real-IP}
+    tenant:
+      rate-per-second: ${VOD_RATELIMIT_TENANT_RPS:50}
+      burst: ${VOD_RATELIMIT_TENANT_BURST:200}
+    login:
+      rate-per-second: ${VOD_RATELIMIT_LOGIN_RPS:0.2}
+      burst: ${VOD_RATELIMIT_LOGIN_BURST:10}
+    webhook:
+      rate-per-second: ${VOD_RATELIMIT_WEBHOOK_RPS:5}
+      burst: ${VOD_RATELIMIT_WEBHOOK_BURST:20}
+  usage:
+    max-history-days: ${VOD_USAGE_MAX_HISTORY_DAYS:90}
+  idempotency:
+    ttl-seconds: ${VOD_IDEMPOTENCY_TTL_SECONDS:86400}
+  jobs:
+    # POST /jobs/{id}/retry 是否也接受 CANCELLED 的任务（FAILED 总是可以）。
+    retry-allow-cancelled: ${VOD_JOBS_RETRY_ALLOW_CANCELLED:true}
+  template:
+    default-name: ladder_v1
+    # 系统模板（tenant_id=0）默认只读，避免改掉老资产的行为。
+    allow-system-edit: ${VOD_TEMPLATE_ALLOW_SYSTEM_EDIT:false}
+  webhook:
+    dispatch-interval-ms: ${VOD_WEBHOOK_DISPATCH_INTERVAL_MS:2000}
+    batch-size: ${VOD_WEBHOOK_BATCH_SIZE:20}
+    max-attempts: ${VOD_WEBHOOK_MAX_ATTEMPTS:8}
+    base-backoff-seconds: ${VOD_WEBHOOK_BASE_BACKOFF_SECONDS:10}
+    max-backoff-seconds: ${VOD_WEBHOOK_MAX_BACKOFF_SECONDS:3600}
+    backoff-jitter: ${VOD_WEBHOOK_BACKOFF_JITTER:0.5}
+    claim-seconds: ${VOD_WEBHOOK_CLAIM_SECONDS:120}
+    connect-timeout-ms: ${VOD_WEBHOOK_CONNECT_TIMEOUT_MS:3000}
+    read-timeout-ms: ${VOD_WEBHOOK_READ_TIMEOUT_MS:5000}
+    max-response-bytes: ${VOD_WEBHOOK_MAX_RESPONSE_BYTES:4096}
+    # 开发开关，默认关；只在 VOD_ENV=dev 生效，非 dev 下设置会拒绝启动。
+    dev-allow-http: ${VOD_WEBHOOK_DEV_ALLOW_HTTP:false}
+    dev-allow-private-hosts: ${VOD_WEBHOOK_DEV_ALLOW_PRIVATE_HOSTS:}
   outbox:
     # 兜底发布轮询（complete 后仍先走快速发布）。多实例靠条件 UPDATE 领取，领取过期后别的实例接手。
     publish-interval-ms: ${VOD_OUTBOX_PUBLISH_INTERVAL_MS:5000}
