@@ -6,6 +6,109 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 路线图见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)，旧接口兼容约定见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
 
+## 分支方案：Phase 5 平台化控制台
+
+本分支：`plan/phase-5`，基线 `main` = `9cab039`（Phase 4 已合并）。下面只写方案，还没有实现代码。
+
+协作方式：其他 agent 请在**本分支**上按下面清单做最小改动开发；不要自行合并到 `main`，也不要另开平行分支。开发完后由「短剧视频服务器开发bot」检查，没问题再合并。Range 响应头（缓存命中后要回 206）和故障注入脚本时序是并行小分支，不要放进本分支。
+
+对照文档：[路线图](docs/panda-vod-roadmap.html) 第 06 节 API 草案（`POST /webhooks`、`GET /usage`、`POST /assets/{id}/transcodes`、管理端与租户 API 分开授权）、第 08 节（API Key 轮换、Spring Security + JWT、Webhook 防 SSRF 与 DNS 重绑定、限流与配额）、第 09 节 Phase 5、第 10 节第 1 条验收（租户互相不可见）。目标：**做出可演示的多租户点播平台**：控制台能管租户和密钥、能按模板重新转码、转码结果能可靠回调，租户之间互相看不见。
+
+### 已经有的，不要重做
+
+这些是 Phase 1–4 留下的雏形，本分支在其上做最小改动，不要推倒重来。
+
+- Vue 3 控制台雏形：`console/`（Vite，`base` 为 `/vod-console/`，构建到 `nginx/html/vod-console/`）。现在是在页面里粘贴 API Key，能直传、刷新资产和任务列表、看当日用量、登记 Webhook，没有登录，也没有租户、密钥、模板、任务详情和投递记录。
+- 租户与 API Key：`vod_tenant`、`vod_api_credential`（只存哈希、scopes、status、`expires_at`），`ApiKeyFilter` 校验 `X-Api-Key` / Bearer。没有创建、撤销、轮换接口，明文不会只展示一次——因为根本还没有管理接口。
+- 存储配额：`vod_tenant.storage_quota_bytes` / `storage_used_bytes`，`UsageService.reserveStorage` 在 complete 事务里原子占用（V8）。
+- 日用量：`vod_usage_daily`（存储、播放次数、转码任务数），`GET /api/v1/usage` 只返回「今天」三列，不含配额和已用存储。
+- Webhook 登记：`POST/GET /api/v1/webhooks`（`PlatformController`）。登记时校验 HTTPS、拒绝 localhost / 内网字面量 / 云 metadata；创建时返回 `secret`，列表不再返回。`WebhookSigner` 用 HMAC-SHA256，请求头 `X-Vod-Signature`。
+- Webhook 投递现状：`UploadService.publishAfterCommit` 在事务提交后**同步**调用 `webhooks.dispatch(..., "transcode.requested", body)`，body 还是转码消息；只试一次，失败写入 `vod_webhook_delivery` 后不会重试。成功、失败、取消都不会发事件。`LiveWebhookIo` 先按主机名解析再按主机名连接，解析和连接之间 DNS 可能指向内网（重绑定窗口还在）。
+- 转码任务唯一键 `(asset_id, profile)`，默认 profile 为 `ladder_v1`（Phase 0 冻结，本分支不得删这个唯一键）。重新转码必须复用同一行，靠 `claim_version + 1` 打开新的输出前缀（Phase 4 已经按这个设计做了切换和清理）。
+- 取消：`POST /api/v1/jobs/{id}/cancel`。失败重放目前只有运维脚本 `scripts/dlq.py`，不是公开 API。
+- 播放、鉴权、Outbox、围栏、任务专属前缀：Phase 4 已合并，不要改行为。`vod_outbox` 只给转码投递 RabbitMQ 用，Webhook **不要**复用这张表：`OutboxPublisher` 会把 `PENDING` 行发到转码队列。
+
+### 本分支要做的
+
+建议按顺序做。新表结构用 Flyway **V12 及之后**，不要改 V1–V11。SQL 要同时兼容 H2 MySQL 模式和 MySQL 8.4。`mysql/init.sql` 只管旧 Demo 表。旧 Demo 链路按 `docs/phase-0-contract.md` 冻结。消息 v1 契约不改，模板和事件都从 `job_id` 查库。TTL、重试次数、限流速率、配额默认值、JWT 有效期都写成配置项，默认值不是基准或承诺。不要编造性能数字。密钥不要写进仓库或输出。
+
+1. **管理端鉴权：Spring Security + JWT**
+   现状：`vod-api` 没有 `spring-boot-starter-security`，租户接口全靠 `ApiKeyFilter`，管理接口不存在。
+   要改：引入 Spring Security，但不要把现有 API Key 鉴权推倒重写。`/api/v1/admin/**` 用 JWT（登录接口除外）；现有租户接口（`/api/v1/uploads`、`/assets`、`/jobs`、`/webhooks`、`/usage`、播放 token 等）继续走 API Key；`/api/v1/healthz`、`/api/v1/qoe`、`/keys/v1/**` 维持现有放行。`POST /api/v1/admin/login` 校验管理用户（密码只存哈希，开发环境可用环境变量种子，不要把默认口令写进镜像说明以外的代码仓库）。JWT 用新密钥 `VOD_ADMIN_JWT_SECRET`，走现有 `SecretGuard`：非 dev 时空、等于 `dev` 或过短就拒绝启动，带版本前缀，过期时间可配。管理接口拿到的身份不能当成租户 API Key 用，租户 Key 也不能调用 `/admin/**`（隔离要有测试：用租户 Key 调管理接口 401/403，用管理 JWT 调租户上传接口 401）。不做完整 RBAC、不做 OAuth、不接第三方登录。
+
+2. **租户与 API Key 管理接口**
+   要改：管理端提供租户的创建、列表、启用/停用，以及给指定租户创建、列出、撤销、轮换 API Key。创建和轮换只在响应里展示一次明文，库里只存哈希；支持 scopes、过期时间。停用租户后，该租户所有 Key 不能再调租户接口。设置或修改存储配额、并发转码上限、每日转码次数上限（后两项见第 7 项，列加在 `vod_tenant` 上即可）。列表不要返回哈希或明文。这些接口全部在 `/api/v1/admin/**`，鉴权走第 1 项。现有 `DevCredentialSeeder` 和开发用 `dev-demo-key` 保留，方便本地和旧测试。
+
+3. **Webhook 事件与可靠投递**
+   现状：只在上传完成之后同步发一次 `transcode.requested`，不重试；成功/失败/取消没有事件。
+   要改：
+   - 事件至少包括 `transcode.succeeded`、`transcode.failed`；`transcode.requested` 可以保留，但改成与另外两个相同的异步投递，不要在 `afterCommit` 里直接 HTTP。取消成功后发 `transcode.failed`（payload 带 `reason=cancelled`）或单独的 `transcode.cancelled`，选一个写进契约并保持一致。
+   - 成功、失败事务在 **Worker**（`fencing.py` 里写 `SUCCEEDED` / `FAILED` 的同一事务）插入 Webhook 事件；取消在 **vod-api** 的取消事务里插入。不要在事务里发 HTTP。
+   - 新建事件表（例如 `vod_webhook_event`），**不要**写入 `vod_outbox`。投递表在 V3 `vod_webhook_delivery` 上加列，或新建并废弃同步写入路径：状态、`attempts`、`next_attempt_at`、领取租约、`response_code`、截断后的错误信息、请求体引用。
+   - Java 侧做与 `OutboxPublisher` 类似的投递循环：条件 UPDATE 领取、指数退避加 jitter、超过次数标记最终失败；多实例安全。登记、查询、停用端点的租户接口补齐（至少能停用；删除可选）。事件 payload 用稳定 JSON（含 `event_type`、`job_id`、`asset_id`、`occurred_at` 等），签名仍用 `WebhookSigner` + `X-Vod-Signature`。
+   - 投递超时、响应体大小上限写成配置。限流见第 7 项（按租户限制出站频率）。提供管理或租户侧的投递记录查询（不要返回签名密钥）。
+
+4. **Webhook SSRF 与 DNS 重绑定**
+   现状：`WebhookUrlGuard` 拒绝明文 HTTP、userinfo、localhost、常见 IPv4 内网字面量和 `169.254.169.254`；投递前会再解析一次，但 `LiveWebhookIo.post` 仍向**主机名**发请求，校验和连接之间可以被重绑定。IPv6 字面量几乎没拦。
+   要改：解析 → 校验每个地址都是公网（含 IPv6：回环、链路本地、ULA `fc00::/7`、IPv4 映射的内网地址）→ **连接到这次校验过的 IP**，同时用原主机名做 SNI / `Host` / 证书校验。不要先校验再按主机名让运行时重新解析。登记时和每次投递时都要走这套检查。开发环境若要打到本机回调，用显式开关（仅 `VOD_ENV=dev`）放行，默认关闭。补测试：假 DNS 第一次返回公网、连接前改成 `127.0.0.1` 时必须被拦住或根本连不到内网。
+
+5. **转码模板与重新转码：`POST /api/v1/assets/{id}/transcodes`**
+   现状：没有模板表；Worker 码率梯队写死在 `worker.py`；`JobGate` / `uk_asset_profile` 保证每个资产每个 profile 只有一行。
+   要改：V12+ 建 `vod_transcode_template`（系统默认模板 + 租户模板）。默认模板的 profile 仍叫 `ladder_v1`，参数与当前 Worker 梯队一致，避免老资产行为悄悄变掉。租户可列出可用模板；管理端可改租户模板（系统默认是否可改写成配置，默认不要在演示里改系统模板）。
+   `POST /api/v1/assets/{id}/transcodes`（scope 与资产写操作一致，支持 `Idempotency-Key`）：指定模板发起转码。跨租户走现有不可见处理；资产不存在或未上传完成（没有源对象）返回 4xx。若该 `(asset_id, profile)` 已有任务且状态是 `PENDING` / `RETRYING` / `RUNNING`，返回 409，不新建行。若任务是 `SUCCEEDED` / `FAILED` / `CANCELLED`，**复用这一行**：在事务里把状态打回 `PENDING`，`claim_version + 1`，清空租约和错误，写入新的 outbox（消息 v1 不变），并按 Phase 4 规则插入新的 `WRITING` 前缀。不要删除 `uk_asset_profile`，不要另开第二行相同 profile 的任务。加密资产重新转码沿用 `vod_content_key` 里已有的 key，不要另写一把（本分支不做密钥轮换）。已 READY 的旧 Core 加密资产走这次重新转码后，应写出 `/keys/v1/` 和新的任务专属前缀，这是把它们修到可播的正规路径。Worker 按 `job_id` 读模板参数，不要把梯队塞进消息体。
+
+6. **租户侧重试：`POST /api/v1/jobs/{id}/retry`**
+   把 `scripts/dlq.py replay` 的规则收成公开接口：只接受本租户、库里为 `FAILED` 的 Core 任务（以数据库为准，不转发死信原消息）；重置为 `PENDING`、资产回到可转码状态、写新 outbox。已在跑或已成功的任务 409；跨租户 404。是否允许从 `CANCELLED` 重试写成配置，默认允许并在文档里写清。支持 `Idempotency-Key`。运维脚本可以改调同一套服务逻辑，但不是本项必做。
+
+7. **API 限流与基础配额**
+   现状：只有存储配额；Nginx 对 `/keys/v1/` 和 QoE 有 `limit_req`；租户 API 没有整体限流。
+   要改：租户 API（按 API Key / 租户）和管理登录（按 IP）做可配置限流。单实例内存桶也可以，但机器上已有 Redis，优先用 Redis，这样多实例 vod-api 限额是共享的；用内存时要在 README 写明「只对单实例有效」。超限返回 429 和 `Retry-After`。配额在存储之外增加：同时 `RUNNING` 的转码任务数、每日新建/重转次数；超额 409 或 429（选一个并在契约里写死）。出站 Webhook 也按租户限速，避免回调把下游或自身打满。默认值一律可配，dev 下要松到现有测试不必改一堆环境变量就能过。
+
+8. **用量查询补全**
+   `GET /api/v1/usage` 在现有今日计数之外，返回配额、已用存储、并发占用、可选的按天历史（例如 `?days=`，上限可配）。管理端可查指定租户。播放计数的 Redis `GETDEL` 丢增量问题本分支不做。
+
+9. **Vue 控制台升级**
+   继续用 Vue 3 + TypeScript + Vite，构建产物仍输出到 `nginx/html/vod-console/`。加上路由，但不要引入大型 UI 框架。页面要能演示完整平台流程：
+   - 管理登录（JWT），不要再把管理口令写进前端源码；
+   - 租户列表与创建、配额编辑；
+   - API Key 创建 / 撤销 / 轮换（明文只出现一次）；
+   - 资产列表与上传、资产详情、对 READY 资产申请播放 token 并试播；
+   - 任务详情：取消、重试、按模板重新转码；
+   - 模板列表；
+   - Webhook 登记、停用、投递记录；
+   - 用量与配额。
+   控制台调管理接口用 JWT，调租户接口用该租户的 API Key（登录后由管理员创建或选用）。开发模式的 Vite 代理保留。构建后的静态文件提交进仓库的规则与现在一致（现在会提交 `nginx/html/vod-console/`），避免演示栈还要现场 `npm run build`。本项不改旧 Demo 播放页，只保留通往控制台的入口。
+
+10. **验收脚本与文档**
+    新增 `scripts/platform_live.py`（需要 Docker 栈）：创建租户与 Key、上传并等到 READY、收到 `transcode.succeeded`（脚本起一个公网可达或 dev 开关下的本地 HTTPS/HTTP 接收端）、跨租户资产 404、伪造/过期管理 JWT 不能调管理接口、租户 Key 不能调 `/admin/**`、重新转码后 `claim_version` 增加且旧前缀进入清理、失败任务可重试、限流或配额至少能测到一条超限路径、SSRF 地址登记被拒。更新 `docs/phase-0-contract.md` 的 Core 部分（旧 Demo 条目保持冻结原文），README 补新接口、配置项、事件名和指标（若有投递成功/失败计数，用 Micrometer，标签不要带 URL 或密钥）。
+
+**可选小项（不做不影响验收，做了单独说明）**：dev 下用开关放行 HTTP Webhook，方便 `platform_live.py` 不配证书；控制台构建进 `vod-api` 或 Nginx 镜像的一致性检查（例如 CI 或脚本核对 `console/` 与 `nginx/html/vod-console/` 是否同步）。
+
+### 本分支不要做
+
+- Phase 4 遗留的回源 `Content-Length` / 缓存命中 Range 206，以及 `fault_inject.py` 里 MinIO 场景的默认时序、`.gitattributes` 固定 `*.envsh` 为 LF：这些走并行小分支，不要塞进本分支。
+- 可选的 `WORKER_CANCEL_CHECK_SECONDS`（Phase 4 就没做）。
+- 旧 Demo 播放链路的任何改动、`content_key` 迁移、把 Demo 付费集改走加密 Core 资产。
+- 改 `uk_asset_profile` 或消息 v1，或改 Flyway V1–V11。
+- KMS / 信封加密 / DRM / Webhook 密钥入库加密（密钥继续只在创建时返回一次即可）。
+- 回源密钥轮换、mTLS、CDN 刷新、Grafana、播放计数 `GETDEL` 丢增量、Multipart / 缩略图 / 字幕 / CMAF / H.265 / 多存储 / 多 CDN / 冷存储（Phase 6）。
+- 完整 RBAC、OAuth、第三方登录、多管理角色。
+- 短剧生成、推荐、直播推流。这些不属于点播中台本阶段。
+
+### 写方案时的判断
+
+- 重新转码复用 `(asset_id, profile)` 这一行，而不是拆唯一键。Phase 4 的输出前缀已经是 `{job_id}-{claim_version}`，`claim_version + 1` 自然打开新目录；成功事务只允许自己的 `WRITING` 前缀变成 `ACTIVE`，旧的 `ACTIVE` 会变成 `GARBAGE`。
+- Webhook 事件必须进独立表，不能借用 `vod_outbox`。
+- DNS 重绑定的补丁点在 `LiveWebhookIo`：要钉住已校验的 IP 再连接，只靠「先解析再检查」不够。
+- 管理端和租户端从鉴权上分开，控制台只是这两类 API 的界面。租户模型按业务线隔离（长视频 / 短视频 / 短剧可以是不同租户），本阶段不实现业务线专属逻辑。
+- `docker-compose.yml` 里仍写死了部分宿主端口，本分支的验收栈继续用独立项目名和 override，不要改已有容器和数据卷。
+
+### 测试要求（开发时）
+
+每个改动点补测试，并保证现有测试仍通过。有 Java 21 和 Maven 就跑 `cd vod-api && mvn test`（当前 main 上是 82 个用例；未设 `VOD_TEST_MYSQL_URL` 时 MySQL 用例按设计跳过；能连 MySQL 8.4 就设置后再跑一遍）。跑 `python3 scripts/contract_check.py`、`test_bridge.py`、`test_hls_verify.py`、`test_vod_client.py`、`test_worker_fencing.py`、`test_worker_reliability.py`、`test_dlq.py`、`test_output_gc.py`、`test_playback_contract.py`、`test_api_playback.py` 和新增单测。有 Docker 就用独立项目名起栈（如 `docker compose -p drama-vod-p5 up -d --build`，端口冲突时用 override），跑 `test_fencing_mysql.py`、`scripts/platform_live.py`、`scripts/e2e.py`（旧 Demo 回归）；`playback_live.py` 因 Range 问题已知会有一项失败，不要为了让它全过而在本分支改回源。没跑过的不要声称通过，写明原因。改完后在本分支提交（作者 `TinyPandar <meiyoujunlee@foxmail.com>`），可以 push 到 `origin/plan/phase-5`，但不要合并到 `main`。
+
+
+
 ## 分支方案：Phase 4 播放与分发
 
 本分支：`plan/phase-4`，基线 `main` = `05ce971`。下面 1–10 项已在本分支实现（可选小项未做），实现后的接口、配置、指标、测试结果和剩余风险见下一节「Phase 4 实现说明」。
@@ -103,7 +206,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 - 需要 Docker：用独立项目名起栈，例如 `docker compose -p drama-vod-p4 up -d --build`；compose 里有固定宿主端口（3306、6379、9001、15672 和 `HTTP_PORT`/`UPLOAD_PORT`），和已在跑的栈冲突时先改端口或用 override 文件，不要动已有容器和数据卷。然后跑 `test_fencing_mysql.py`、`scripts/playback_live.py`、`scripts/fault_inject.py`、`scripts/e2e.py`（旧 Demo 回归）。
 - 没跑过的不要声称通过，写明原因。
 
-## Phase 4 实现说明（本分支，未合并到 `main`）
+## Phase 4 实现说明（已合并到 `main`，`9cab039`）
 
 只改 Core；旧 Demo 的 `/hls/{sig}/{exp}/{asset}/`、签名算法与缓存键、`/keys/{asset_id}`、`TOKEN_SECRET` token、`assets/{id}/` 前缀、`content_key`、`/play` 字段都没动（`scripts/test_playback_contract.py` 逐字核对旧 location）。消息 v1 未改。
 
