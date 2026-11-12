@@ -25,6 +25,11 @@ vod:
     session-ttl-seconds: 900
     # 测试用小上限，MemoryStorage 默认对象 128 字节。
     max-object-bytes: 1048576
+    # Phase 6：分片 5 MiB；max-object-bytes 在 multipart 测试里由用例自己改大。
+    part-size-bytes: 5242880
+    # 测试里手动调用 UploadCleanup.runOnce()。
+    cleanup-interval-ms: 3600000
+    cleanup-initial-delay-ms: 3600000
   quota:
     default-storage-bytes: 0
   webhook:

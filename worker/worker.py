@@ -61,6 +61,12 @@ OUTPUT_GC_INTERVAL_SEC = env_int("WORKER_OUTPUT_GC_INTERVAL_SECONDS", 300)
 OUTPUT_GC_PREFIX_BATCH = env_int("WORKER_OUTPUT_GC_PREFIX_BATCH", 20)    # 每轮最多处理几个前缀
 OUTPUT_GC_DELETE_BATCH = env_int("WORKER_OUTPUT_GC_DELETE_BATCH", 500)   # 每次 list/delete_objects 的对象数（≤1000）
 POLL_SEC = 0.5                                               # 子进程轮询间隔：围栏丢失后多快杀掉 ffmpeg
+# Phase 6：Core 转码成功时在本期前缀里写一张封面（poster.jpg）。抽帧失败不影响 READY。
+POSTER_ENABLED = os.environ.get("WORKER_POSTER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+POSTER_AT_SEC = env_float("WORKER_POSTER_AT_SECONDS", 1.0)    # 抽帧位置；比片长还长时取片长一半
+POSTER_TIMEOUT_SEC = env_int("WORKER_POSTER_TIMEOUT_SECONDS", 60)
+POSTER_MAX_WIDTH = env_int("WORKER_POSTER_MAX_WIDTH", 1280)  # 封面宽度上限（不放大）
+POSTER_NAME = "poster.jpg"
 
 FIRST_SEG, SEG = 1, 4   # 首片 1s（秒开），之后 4s
 # 码率阶梯：(名字, 短边像素, 视频码率kbps)。竖屏短剧 720p = 720x1280。另一条边按比例算(-2 保证偶数)
@@ -74,6 +80,7 @@ HEARTBEAT = Gauge("vod_worker_heartbeat_timestamp_seconds",
 LEASE_LOST = Counter("vod_worker_lease_lost_total", "heartbeat found the claim fence lost (taken over or cancelled)")
 DROP_FENCED = Counter("vod_worker_drop_fenced_total", "results dropped because the claim fence was lost")
 GC_PREFIXES = Counter("vod_worker_output_gc_prefixes_total", "garbage output prefixes deleted")
+POSTERS = Counter("vod_worker_poster_total", "Core poster extraction results", ["result"])
 
 KEYS = PlaintextKeyStore()
 
@@ -179,6 +186,49 @@ def build_ffmpeg(src, out, ladder, has_audio, keyinfo, portrait, audio_kbps=96):
     if keyinfo:
         cmd += ["-hls_key_info_file", keyinfo]
     return cmd + [f"{out}/%v/index.m3u8"]
+
+
+def poster_position(dur_ms, at_sec=None):
+    """抽帧时间点（秒）：配置的位置在片长之内就用它，否则取片长一半（极短素材取 0）。"""
+    at = POSTER_AT_SEC if at_sec is None else at_sec
+    dur = max(0.0, (dur_ms or 0) / 1000.0)
+    if 0 <= at < dur:
+        return at
+    return round(dur / 2, 3) if dur > 0 else 0.0
+
+
+def build_poster_cmd(src, dest, at_sec, max_width=None):
+    """参数数组，不拼 shell。-ss 放在 -i 前做快速定位；只取一帧，按宽度上限缩小（不放大），偶数尺寸。"""
+    w = int(max_width or POSTER_MAX_WIDTH)
+    return ["ffmpeg", "-y", "-v", "error", "-ss", f"{at_sec:.3f}", "-i", src, "-map", "0:v:0", "-frames:v", "1",
+            "-vf", f"scale='min({w},iw)':-2", "-q:v", "3", "-f", "image2", "-c:v", "mjpeg", dest]
+
+
+def extract_poster(src, out_dir, dur_ms, work, stop=None):
+    """在 out_dir 写 poster.jpg，返回 True；失败（无视频流、坏帧、超时、空文件）返回 False，不抛错。
+    先写到 work 下的临时文件，确认是非空文件后再移进产物目录：产物目录里只会出现完整的封面，
+    它随 HLS 一起上传，并进入本地清单与远端 list 对账。围栏丢失（FenceLost）照常抛出。"""
+    if not POSTER_ENABLED:
+        return False
+    tmp = os.path.join(work, "poster.tmp.jpg")
+    try:
+        run(build_poster_cmd(src, tmp, poster_position(dur_ms)), POSTER_TIMEOUT_SEC, stop, OUTPUT_INVALID)
+        if not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
+            raise JobError(OUTPUT_INVALID, "poster frame is empty")
+        os.replace(tmp, os.path.join(out_dir, POSTER_NAME))
+        POSTERS.labels("ok").inc()
+        return True
+    except FenceLost:
+        raise
+    except Exception as e:  # 封面是增强，不是可播前提
+        POSTERS.labels("skipped").inc()
+        log("poster_skipped", err=str(e)[-300:])
+        return False
+    finally:
+        if os.path.isdir(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+        elif os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def get_or_create_key(c, asset_id, origin="legacy"):
@@ -327,6 +377,10 @@ def process(job_id, trace_id, origin="legacy"):
             verify_hls(f"{work}/out", [name for name, _, _ in ladder], bool(a["encrypted"]))
         except RuntimeError as e:
             raise JobError(OUTPUT_INVALID, str(e)) from e
+        # Phase 6：Core 的封面写进本期产物目录，随 HLS 上传并进清单；失败只是没有封面。旧 Demo 不变。
+        poster_key = None
+        if origin == "core" and extract_poster(src, f"{work}/out", dur_ms, work, lost):
+            poster_key = prefix + POSTER_NAME
         check_fence()
         if origin == "core":
             output_prefix.insert_writing(c, asset_id, job_id, version, prefix)
@@ -335,8 +389,9 @@ def process(job_id, trace_id, origin="legacy"):
         if origin == "core":
             check_remote(f"{work}/out", prefix)
         conn.begin()
+        extra = {"poster_key": poster_key} if origin == "core" else {}
         if not commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, w, h,
-                              renditions_of(ladder, w, h, portrait), a["episode_id"]):
+                              renditions_of(ladder, w, h, portrait), a["episode_id"], **extra):
             conn.rollback()
             discard_prefix(c, prefix, prefix_recorded)
             return drop_fenced(job_id, version, trace_id, "commit_success")
@@ -346,7 +401,7 @@ def process(job_id, trace_id, origin="legacy"):
         JOBS.labels("succeeded").inc()
         DUR.observe(time.time() - t0)
         log("job_done", job_id=job_id, asset_id=asset_id, renditions=[x[0] for x in ladder], files=nfiles,
-            claim_version=version, secs=round(time.time() - t0, 1), trace_id=trace_id)
+            poster=bool(poster_key), claim_version=version, secs=round(time.time() - t0, 1), trace_id=trace_id)
         return "ok"
     except FenceLost as e:
         conn.rollback()

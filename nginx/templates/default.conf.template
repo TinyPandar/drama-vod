@@ -219,6 +219,8 @@ server {
 }
 
 # ---------- 上传网关：只放行带预签名的 PUT 直传 ----------
+# Phase 6：multipart 的分片也是预签名 PUT（?uploadId=&partNumber=），走同一个入口；浏览器要读每个分片响应的 ETag
+# 才能 complete，所以暴露 ETag。CORS 头只由这里给一份：隐藏上游（MinIO）自带的同名头，避免浏览器看到重复的 Allow-Origin。
 server {
     listen 9000;
     client_max_body_size 5g;
@@ -231,7 +233,12 @@ server {
             return 204;
         }
         add_header Access-Control-Allow-Origin $http_origin always;
-        limit_except PUT { deny all; }
+        add_header Access-Control-Expose-Headers "ETag" always;
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Credentials;
+        proxy_hide_header Access-Control-Expose-Headers;
+        # OPTIONS 也要列上：limit_except 在选 location 阶段就把其他方法切到 deny，上面 if 里的预检 204 根本执行不到
+        limit_except PUT OPTIONS { deny all; }
         proxy_request_buffering off;              # 边收边转，不在 nginx 落盘
         proxy_set_header Host $http_host;         # 保留客户端看到的 host，预签名校验要用
         proxy_pass http://minio_origin;

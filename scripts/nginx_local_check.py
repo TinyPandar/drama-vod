@@ -60,12 +60,20 @@ class Origin(http.server.BaseHTTPRequestHandler):
             if "missing" in self.path:
                 return self.reply(404, b"nope")
             body = (b"#EXTM3U\n" if self.path.endswith(".m3u8") else bytes(range(256)) * 8)
-            return self.reply(200, body, {"Cache-Control": "private, max-age=1"})  # Nginx 必须隐藏/覆盖
+            extra = {"Content-Type": "image/jpeg"} if self.path.endswith(".jpg") else {}
+            return self.reply(200, body, {"Cache-Control": "private, max-age=1", **extra})  # Nginx 必须隐藏/覆盖
         if self.path.startswith("/keys/v1/"):
             return self.reply(200, b"0123456789abcdef", {"Cache-Control": "no-store, private"})
         if self.path.startswith("/keys/"):
             return self.reply(401, b"legacy keys", {"Cache-Control": "no-store"})
         self.reply(404, b"")
+
+    def do_PUT(self):
+        # 模拟 MinIO：预签名 PUT（含 multipart 分片）回 ETag，并且自己也带一份 CORS 头（网关必须隐藏掉）
+        Origin.hits.append(self.path)
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.reply(200, b"", {"ETag": '"0123abcd"', "Access-Control-Allow-Origin": self.headers.get("Origin") or "*",
+                              "Access-Control-Expose-Headers": "Date, Server"})
 
     def do_POST(self):
         Origin.hits.append(self.path)
@@ -156,6 +164,7 @@ def main():
     time.sleep(0.8)
     try:
         run_checks(ports["http"])
+        run_upload_checks(ports["upload"])
     finally:
         proc.terminate()
         proc.wait(5)
@@ -163,6 +172,24 @@ def main():
             srv.shutdown()
         shutil.rmtree(tmp, ignore_errors=True)
     return finish()
+
+
+def run_upload_checks(port):
+    """Phase 6：上传网关。multipart 分片的预签名 PUT 原样转给存储；浏览器能读 ETag；CORS 头只有一份。"""
+    Origin.hits.clear()
+    path = "/vod-source/raw/t1/9/source.mp4?uploadId=abc&partNumber=3&X-Amz-Signature=x"
+    st, h, _ = req(port, path, method="PUT", headers={"Origin": ALLOWED}, data=b"x" * 1024)
+    check("upload gateway forwards part PUT with query", st == 200 and Origin.hits == [path], f"{st} {Origin.hits}")
+    check("upload gateway keeps ETag", h.get("ETag") == '"0123abcd"', h.get("ETag"))
+    acao = h.get_all("Access-Control-Allow-Origin") or []
+    check("upload gateway single Allow-Origin", acao == [ALLOWED], acao)
+    expose = h.get_all("Access-Control-Expose-Headers") or []
+    check("upload gateway exposes ETag", expose == ["ETag"], expose)
+    st, h, _ = req(port, "/vod-source/raw/t1/9/source.mp4", method="OPTIONS",
+                   headers={"Origin": ALLOWED, "Access-Control-Request-Method": "PUT"})
+    check("upload gateway preflight 204", st == 204 and "PUT" in (h.get("Access-Control-Allow-Methods") or ""), st)
+    st, _, _ = req(port, "/vod-source/raw/t1/9/source.mp4?uploadId=abc")
+    check("upload gateway still rejects GET", st == 403, st)
 
 
 def run_checks(port):
@@ -195,6 +222,15 @@ def run_checks(port):
     check("multi-range on HIT also served by nginx", st3 == 206, st3)
     check("206 keeps immutable Cache-Control", h2.get("Cache-Control") == "public, max-age=86400, immutable",
           h2.get("Cache-Control"))
+
+    # ---- Phase 6：封面在同一 gen 目录，签名与 master 相同 ----
+    Origin.hits.clear()
+    st, h, _ = req(port, gen_url(exp, 12, "34-2", "poster.jpg"))
+    check("gen poster.jpg 200 image/jpeg via origin", st == 200 and h.get("Content-Type") == "image/jpeg"
+          and Origin.hits == ["/internal/origin/v1/12/34-2/poster.jpg"], f"{st} {h.get('Content-Type')} {Origin.hits}")
+    check("gen poster.jpg immutable", h.get("Cache-Control") == "public, max-age=86400, immutable", h.get("Cache-Control"))
+    st, _, _ = req(port, gen_url(exp, 12, "34-2", "poster.jpg").replace("/34-2/", "/34-3/"))
+    check("poster signed for one gen is 403 on another gen", st == 403, st)
 
     st, h, _ = req(port, gen_url(exp, 12, "34-2").replace("/hls/v1/", "/hls/v1/A", 1))
     check("forged gen signature 403 no-store", st == 403 and h.get("Cache-Control") == "no-store", f"{st} {h.get('Cache-Control')}")

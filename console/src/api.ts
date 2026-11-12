@@ -71,7 +71,10 @@ export type ApiKey = {
   id: number; tenant_id: number; name: string | null; key_prefix: string | null; scopes: string; status: string;
   expires_at: string | null; created_at: string; revoked_at: string | null; api_key?: string;
 };
-export type Asset = { id: number; status: string; source_size: number; encrypted: boolean; hls_prefix?: string | null };
+/** poster_url：Phase 6 封面签名地址（会过期，刷新列表重新签），没有封面为 null。 */
+export type Asset = {
+  id: number; status: string; source_size: number; encrypted: boolean; hls_prefix?: string | null; poster_url?: string | null;
+};
 export type Job = {
   id: number; asset_id: number; profile: string; status: string; attempts: number; claim_version: number;
   max_attempts?: number; last_error?: string | null; error_code?: string | null; next_attempt_at?: string | null;
