@@ -6,6 +6,29 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 路线图见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)，旧接口兼容约定见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
 
+## 分支方案：CI（GitHub Actions 跑现有测试）
+
+本分支：`plan/ci`，基线 `main` = `e1e211f`（Phase 5 和返工都已合并）。目前仓库没有任何 CI，测试全靠本地手跑。这一刀只做「每次 push 和 PR 自动跑现有测试」，不新写业务测试，也不改业务代码。
+
+### 要做的事
+
+1. 新增 `.github/workflows/ci.yml`，触发：`push` 到任意分支、`pull_request` 到 `main`，外加 `workflow_dispatch`。设 `concurrency`，同一分支新提交取消旧运行。权限只给 `contents: read`。
+2. **job `vod-api`**：`ubuntu-latest`，`actions/setup-java`（Temurin 21，开 Maven 缓存），起 `mysql:8.4` service（root 空口令或固定测试口令，带健康检查），设置 `VOD_TEST_MYSQL_URL` / `VOD_TEST_MYSQL_USER`（/ `VOD_TEST_MYSQL_PASSWORD`）后在 `vod-api` 下跑 `mvn -B test`。这样 H2 用例和 `Phase5MysqlTest`、`MysqlSemanticsTest` 一次跑完，**MySQL 用例不能被跳过**（在步骤里检查 surefire 报告里这两个类 skipped=0，或用等价办法让「没连上库而全跳过」变成失败）。失败时上传 `target/surefire-reports` 作为 artifact。
+3. **job `python`**：`actions/setup-python`（版本与 `api/Dockerfile`、`worker/Dockerfile` 一致），装 `api/requirements.txt`、`worker/requirements.txt` 和测试要用的 `pymysql`；同样起 `mysql:8.4` service。依次跑 `scripts/contract_check.py` 和 `scripts/test_*.py` 全部 11 个（`test_fencing_mysql.py` 用 service 的端口）。任一脚本非零退出就失败，不要 `|| true`。需要 ffmpeg 的用例目前都是假的 ffmpeg，如果实际需要就 `apt-get install ffmpeg`，不需要就别装。
+4. **job `console`**：`actions/setup-node`（写明主版本，开 npm 缓存），在 `console` 下 `npm ci && npm run build`。现在 `npm ci` 报锁文件和 `package.json` 不同步（Phase 5 审查 N7，main 上本来就有），本分支顺手用 `npm install` 重新生成 `package-lock.json` 修掉，**不升级依赖版本范围**。可选：构建完 `git diff --exit-code` 检查提交里的构建产物没过期（如果仓库确实提交了产物）。
+5. 三个 job 并行；README「检查」一节补一行 CI 说明和徽章（可选），写清楚 CI 里跑什么、不跑什么。
+
+### 本分支不要做
+
+- 不跑需要整套 compose 的脚本：`e2e.py`、`playback_live.py`、`platform_live.py`、`core_live.py`、`drama_vod_live.py`、`fault_inject.py`、`kill_recover_submit.py`、`browser_check.py`、`nginx_local_check.py`。Docker 集成测试以后单独一刀（可能是手动触发或 nightly）。
+- 不改业务代码和现有测试的断言；如果 CI 环境下某个测试暴露问题（比如时序、时区、路径），先在 README 实现说明里记下来，最小修，修法写清楚，不要用跳过掩盖。
+- 不加发布、镜像推送、部署、代码覆盖率服务、需要 secrets 的步骤。
+- 不改 Phase 6 分支（`plan/phase-6`）；它以后合 main 时自然带上 CI。
+
+### 测试要求
+
+推上去后看 Actions 实际结果：三个 job 都绿，并在实现说明里记录 run 链接、`vod-api` 用例数和 MySQL 用例确实没跳过。故意改坏一个断言在临时分支验证 CI 会红（验证完删掉那个临时分支，不要合）。
+
 ## 分支方案：Phase 5 平台化控制台
 
 本分支：`plan/phase-5`，基线 `main` = `9cab039`（Phase 4 已合并）。下面先是方案原文，实现情况见紧接着的「Phase 5 实现说明」。
@@ -109,7 +132,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 
 
-## Phase 5 实现说明（`plan/phase-5`，未合并到 `main`）
+## Phase 5 实现说明（已合并到 `main`，`248b6e3`；返工 `e1e211f`）
 
 旧 Demo 链路、消息 v1、`uk_asset_profile`、Flyway V1–V11、`mysql/init.sql` 都没动；新表结构在 `V12__platform_console.sql`（H2 MySQL 模式与 MySQL 8.4 都跑过）。
 
