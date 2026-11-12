@@ -146,6 +146,25 @@ class Phase6MysqlTest {
         assertEquals(0, cleanup.runOnce());
     }
 
+    @Test
+    void expiredButAssembledSessionCanStillCompleteOnMysql() throws Exception {
+        // N1 在 MySQL TIMESTAMP 下：组合成功但配额 403 → 过期 → 清理跳过 → 放开配额后 complete 建任务。
+        jdbc.update("UPDATE vod_tenant SET storage_quota_bytes = 1 WHERE id = 1");
+        long sessionId = openMultipart(null).get("session_id").asLong();
+        String up = uploadId(sessionId);
+        String e1 = storage.uploadPart(up, 1, 4096);
+        String body = "{\"parts\":[{\"part_number\":1,\"etag\":\"" + e1 + "\"}]}";
+        complete(sessionId, body).andExpect(status().isForbidden());
+        jdbc.update("UPDATE vod_upload_session SET expires_at = ? WHERE id = ?", Timestamp.from(Instant.now().minusSeconds(5)), sessionId);
+        assertEquals(0, cleanup.runOnce());
+        assertEquals("OPEN", sessionStatus(sessionId));
+        assertFalse(storage.aborted.contains(up));
+        jdbc.update("UPDATE vod_tenant SET storage_quota_bytes = NULL WHERE id = 1");
+        complete(sessionId, body).andExpect(status().isOk());
+        assertEquals(1, count("vod_transcode_job"));
+        assertEquals("COMPLETED", sessionStatus(sessionId));
+    }
+
     private int count(String table) {
         return jdbc.queryForObject("SELECT COUNT(*) FROM " + table, Integer.class);
     }

@@ -174,6 +174,15 @@ public class UploadService {
      */
     @Transactional
     public Map<String, Object> complete(long tenantId, long sessionId, String traceId) {
+        return complete(tenantId, sessionId, traceId, false);
+    }
+
+    /**
+     * allowExpiredAssembled 只由 {@link MultipartUploads#complete} 传 true：会话已过期、但存储侧已组合好（N1），
+     * 仍要求 OPEN，HEAD / 校验 / 配额照常；其他调用方行为不变。
+     */
+    @Transactional
+    public Map<String, Object> complete(long tenantId, long sessionId, String traceId, boolean allowExpiredAssembled) {
         var sessions = jdbc.query(
                 "SELECT " + SESSION_COLUMNS + " FROM vod_upload_session WHERE id = ? AND tenant_id = ? FOR UPDATE",
                 SESSION_ROW, sessionId, tenantId);
@@ -187,7 +196,9 @@ public class UploadService {
         // 已经建过任务：重复 complete 直接返回原任务，不再 HEAD，也不把资产状态改回 UPLOADED。
         if (!jobs.isEmpty()) return jobResult(assetId, jobs.get(0));
         if (!"OPEN".equals(session.status())) throw new ConflictException("upload session is not open");
-        if (session.expired(Instant.now())) throw new ConflictException("upload session expired");
+        if (session.expired(Instant.now()) && !(allowExpiredAssembled && session.multipart())) {
+            throw new ConflictException("upload session expired");
+        }
         var sources = jdbc.query(
                 "SELECT o.id, o.bucket, o.object_key FROM vod_media_asset a "
                         + "JOIN vod_storage_object o ON o.id = a.source_object_id AND o.tenant_id = a.tenant_id "
@@ -199,7 +210,7 @@ public class UploadService {
                 .orElseThrow(() -> new ConflictException("source object not found, upload first"));
         policy.check(source.key(), head);
         // Phase 5：锁租户行后检查并发与每日转码配额（429），同一租户建任务的事务从这里开始串行。
-        // 放在 HEAD 之后，不在锁里等对象存储；加锁顺序租户 → 对象 → 资产 → 任务，见 QuotaService。
+        // 放在 HEAD 之后，不在锁里等对象存储；加锁顺序会话 → 租户 → 对象 → 资产 → 任务，见 QuotaService。
         quotas.checkNewTranscode(tenantId);
         jdbc.update("UPDATE vod_storage_object SET size = ?, etag = ?, content_type = ?, checksum = ? WHERE id = ? AND tenant_id = ?",
                 head.size(), head.etag(), head.contentType(), head.checksum(), source.id(), tenantId);

@@ -15,7 +15,8 @@ import java.util.List;
 /**
  * Phase 6：过期仍 OPEN 的 multipart 会话 → 存储侧 abort（丢掉未完成分片）→ 会话 ABORTED。
  *
- * <p>只处理 upload_mode='multipart'、status='OPEN'、已过期的会话；COMPLETED 不碰，不删除任何对象
+ * <p>只处理 upload_mode='multipart'、status='OPEN'、已过期的会话；COMPLETED 不碰；abort 前先 HEAD 目标对象，
+ * 已存在（已组合、还没建任务）就跳过，保持 OPEN 让客户端重试 complete（N1）。不删除任何对象
  * （包括已经组合好、但没建任务的源对象，以及 put 会话留下的对象，见 README 风险）。
  * 多实例：条件 UPDATE 写 cleanup_until 领取，领到才处理；存储失败只打日志，领取到期后下一轮再试。
  */
@@ -69,6 +70,21 @@ public class UploadCleanup {
             if (rows.isEmpty()) continue;
             String key = rows.get(0)[0];
             String uploadId = rows.get(0)[1];
+            if (key != null) {
+                // N1：桶里已有目标对象 = 存储侧已组合过（建任务那步失败过，比如配额 403）。不 abort、不标 ABORTED，
+                // 留给客户端重试 complete；领取不清，到期后下一轮再看。
+                try {
+                    if (storage.head(UploadService.SOURCE_BUCKET, key).isPresent()) {
+                        registry.counter("vod.upload.multipart", "event", "cleanup_skipped_assembled").increment();
+                        log.info("expired multipart session already assembled, skip abort session={}", id);
+                        continue;
+                    }
+                } catch (RuntimeException e) {
+                    registry.counter("vod.upload.multipart", "event", "cleanup_failed").increment();
+                    log.warn("expired multipart head failed session={}: {}", id, e.toString());
+                    continue;  // 保留领取，到期后下一轮再试
+                }
+            }
             if (uploadId != null && key != null) {
                 try {
                     storage.abortMultipart(UploadService.SOURCE_BUCKET, key, uploadId);

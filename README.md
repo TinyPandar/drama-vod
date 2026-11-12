@@ -103,8 +103,8 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 1. **存储层**：`ObjectStorage` 加了 `createMultipart` / `presignUploadPart` / `listParts` / `completeMultipart` / `abortMultipart`。`S3ObjectStorage` 用同一个 AWS SDK v2：创建、列出、完成、取消走内网 client，分片预签名走公网 presigner；S3 的 `NoSuchUpload` 映射为 `NoSuchUploadException`，`InvalidPart` / `InvalidPartOrder` / `EntityTooSmall` 等映射为 `MultipartRejectedException`，abort 遇到 `NoSuchUpload` 视为成功。`MemoryStorage`（测试）按 S3 规则模拟：part 升序、etag 一致、非末块不小于 5 MiB，能列出、完成、取消，并记录被 abort 的 upload id。`UnavailableStorage` 新方法同样抛未配置。没有引入别的 SDK。
 2. **会话**：V13 给 `vod_upload_session` 加了 `upload_mode`（默认 `put`，列名避开 MySQL 关键字 `mode`）、`multipart_upload_id`、`cleanup_until`（清理领取）、`updated_at`，以及 `(status, expires_at)` 索引。multipart 在 open 事务的最后一步调 `createMultipart`；如果事务之后回滚，提交后回调会把刚建的存储侧上传 abort 掉（best-effort）。multipart 会话有效期单独配置（`VOD_UPLOAD_MULTIPART_SESSION_TTL_SECONDS`，默认 86400，硬上限 604800），从 open 起算、**不续期**；会话内可以反复 `POST /parts` 重签 URL，每次有效期取 `part-url-ttl-seconds` 和会话剩余时间的较小值。
-3. **complete / abort 的并发**：`UploadService.complete` 的事务开头改成 `SELECT … FOR UPDATE` 锁会话行，再复核 OPEN / 未过期；abort 也在事务里锁同一行。加锁顺序是会话 → 租户（配额）→ 对象 → 资产 → 任务。真 MySQL 上 10 轮并发「complete 对 abort」，每一轮都只有一方生效：要么 COMPLETED 且有任务（abort 409），要么 ABORTED 且没有任务（complete 409）。multipart 的存储侧组合在这个事务之外进行（`MultipartUploads.complete`），组合成功后再调用原 complete；上一次已组合、但建任务失败（比如配额 403）时重试，存储侧 upload 已不存在、桶里已有对象，就直接走 HEAD 校验。multipart 对象的 ETag（形如 `…-3`）不是整文件 MD5，`checksum` 可能为空，这些都不会导致拒绝。
-4. **过期清理**：`UploadCleanup` 定时任务。只处理 `upload_mode='multipart'`、`status='OPEN'`、已过期的会话，用条件 UPDATE 写入 `cleanup_until` 来领取（可以多实例），领到后在存储侧 abort，再改成 `ABORTED`；存储失败时只打日志，领取到期后下一轮重试。**不删除任何对象**：put 会话的过期残留、已组合但没建任务的源对象都留着（见风险）。abort 和过期后，资产都停在 `UPLOADING`（与原来过期会话一样，不能转码）。
+3. **complete / abort 的并发**：`UploadService.complete` 的事务开头改成 `SELECT … FOR UPDATE` 锁会话行，再复核 OPEN / 未过期；abort 也在事务里锁同一行。加锁顺序是会话 → 租户（配额）→ 对象 → 资产 → 任务。真 MySQL 上 10 轮并发「complete 对 abort」，每一轮都只有一方生效：要么 COMPLETED 且有任务（abort 409），要么 ABORTED 且没有任务（complete 409）。multipart 的存储侧组合在这个事务之外进行（`MultipartUploads.complete`），组合成功后再调用原 complete；上一次已组合、但建任务失败（比如配额 403）时重试，存储侧 upload 已不存在、桶里已有对象，就直接走 HEAD 校验。这种情况下即使会话已经过期（仍是 OPEN），`MultipartUploads.complete` 先 HEAD 目标对象、再用 `listParts` 确认 upload 已不存在，两者都成立就照常进入 HEAD + `UploadPolicy` + 配额 + 建任务事务，不再 409（审查 N1：原来过期后这个已组合的对象再也走不完流程）；没组合过的过期会话仍是 409，锁内仍复核 OPEN，所以已 abort 的会话照旧 409。multipart 对象的 ETag（形如 `…-3`）不是整文件 MD5，`checksum` 可能为空，这些都不会导致拒绝。
+4. **过期清理**：`UploadCleanup` 定时任务。只处理 `upload_mode='multipart'`、`status='OPEN'`、已过期的会话，用条件 UPDATE 写入 `cleanup_until` 来领取（可以多实例），领到后先 HEAD 目标对象：对象已存在说明存储侧已组合过（只是没建成任务），跳过、保持 OPEN，让客户端重试 complete（计 `cleanup_skipped_assembled`，领取不清，到期后下一轮再看）；否则在存储侧 abort，再改成 `ABORTED`；存储失败时只打日志，领取到期后下一轮重试。**不删除任何对象**：put 会话的过期残留、已组合但没建任务的源对象都留着（见风险）。abort 和过期后，资产都停在 `UPLOADING`（与原来过期会话一样，不能转码）。
 5. **封面抽帧**：只对 Core 做。Worker 在 `verify_hls` 之后、复核围栏与上传之前，用参数数组调 `ffmpeg -ss {t} -i src -frames:v 1 …` 抽一帧，宽度上限 1280（不放大），先写到临时文件，确认非空后再移进产物目录，和 m3u8、ts 一起上传（master 仍然最后传），并进入本地清单与远端 list 对账，对不上就按 `STORAGE_ERROR` 重试。抽帧位置默认第 1 秒，片长不足时取片长一半。抽帧失败（无帧、坏文件、超时、空文件）记 `poster_skipped`，任务照常 READY；围栏丢失（`FenceLost`）照常中止。旧 Demo 不抽帧，SQL 也不变。
 6. **登记封面**：`fencing.commit_success` 增加 `poster_key` 参数，和 `hls_prefix` / `READY` / 前缀 `ACTIVE` 在同一条 UPDATE、同一事务里写入；键不在本期前缀里时写 NULL。重新转码后封面跟着新前缀走；新一期没出封面时写 NULL，不会继续指向即将被 GC 的旧前缀。封面不进 `vod_storage_object`。
 7. **签名地址**：新增 `PosterUrls`，只在 `poster_key` 落在资产**当前** `hls_prefix`（带 gen）里时签发，地址是 `/hls/v1/{sig}/{exp}/{asset}/{gen}/poster.jpg`，签名与该 gen 的 master 相同（Nginx 带 gen 的 location 本来就能匹配，缓存键也带 gen）。playback-token / playback 与 `master_url` 用同一个 `exp`；列表和详情用 `vod.play-ttl-seconds`，同样不超过 `token-ttl-max-seconds`。旧固定前缀、封面键与当前前缀对不上、没有封面时，都返回 `null`。Webhook 事件没改。
@@ -128,7 +128,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 | `WORKER_POSTER_AT_SECONDS` | 1.0 | 抽帧位置；不小于片长时取片长一半 |
 | `WORKER_POSTER_TIMEOUT_SECONDS` / `WORKER_POSTER_MAX_WIDTH` | 60 / 1280 | 抽帧超时 / 封面宽度上限 |
 
-**新指标**（不带 URL、租户或密钥标签）：vod-api `vod_upload_multipart_total{event=created|completed|complete_rejected|aborted|put_aborted|expired_aborted|cleanup_failed}`；Worker `vod_worker_poster_total{result=ok|skipped}`。前者在本机 jar 的 `/actuator/prometheus` 里看到了，后者在 `prometheus_client` 的输出里看到了。
+**新指标**（不带 URL、租户或密钥标签）：vod-api `vod_upload_multipart_total{event=created|completed|complete_rejected|aborted|put_aborted|expired_aborted|cleanup_skipped_assembled|cleanup_failed}`；Worker `vod_worker_poster_total{result=ok|skipped}`。前者在本机 jar 的 `/actuator/prometheus` 里看到了，后者在 `prometheus_client` 的输出里看到了。
 
 **本分支实际跑过的测试**（2026-11-12，macOS arm64，本机**没有 Docker**，也没有可供自动化的 Chrome / Chromium）
 
@@ -138,6 +138,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
   - `Phase6MysqlTest`（3 个，只跑真 MySQL）：multipart 全流程；10 轮并发 complete 对 abort；清理在 MySQL TIMESTAMP 下的比较与领取。
   - `S3PresignTest` 新增 1 个：分片 URL 用公网地址，带 `uploadId`、`partNumber` 和有效期。
 - Python 3.12：`contract_check`、`test_bridge`、`test_hls_verify`、`test_vod_client`、`test_worker_fencing`（7）、`test_worker_reliability`（39）、`test_dlq`（5）、`test_output_gc`（9）、`test_playback_contract`、`test_api_playback`（8）、`test_transcode_template`（3）全过；新增 `test_poster.py` 16 个全过，覆盖：封面进清单并先于 master 上传；远端缺封面或封面大小不对时按 STORAGE_ERROR 重试、不提交；抽帧失败、超时、空文件时仍然 ok 且 `poster_key=None`；关闭开关后不抽帧；围栏丢失时丢弃；旧 Demo 不抽帧；成功事务 SQL；键不在当期前缀时写 NULL；另有 5 个用**本机真实 ffmpeg** 的用例，测竖屏、短片取中间帧、横屏缩到 1280、纯音频和垃圾文件返回 False。
+- **N1 补丁**（2026-11-13，box 上 Linux、MySQL 8.4，审查后补）：`MultipartUploadTest` 新增 2 个（组合成功但配额 403、会话过期后，再 complete 仍按 HEAD + 配额走、清理不标 ABORTED、放开配额后建任务；清理跳过已组合会话、照旧 abort 没组合的会话，被主动 abort 后 complete 仍 409），`Phase6MysqlTest` 新增 1 个（同一流程在真 MySQL 上）。`mvn test` 共 139 个：不设 `VOD_TEST_MYSQL_URL` 时 0 失败、11 个跳过；设到 MySQL 8.4 时 139 个全过、0 跳过。
 - `test_fencing_mysql.py` 连本机 MySQL 8.4.10：30 个全过（新增 2 个：封面跟着 ACTIVE 前缀走，重转没封面时写 NULL；围栏丢失时不写封面）。
 - `nginx_local_check.py`（本机 Homebrew nginx）：42/42（原 33 个 + 新增 9 个：gen 目录下的 `poster.jpg` 能取到 200 image/jpeg、immutable，换 gen 后 403；上传网关能转发带 query 的分片 PUT、保留 ETag、只有一份 Allow-Origin、暴露 ETag、预检 204、GET 仍 403）。改动前同一份检查里，后 3 项（单份 Allow-Origin、暴露 ETag、预检 204）是失败的。
 - **本机冒烟**（不是 compose 栈）：
@@ -157,7 +158,7 @@ COMPOSE_PROJECT_NAME=drama-vod-p6 VOD_ADMIN_USERNAME=… VOD_ADMIN_PASSWORD=… 
 
 **剩余风险**
 
-- **不删除源对象**：put 会话过期后，桶里可能留着已经 PUT、但从没 complete 的源对象；multipart 已组合成功、但最终没建任务就过期或被 abort 的源对象也会留着。这两种都没有清理，目前只 abort 未完成的分片。
+- **不删除源对象**：put 会话过期后，桶里可能留着已经 PUT、但从没 complete 的源对象；multipart 已组合成功、但被 abort 的源对象也会留着。这两种都没有清理，目前只 abort 未完成的分片。multipart 已组合、没建任务就过期的会话不再卡死（过期后仍可 complete，清理也不会把它标 ABORTED），但客户端如果一直不重试，会话会一直停在 OPEN、对象一直留着，清理每过一个领取时长（默认 300 秒）会再 HEAD 一次。
 - multipart 会话不续期：超过有效期（默认 24 小时）还没传完，只能取消重开。open 事务回滚时的存储侧 abort 是 best-effort，失败只打日志，可能留下一个没有会话指向的未完成上传（MinIO 自身的过期策略之外，没有别的兜底）。
 - 加密资产的封面是**明文 JPEG**（只有签名 URL 保护，不需要内容密钥）。如果付费内容连首帧都不能外露，需要给加密资产关掉封面，这个开关本分支没做。
 - 已 READY 的旧资产没有封面，要重新转码才会生成；没有「只重抽封面」的接口。重新转码时没出封面会写 NULL，旧封面不会保留。

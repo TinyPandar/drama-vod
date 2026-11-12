@@ -92,10 +92,20 @@ public class MultipartUploads {
      *   <li>upload 已不存在（上一次 complete 已组合成功，但建任务那步失败，比如配额）：桶里有对象就继续走 HEAD 校验，
      *       没有对象就 409；</li>
      * </ul>
-     * 组合成功后才进入 HEAD + 校验 + 建任务事务。
+     * 组合成功后才进入 HEAD + 校验 + 建任务事务。已过期但仍 OPEN、且存储侧已组合（upload 不存在、桶里有对象）的会话，
+     * 也照常进入这个事务（N1，见 {@link #assembledInStorage}）。
      */
     public Map<String, Object> complete(long tenantId, long sessionId, Object rawParts, String traceId) {
         UploadService.Session session = visible(tenantId, sessionId);
+        if (session.multipart() && "OPEN".equals(session.status()) && session.expired(Instant.now())
+                && !jobExists(session.assetId()) && assembledInStorage(session)) {
+            // N1：上次已组合成功、但建任务失败（比如配额 403），之后会话过期。对象已在桶里，照常 HEAD + 校验 + 建任务，
+            // 不再 409 卡死。其他过期情况（没组合过）仍走下面原逻辑 409。会话锁内会再复核 OPEN。
+            log.info("expired multipart session already assembled, continuing complete session={}", session.id());
+            Map<String, Object> result = uploads.complete(tenantId, sessionId, traceId, true);
+            uploads.multipartEvent("completed");
+            return result;
+        }
         if (!session.multipart() || !"OPEN".equals(session.status()) || session.expired(Instant.now())
                 || jobExists(session.assetId())) {
             return uploads.complete(tenantId, sessionId, traceId);
@@ -160,6 +170,27 @@ public class MultipartUploads {
         out.put("mode", session.mode());
         out.put("session_status", "ABORTED");
         return out;
+    }
+
+    /**
+     * 存储侧已组合：桶里有目标对象，且 upload id 已不存在（listParts 报 NoSuchUpload）。都是只读调用，在会话锁之外。
+     * 存储故障返回 503（结果未知，可以重试），不当成「没组合」。
+     */
+    private boolean assembledInStorage(UploadService.Session session) {
+        try {
+            if (session.objectKey() == null
+                    || storage.head(UploadService.SOURCE_BUCKET, session.objectKey()).isEmpty()) return false;
+            if (session.uploadId() == null) return true;
+            try {
+                storage.listParts(UploadService.SOURCE_BUCKET, session.objectKey(), session.uploadId());
+                return false;  // upload 还在，说明没组合完
+            } catch (ObjectStorage.NoSuchUploadException gone) {
+                return true;
+            }
+        } catch (RuntimeException e) {
+            log.warn("check assembled multipart failed session={}: {}", session.id(), e.toString());
+            throw new UploadService.StorageUnavailableException("object storage unavailable, retry later");
+        }
     }
 
     private UploadService.Session visible(long tenantId, long sessionId) {

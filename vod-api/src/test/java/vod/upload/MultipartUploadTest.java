@@ -225,6 +225,71 @@ class MultipartUploadTest {
     }
 
     @Test
+    void assembledThenQuota403ThenExpiredRetryStillCreatesJob() throws Exception {
+        // N1：组合成功但配额 403，会话随后过期。原来过期直接 409，桶里的对象再也走不完流程。
+        jdbc.update("UPDATE vod_tenant SET storage_quota_bytes = 1 WHERE id = 1");
+        JsonNode opened = openMultipart("key-a", null);
+        long sessionId = opened.get("session_id").asLong();
+        String uploadId = uploadId(sessionId);
+        String e1 = storage.uploadPart(uploadId, 1, 4096);
+        complete("key-a", sessionId, partsBody(e1), status().isForbidden());
+        assertFalse(storage.uploadOpen(uploadId));
+        expire(sessionId);
+
+        // 过期 + 已组合：照常 HEAD / 校验 / 配额，配额仍不够就还是 403（不是 409），会话仍 OPEN。
+        complete("key-a", sessionId, partsBody(e1), status().isForbidden());
+        assertEquals("OPEN", sessionStatus(sessionId));
+        // 清理看到桶里已有对象，不标 ABORTED。
+        assertEquals(0, cleanup.runOnce());
+        assertEquals("OPEN", sessionStatus(sessionId));
+        assertFalse(storage.aborted.contains(uploadId));
+
+        jdbc.update("UPDATE vod_tenant SET storage_quota_bytes = NULL WHERE id = 1");
+        JsonNode done = complete("key-a", sessionId, partsBody(e1), status().isOk());
+        assertEquals("PENDING", done.get("job_status").asText());
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_transcode_job", Integer.class));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_outbox", Integer.class));
+        assertEquals("COMPLETED", sessionStatus(sessionId));
+        assertEquals(4096L, jdbc.queryForObject("SELECT source_size FROM vod_media_asset WHERE id = ?", Long.class,
+                opened.get("asset_id").asLong()));
+        // 重复 complete 仍返回同一任务
+        assertEquals(done.get("job_id").asLong(),
+                complete("key-a", sessionId, partsBody(e1), status().isOk()).get("job_id").asLong());
+    }
+
+    @Test
+    void cleanupSkipsAssembledSessionButAbortsUnassembled() throws Exception {
+        jdbc.update("UPDATE vod_tenant SET storage_quota_bytes = 1 WHERE id = 1");
+        long assembled = openMultipart("key-a", null).get("session_id").asLong();
+        String assembledUpload = uploadId(assembled);
+        String e1 = storage.uploadPart(assembledUpload, 1, 4096);
+        complete("key-a", assembled, partsBody(e1), status().isForbidden());
+        long pending = openMultipart("key-a", null).get("session_id").asLong();
+        String pendingUpload = uploadId(pending);
+        String e2 = storage.uploadPart(pendingUpload, 1, 100);
+        expire(assembled);
+        expire(pending);
+        double skippedBefore = counter("cleanup_skipped_assembled");
+
+        assertEquals(1, cleanup.runOnce());
+        assertEquals("OPEN", sessionStatus(assembled), "已组合：不标 ABORTED");
+        assertFalse(storage.aborted.contains(assembledUpload));
+        assertEquals("ABORTED", sessionStatus(pending), "没组合：照旧 abort");
+        assertTrue(storage.aborted.contains(pendingUpload));
+        assertEquals(skippedBefore + 1, counter("cleanup_skipped_assembled"));
+        // 领取未到期，下一轮不重复 HEAD
+        assertEquals(0, cleanup.runOnce());
+        assertEquals(skippedBefore + 1, counter("cleanup_skipped_assembled"));
+
+        // 没组合过的过期会话 complete 仍 409；已组合的会话被主动 abort 后 complete 也 409（锁内复核 OPEN）。
+        complete("key-a", pending, partsBody(e2), status().isConflict());
+        abort("key-a", assembled, status().isOk());
+        jdbc.update("UPDATE vod_tenant SET storage_quota_bytes = NULL WHERE id = 1");
+        complete("key-a", assembled, partsBody(e1), status().isConflict());
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM vod_transcode_job", Integer.class));
+    }
+
+    @Test
     void putSessionRejectsPartEndpointsWith409() throws Exception {
         long sessionId = open("key-a", null, "{}", status().isOk()).get("session_id").asLong();
         parts("key-a", sessionId, "[1]", status().isConflict());
