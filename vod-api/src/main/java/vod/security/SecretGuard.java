@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -16,7 +17,8 @@ import java.util.Locale;
  * VOD_ADMIN_JWT_SECRET（Phase 5 管理端 JWT）。
  *
  * <p>VOD_ENV 不是 dev 时，任一密钥为空、等于 dev 或短于 vod.security.min-secret-length 就抛异常，Spring 上下文起不来；
- * dev 下只打警告，VOD_PLAY_TOKEN_SECRET / VOD_ADMIN_JWT_SECRET 为空时退回 dev，保证本地一条命令能起栈。日志只写变量名，不写值。
+ * dev 下只打警告，VOD_PLAY_TOKEN_SECRET 为空时退回 dev，保证本地一条命令能起栈；VOD_ADMIN_JWT_SECRET 为空时每次启动随机生成
+ * （不退回固定值，否则谁都能伪造管理 token；代价是重启后旧管理 token 失效）。日志只写变量名，不写值。
  */
 @Component
 public class SecretGuard {
@@ -60,8 +62,16 @@ public class SecretGuard {
         if (adminJwtSecret != null && !adminJwtSecret.isBlank()) {
             this.adminJwtSecret = adminJwtSecret.getBytes(StandardCharsets.UTF_8);
         } else {
-            this.adminJwtSecret = dev ? DEV_FALLBACK.getBytes(StandardCharsets.UTF_8) : null;
+            this.adminJwtSecret = dev ? randomAdminSecret() : null;
         }
+    }
+
+    /** dev 下未配置管理 JWT 密钥：32 字节随机数，只存在于本进程内存。 */
+    private static byte[] randomAdminSecret() {
+        byte[] secret = new byte[32];
+        new SecureRandom().nextBytes(secret);
+        log.warn("VOD_ADMIN_JWT_SECRET not set; generated a random one for this process (VOD_ENV=dev), admin tokens will not survive a restart");
+        return secret;
     }
 
     public static boolean isDev(String env) {

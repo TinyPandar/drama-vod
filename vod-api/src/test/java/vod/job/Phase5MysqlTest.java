@@ -105,6 +105,39 @@ class Phase5MysqlTest {
     }
 
     @Test
+    void concurrentRetranscodesWithDifferentTemplatesOnSameAssetOnlyOneWins() throws Exception {
+        jdbc.update("UPDATE vod_tenant SET max_concurrent_jobs = NULL");
+        jdbc.update("DELETE FROM vod_transcode_template WHERE tenant_id = 1");
+        jdbc.update("INSERT INTO vod_transcode_template(tenant_id, name, ladder_json, audio_kbps) VALUES (1, 'mobile', '[[\"360p\",360,500]]', 64)");
+        var pool = Executors.newFixedThreadPool(2);
+        var go = new CountDownLatch(1);
+        try {
+            List<Future<Integer>> results = new ArrayList<>();
+            for (String body : List.of("{\"template\":\"ladder_v1\"}", "{\"template\":\"mobile\"}")) {
+                results.add(pool.submit(() -> {
+                    go.await(5, TimeUnit.SECONDS);
+                    return mvc.perform(post("/api/v1/assets/5/transcodes").header("X-Api-Key", "my-a")
+                            .contentType("application/json").content(body)).andReturn().getResponse().getStatus();
+                }));
+            }
+            go.countDown();
+            List<Integer> codes = new ArrayList<>();
+            for (var f : results) codes.add(f.get(20, TimeUnit.SECONDS));
+            codes.sort(Integer::compare);
+            assertEquals(List.of(202, 409), codes, "one in-flight transcode per asset, whatever the template");
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_transcode_job WHERE asset_id = 5 AND status = 'PENDING'", Integer.class));
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_outbox", Integer.class));
+        // 进行中的那个结束前，另一个模板仍然 409
+        String pending = jdbc.queryForObject("SELECT profile FROM vod_transcode_job WHERE asset_id = 5 AND status = 'PENDING'", String.class);
+        String other = "ladder_v1".equals(pending) ? "mobile" : "ladder_v1";
+        mvc.perform(post("/api/v1/assets/5/transcodes").header("X-Api-Key", "my-a").contentType("application/json")
+                .content("{\"template\":\"" + other + "\"}")).andExpect(status().isConflict());
+    }
+
+    @Test
     void retranscodeIdempotencyEventsDeliveryAndUsageOnMysql() throws Exception {
         jdbc.update("UPDATE vod_tenant SET max_concurrent_jobs = NULL");
         mvc.perform(post("/api/v1/assets/5/transcodes").header("X-Api-Key", "my-a").header("Idempotency-Key", "k1"))

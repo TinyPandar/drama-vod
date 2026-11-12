@@ -148,7 +148,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 | 名称（环境变量） | 默认 | 含义 |
 |---|---|---|
-| `VOD_ADMIN_JWT_SECRET` | 空（dev 退回 `dev`） | 管理 JWT 的 HMAC 密钥，非 dev 必填 |
+| `VOD_ADMIN_JWT_SECRET` | 空（dev 下每次启动随机生成） | 管理 JWT 的 HMAC 密钥，非 dev 必填 |
 | `VOD_ADMIN_JWT_TTL_SECONDS` / `VOD_ADMIN_JWT_LEEWAY_SECONDS` | 3600 / 30 | token 有效期 / 时钟偏差容忍 |
 | `VOD_ADMIN_USERNAME` / `VOD_ADMIN_PASSWORD` | 空 | 开发用管理员种子（都设置时才建号；非 dev 下口令短于最小长度不建） |
 | `VOD_ADMIN_MAX_KEY_TTL_SECONDS` | 0 | 新 key 的最长有效期，0 = 允许不过期 |

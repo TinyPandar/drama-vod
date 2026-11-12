@@ -128,6 +128,8 @@ class TranscodeApiTest {
         mvc.perform(post("/api/v1/assets/" + ids[0] + "/transcodes").header("X-Api-Key", "key-a")).andExpect(status().isAccepted())
                 .andExpect(jsonPath("$.claim_version").value(4));
         assertEquals("UPLOADED", jdbc.queryForObject("SELECT status FROM vod_media_asset WHERE id = ?", String.class, ids[0]));
+        // 默认模板的任务先结束（进行中时换模板也是 409，见 activeJobOfAnyTemplateBlocksRetranscode）
+        jdbc.update("UPDATE vod_transcode_job SET status = 'SUCCEEDED' WHERE id = ?", ids[1]);
         // 租户模板：新的 profile 一行任务，带 template_id；别的租户看不到这个模板
         jdbc.update("INSERT INTO vod_transcode_template(tenant_id, name, ladder_json, audio_kbps) VALUES (1, 'mobile', '[[\"360p\",360,500]]', 64)");
         JsonNode created = body(mvc.perform(post("/api/v1/assets/" + ids[0] + "/transcodes").header("X-Api-Key", "key-a")
@@ -137,6 +139,47 @@ class TranscodeApiTest {
         long[] b = uploaded("key-b");
         mvc.perform(post("/api/v1/assets/" + b[0] + "/transcodes").header("X-Api-Key", "key-b")
                 .contentType("application/json").content("{\"template\":\"mobile\"}")).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void activeJobOfAnyTemplateBlocksRetranscode() throws Exception {
+        jdbc.update("INSERT INTO vod_transcode_template(tenant_id, name, ladder_json, audio_kbps) VALUES (1, 'mobile', '[[\"360p\",360,500]]', 64)");
+        long[] ids = uploaded("key-a");
+        long assetId = ids[0], ladderJob = ids[1];
+        String mobile = "{\"template\":\"mobile\"}";
+        // 默认模板的任务还在 PENDING/RETRYING/RUNNING：换个模板也 409，不新建行、不写 outbox、不记用量
+        int outboxBefore = count("vod_outbox");
+        for (String active : List.of("PENDING", "RETRYING", "RUNNING")) {
+            jdbc.update("UPDATE vod_transcode_job SET status = ? WHERE id = ?", active, ladderJob);
+            mvc.perform(post("/api/v1/assets/" + assetId + "/transcodes").header("X-Api-Key", "key-a")
+                            .contentType("application/json").content(mobile))
+                    .andExpect(status().isConflict())
+                    .andExpect(jsonPath("$.detail").value(org.hamcrest.Matchers.containsString(active)));
+        }
+        assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_transcode_job WHERE asset_id = ?", Integer.class, assetId));
+        assertEquals(outboxBefore, count("vod_outbox"));
+        // 带 Idempotency-Key 的 409 不留下可重放的结果：任务结束后同一个 key 能正常建任务
+        mvc.perform(post("/api/v1/assets/" + assetId + "/transcodes").header("X-Api-Key", "key-a").header("Idempotency-Key", "m-1")
+                .contentType("application/json").content(mobile)).andExpect(status().isConflict());
+        // 默认模板的任务结束后，mobile 可以建；此时 mobile 进行中，反过来重新转码默认模板也 409
+        jdbc.update("UPDATE vod_transcode_job SET status = 'SUCCEEDED' WHERE id = ?", ladderJob);
+        JsonNode created = body(mvc.perform(post("/api/v1/assets/" + assetId + "/transcodes").header("X-Api-Key", "key-a")
+                .header("Idempotency-Key", "m-1").contentType("application/json").content(mobile)).andExpect(status().isAccepted()));
+        long mobileJob = created.get("id").asLong();
+        assertEquals("mobile", created.get("profile").asText());
+        int claimBefore = jdbc.queryForObject("SELECT claim_version FROM vod_transcode_job WHERE id = ?", Integer.class, ladderJob);
+        mvc.perform(post("/api/v1/assets/" + assetId + "/transcodes").header("X-Api-Key", "key-a")).andExpect(status().isConflict());
+        assertEquals("SUCCEEDED", jdbc.queryForObject("SELECT status FROM vod_transcode_job WHERE id = ?", String.class, ladderJob));
+        assertEquals(claimBefore, jdbc.queryForObject("SELECT claim_version FROM vod_transcode_job WHERE id = ?", Integer.class, ladderJob));
+        // 两个都是终态：哪个模板都可以重新转码
+        jdbc.update("UPDATE vod_transcode_job SET status = 'CANCELLED' WHERE id = ?", mobileJob);
+        mvc.perform(post("/api/v1/assets/" + assetId + "/transcodes").header("X-Api-Key", "key-a")).andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.id").value(ladderJob));
+        // 别的资产不受影响
+        long[] other = uploaded("key-a");
+        jdbc.update("UPDATE vod_transcode_job SET status = 'SUCCEEDED' WHERE id = ?", other[1]);
+        mvc.perform(post("/api/v1/assets/" + other[0] + "/transcodes").header("X-Api-Key", "key-a")
+                .contentType("application/json").content(mobile)).andExpect(status().isAccepted());
     }
 
     @Test

@@ -91,7 +91,7 @@ public class V1Controller {
 
     /**
      * Phase 5：按模板发起转码 / 重新转码。body 可选 {"template": "模板名"}，缺省用默认模板 ladder_v1。scope asset。
-     * 202 + 任务详情；同一 (资产, 模板) 的任务还在 PENDING/RETRYING/RUNNING 时 409；终态任务复用同一行，claim_version+1。
+     * 202 + 任务详情；同一资产有任一任务（任意模板）还在 PENDING/RETRYING/RUNNING 时 409；终态任务复用同一行，claim_version+1。
      * 支持 Idempotency-Key（重放返回 200 + 同一任务，idempotent_replay=true）。
      */
     @PostMapping("/api/v1/assets/{assetId}/transcodes")

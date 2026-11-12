@@ -4,10 +4,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -40,6 +42,36 @@ class SecretGuardTest {
     }
 
     @Test
+    void devGeneratesRandomAdminJwtSecretWhenMissing() {
+        for (String missing : new String[]{null, "", "  "}) {
+            var a = new SecretGuard("dev", STRONG, STRONG2, missing, 32);
+            var b = new SecretGuard("dev", STRONG, STRONG2, missing, 32);
+            assertEquals(32, a.adminJwtSecret().length);
+            assertFalse(Arrays.equals("dev".getBytes(StandardCharsets.UTF_8), a.adminJwtSecret()), "never fall back to 'dev'");
+            assertFalse(Arrays.equals(a.adminJwtSecret(), b.adminJwtSecret()), "random per process");
+            assertArrayEquals(a.adminJwtSecret(), a.adminJwtSecret(), "stable within one process");
+        }
+        // 显式配置的仍原样使用（dev 下弱值只告警）
+        assertArrayEquals(STRONG.getBytes(StandardCharsets.UTF_8), new SecretGuard("dev", STRONG, STRONG2, STRONG, 32).adminJwtSecret());
+    }
+
+    @Test
+    void nonDevStillRefusesWeakAdminJwtSecret() {
+        for (String weak : new String[]{null, "", "dev", "DEV", "short"}) {
+            var e = assertThrows(IllegalStateException.class, () -> new SecretGuard("prod", STRONG, STRONG2, weak, 32), String.valueOf(weak));
+            assertTrue(e.getMessage().contains("VOD_ADMIN_JWT_SECRET"));
+            assertFalse(e.getMessage().contains("HLS_SECRET"));
+        }
+        assertArrayEquals(STRONG.toUpperCase().getBytes(StandardCharsets.UTF_8),
+                new SecretGuard("prod", STRONG, STRONG2, STRONG.toUpperCase(), 32).adminJwtSecret());
+        var runner = new ApplicationContextRunner().withUserConfiguration(SecretGuard.class);
+        runner.withPropertyValues("vod.env=prod", "vod.hls-secret=" + STRONG, "vod.play-token-secret=" + STRONG2)
+                .run(ctx -> assertThat(ctx).hasFailed());
+        runner.withPropertyValues("vod.env=prod", "vod.hls-secret=" + STRONG, "vod.play-token-secret=" + STRONG2, "vod.admin.jwt-secret=dev")
+                .run(ctx -> assertThat(ctx).hasFailed());
+    }
+
+    @Test
     void springContextFailsToStartWithWeakSecretsOutsideDev() {
         var runner = new ApplicationContextRunner().withUserConfiguration(SecretGuard.class);
         runner.withPropertyValues("vod.env=prod", "vod.hls-secret=dev", "vod.play-token-secret=" + STRONG)
@@ -49,6 +81,11 @@ class SecretGuardTest {
                         "vod.admin.jwt-secret=" + STRONG.toUpperCase())
                 .run(ctx -> assertThat(ctx).hasNotFailed());
         runner.withPropertyValues("vod.env=dev", "vod.hls-secret=", "vod.play-token-secret=")
-                .run(ctx -> assertThat(ctx).hasNotFailed());
+                .run(ctx -> {
+                    assertThat(ctx).hasNotFailed();
+                    byte[] admin = ctx.getBean(SecretGuard.class).adminJwtSecret();
+                    assertEquals(32, admin.length);
+                    assertFalse(Arrays.equals("dev".getBytes(StandardCharsets.UTF_8), admin));
+                });
     }
 }

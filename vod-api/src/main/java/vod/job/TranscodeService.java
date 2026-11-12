@@ -74,8 +74,17 @@ public class TranscodeService {
         if ("UPLOADING".equals(assetStatus) || assets.get(0)[2] == null) {
             throw new UploadService.ConflictException("asset source is not uploaded yet");
         }
-        var jobs = jdbc.query("SELECT id, status FROM vod_transcode_job WHERE asset_id = ? AND profile = ? FOR UPDATE",
-                (rs, n) -> new Object[]{rs.getLong(1), rs.getString(2)}, assetId, template.name());
+        // 锁住这个资产的全部任务行（任意模板）：同一资产同一时间只允许一个进行中的转码，不只按 (资产, 模板) 拦。
+        // 同租户的建任务事务已被 lockTenant 串行；MySQL 下按 asset_id 的 next-key 锁也挡住并发插入。
+        var all = jdbc.query("SELECT id, status, profile FROM vod_transcode_job WHERE asset_id = ? ORDER BY id FOR UPDATE",
+                (rs, n) -> new Object[]{rs.getLong(1), rs.getString(2), rs.getString(3)}, assetId);
+        for (Object[] other : all) {
+            if (ACTIVE.contains((String) other[1])) {
+                throw new UploadService.ConflictException("job " + other[0] + " (template " + other[2] + ") of this asset is "
+                        + other[1] + ", wait for it to finish or cancel it");
+            }
+        }
+        var jobs = all.stream().filter(j -> template.name().equals(j[2])).toList();
         long jobId;
         if (jobs.isEmpty()) {
             quotas.check(tenantId);
@@ -88,7 +97,6 @@ public class TranscodeService {
         } else {
             jobId = (Long) jobs.get(0)[0];
             String status = (String) jobs.get(0)[1];
-            if (ACTIVE.contains(status)) throw new UploadService.ConflictException("job is " + status + ", wait for it to finish or cancel it");
             if (!TERMINAL.contains(status)) throw new UploadService.ConflictException("job is " + status);
             quotas.check(tenantId);
             reset(jobId, status, template.id());

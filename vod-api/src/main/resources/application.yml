@@ -51,7 +51,7 @@ vod:
     default-max-daily-transcodes: ${VOD_QUOTA_DEFAULT_MAX_DAILY_TRANSCODES:0}
   # ---- Phase 5 平台化控制台（默认值都只是开发默认，不是基准或承诺）----
   admin:
-    # 管理端 JWT 的 HMAC 密钥；非 dev 下为空、等于 dev 或过短拒绝启动（SecretGuard），dev 下为空退回 dev。
+    # 管理端 JWT 的 HMAC 密钥；非 dev 下为空、等于 dev 或过短拒绝启动（SecretGuard），dev 下为空时每次启动随机生成。
     jwt-secret: ${VOD_ADMIN_JWT_SECRET:}
     jwt-ttl-seconds: ${VOD_ADMIN_JWT_TTL_SECONDS:3600}
     jwt-leeway-seconds: ${VOD_ADMIN_JWT_LEEWAY_SECONDS:30}

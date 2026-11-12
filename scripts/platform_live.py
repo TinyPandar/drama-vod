@@ -187,8 +187,11 @@ def main():
     admin = js(resp).get("token", "")
     check("管理登录拿到 vadm1. token", resp[0] == 200 and admin.startswith("vadm1."), resp[0])
     check("错误口令 401", http("POST", "/api/v1/admin/login", {"username": user, "password": password + "x"})[0] == 401)
-    jwt_secret = dotenv("VOD_ADMIN_JWT_SECRET") or "dev"  # dev 下为空时服务端退回 dev
-    check("过期的管理 JWT 401", http("GET", "/api/v1/admin/tenants", token=forge_admin_token(jwt_secret, -60))[0] == 401)
+    jwt_secret = dotenv("VOD_ADMIN_JWT_SECRET")
+    if jwt_secret:
+        check("过期的管理 JWT 401", http("GET", "/api/v1/admin/tenants", token=forge_admin_token(jwt_secret, -60))[0] == 401)
+    else:  # dev 下未配置时服务端每次启动随机生成，脚本拿不到，没法用真密钥签一个过期 token
+        print("SKIP 过期的管理 JWT 401  (未配置 VOD_ADMIN_JWT_SECRET)", flush=True)
     check("用别的密钥伪造的管理 JWT 401",
           http("GET", "/api/v1/admin/tenants", token=forge_admin_token(uuid.uuid4().hex * 2, 600))[0] == 401)
     check("没有前缀的裸 JWT 401", http("GET", "/api/v1/admin/tenants", token=admin[len("vadm1."):])[0] == 401)

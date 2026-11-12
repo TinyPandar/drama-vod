@@ -81,7 +81,7 @@ Core 只应理解媒体资产。`drama`、`episode`、`user_unlock`、`episode_p
 
 | 接口 | 必须保持 |
 |---|---|
-| `POST /api/v1/assets/{id}/transcodes` | scope `asset`。body 可选 `{"template": 名称}`，缺省用 `ladder_v1`。资产不存在、属于别的租户、模板不可见：**404**。源文件还没上传完：**409**。同一 `(资产, 模板)` 的任务处于 `PENDING`/`RETRYING`/`RUNNING`：**409**，不新建行。处于 `SUCCEEDED`/`FAILED`/`CANCELLED`：**复用同一行**，改回 `PENDING`、`claim_version`+1，返回 **202** 和任务详情。 |
+| `POST /api/v1/assets/{id}/transcodes` | scope `asset`。body 可选 `{"template": 名称}`，缺省用 `ladder_v1`。资产不存在、属于别的租户、模板不可见：**404**。源文件还没上传完：**409**。同一资产有任一任务（**任意模板**）处于 `PENDING`/`RETRYING`/`RUNNING`：**409**，不新建行也不复用。处于 `SUCCEEDED`/`FAILED`/`CANCELLED`：**复用同一行**，改回 `PENDING`、`claim_version`+1，返回 **202** 和任务详情。 |
 | `POST /api/v1/jobs/{id}/retry` | scope `job`。跨租户或不存在：**404**。只接受 `FAILED`；`CANCELLED` 是否也接受由 `vod.jobs.retry-allow-cancelled` 决定（默认接受）；其他状态 **409**。重置规则与 `scripts/dlq.py replay` 相同，以数据库为准。成功 **202**。 |
 | 上面两个接口的 `Idempotency-Key` | 同一租户、同一接口、同一 key、同一目标的重放：**200**、同一任务、`idempotent_replay: true`，不再写 outbox。同一 key 换了目标：**409**。key 的有效期是配置项。 |
 | 限流 | 租户接口按租户限流，管理登录按客户端 IP 限流。超限：**429**，带 `Retry-After`，body 里 `code: "rate_limited"`。 |
