@@ -66,7 +66,7 @@ class RateLimitTest {
 
     @Test
     void bucketRefillsAndRedisFailureFallsBackToMemory() throws Exception {
-        var limiter = new RateLimiter(new SimpleMeterRegistry(), true, "redis://127.0.0.1:1", 50, 1000, 1, 1, 1, 1, 1);
+        var limiter = new RateLimiter(new SimpleMeterRegistry(), true, "redis://127.0.0.1:1", 50, 1, 1, 1, 1, 1, 1);
         assertTrue(limiter.tryAcquire("tenant", "1").allowed());
         var denied = limiter.tryAcquire("tenant", "1");
         assertFalse(denied.allowed());
