@@ -502,6 +502,10 @@ docker compose --profile obs up -d prometheus
 
 ## 检查
 
+[![CI](https://github.com/TinyPandar/drama-vod/actions/workflows/ci.yml/badge.svg)](https://github.com/TinyPandar/drama-vod/actions/workflows/ci.yml)
+
+CI（`.github/workflows/ci.yml`）在 push 到任意分支、向 `main` 提 PR 时自动跑，三个 job 并行：`vod-api` 用 `mysql:8.4` 服务容器跑 `mvn -B test`（H2 用例和 `MysqlSemanticsTest`、`Phase5MysqlTest` 一起跑，MySQL 用例缺失或被跳过算失败）；`python` 跑 `contract_check.py` 和全部 `scripts/test_*.py`（`test_fencing_mysql.py` 连服务容器，任何脚本非零退出或出现 skipped 算失败）；`console` 跑 `npm ci && npm run build`，并检查提交的 `nginx/html/vod-console/` 产物没过期。CI **不跑**需要整套 Compose 的脚本（`e2e.py`、`*_live.py`、`fault_inject.py`、`kill_recover_submit.py`、`browser_check.py`、`nginx_local_check.py`），也不发布、不部署、不用 secrets。
+
 ```bash
 python scripts/contract_check.py
 python scripts/test_bridge.py
