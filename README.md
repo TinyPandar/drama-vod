@@ -6,6 +6,83 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 路线图见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)，旧接口兼容约定见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
 
+## 分支方案：Phase 6 高级媒体能力（第一刀）
+
+本分支：`plan/phase-6`，基线 `main` = `248b6e3`（Phase 5 已合并）。下面是本分支方案。实现完成后，把实现说明写在本节后面，不要改方案原文。
+
+协作方式：其他 agent 请在**本分支**上按下面清单做最小改动开发；不要自行合并到 `main`，也不要另开平行分支。开发完后由「短剧视频服务器开发bot」检查，没问题再合并。
+
+对照文档：[路线图](docs/panda-vod-roadmap.html) 第 06 节（`POST /uploads` 可返回预签名 URL **或 multipart 信息**）、第 05 节（MinIO 上还有缩略图这类对象）、第 09 节 Phase 6、第 11 节「对象存储直传：预签名上传、校验、Multipart 扩展」。目标：**大文件能断点续传，转码成功后资产有可展示的封面**。Phase 6 在路线图里是长期迭代，本分支只做第一刀，其余明确留到后续。
+
+### 现状（不要推倒重来）
+
+- 上传：`POST /api/v1/uploads` 只签发单次 `put_url`（`ObjectStorage.presignPut`），完整文件一次 PUT 到源桶；`POST /uploads/{id}/complete` 再 HEAD 校验大小、MIME、扩展名和配额，然后同一事务里建任务和 outbox。会话有 TTL（默认 900 秒），过期 complete / 重放会 409；没有 abort 接口，也没有清理未完成分片的后台任务。Nginx 上传网关 `client_max_body_size` 是 5g，小文件这条路径要继续能用。
+- 存储接口：`ObjectStorage` 目前只有 `head` 和 `presignPut`。实现有 `S3ObjectStorage`（预签名用公网地址，HEAD 用内网地址）、测试用 `MemoryStorage`、未配置时的 `UnavailableStorage`。改接口时这三个都要跟上。
+- 封面：资产已有 `duration_ms` / `width` / `height`（Worker 成功事务里用 ffprobe 结果写入），没有海报字段。控制台资产列表和详情也不展示封面。
+- 播放路径：Core 产物在 `assets/v1/{asset_id}/{job_id}-{claim_version}/`，签名 URL 是 `/hls/v1/{sig}/{exp}/{asset}/{gen}/{file}`，`file` 已允许 `poster.jpg` 这种名字；缓存键带 gen，前缀一换就不会命中旧封面。Worker 上传后会按本地清单 list 远端（名字、大小、无多余对象），不一致就 `STORAGE_ERROR` 重试——**封面如果生成了，必须进这份清单**。
+- 成功事务、`claim_version` 围栏、`hls_prefix` 原子切换、旧前缀 GC，都按 Phase 4 的规则走，本分支不要另做一套切换。
+
+### 要做的事
+
+1. **存储层补上 Multipart**
+   在 `ObjectStorage` 增加：创建分片上传、给指定 part 签发预签名 URL、列出已上传分片、完成分片上传、取消分片上传。`S3ObjectStorage` 走 MinIO / S3 的标准 API（创建和完成走内网客户端，分片预签名走公网 presigner，和现在的 PUT 分工一致）。`MemoryStorage` 做成可测的内存实现（能完成、能取消、能列出 etag）；`UnavailableStorage` 继续抛未配置。不要引入第二家云厂商 SDK。
+
+2. **上传会话支持 `mode=multipart`，单次 PUT 保持默认**
+   `POST /api/v1/uploads` 增加可选字段 `mode`：缺省或 `put` 时响应与现在完全兼容（仍返回 `put_url`）。`mode=multipart` 时进入分片会话：在源桶创建 S3 multipart，把 `upload_id`（S3 的 id）和 mode 记到 `vod_upload_session`（Flyway **V13**，只追加列，不要改 V1–V12）。响应返回 `session_id`、`asset_id`、`part_size_bytes`、`expires_at`，**不要**返回 `put_url`。对象键规则仍是 `raw/t{tenant}/{asset}/source.{ext}`。Idempotency-Key 语义与现在相同：同一租户同一 key，OPEN 未过期就重放原会话（multipart 重放不要再 create 一次 S3 上传）；已 COMPLETED 不再签发上传 URL。`part_size_bytes` 做成配置项，默认不得小于 S3 要求的 5 MiB（最后一块可以更小）。会话 TTL 继续可配；multipart 文件可能较慢，允许在 OPEN 且未过期时通过下面的分片接口重新签发 URL，但不要在无上限地续期——如需延长，用配置项设一个上限，并在 README 写清。
+
+3. **分片签发、完成、取消**
+   - `POST /api/v1/uploads/{id}/parts`（或等价清晰的路径）：对仍 OPEN、未过期、且属于本租户的 multipart 会话，为请求里的 part 号列表签发预签名 URL。跨租户或会话不存在按现有规则 404；`put` 模式的会话来调返回 409；过期 409。
+   - `GET /api/v1/uploads/{id}/parts`：列出存储里已经上传成功的 part 及 etag，供断点续传。客户端用这份列表跳过已传分片，再向 POST 要缺失 part 的 URL。
+   - `POST /api/v1/uploads/{id}/complete`：`put` 模式保持现有行为（先 HEAD 再校验再建任务）。multipart 模式必须先用客户端上报的 `{part_number, etag}` 在存储侧 `completeMultipart`，成功后再走现有 HEAD + `UploadPolicy` + 配额 + 建任务/outbox 这条事务；S3 还没组合完就不要建任务。分片 etag 对不上、缺 part、或 completeMultipart 失败，返回 4xx，会话仍是 OPEN，允许重试 complete，不要把源对象留在半组合状态还去转码。Multipart 完成后的对象 ETag 一般不是整个文件的 MD5，SHA-256 也可能没有：校验继续以 HEAD 的 size、content-type、扩展名、配额为准，不要因为缺 checksum 就 422。
+   - 新增 `POST /api/v1/uploads/{id}/abort`：本租户 OPEN 会话可取消；multipart 还要在存储侧 abort，避免 MinIO 留下未完成分片。已 COMPLETED 的会话返回 409，禁止取消以免动到已经在转码的源文件。取消后会话记 `ABORTED`。资产若仍是 `UPLOADING`，按现有上传生命周期的处理方式收尾（不要误删别的资产的源对象）。
+
+4. **过期会话清理未完成的分片上传**
+   增加一个后台清理（间隔可配）：找出已过期仍为 OPEN 的 multipart 会话，abort 存储侧上传，会话打成 `ABORTED`。只处理过期 OPEN，不要碰 COMPLETED，也不要删除已经 HEAD 校验过的源对象。`put` 模式过期会话如果源桶里留下了未 complete 的对象，本分支可以一并删未引用的源对象，但必须先确认会话未完成、资产仍是 `UPLOADING`、对象键与会话一致；吃不准就只做 multipart abort，把 `put` 残留写成风险。清理要可多实例跑（条件更新领取），失败只打日志并下次再试。
+
+5. **转码成功时在同一产物前缀里写出封面**
+   Core Worker 在 HLS 产物之外，用 FFmpeg 参数数组（不拼 shell）从源视频抽一帧 JPEG，上传到**当前任务专属前缀**下的固定名字，例如 `poster.jpg`。抽帧位置做成配置项（例如第 1 秒；比片长短则取 0 秒或中间一帧）。封面必须进入本地清单，并和 m3u8、ts 一起做远端 list 对账，过不了就按现有 `STORAGE_ERROR` 重试，不要单独提交一个没登记的对象。抽帧失败（无视频流、损坏帧等）**不要让整次转码失败**：任务仍可 READY，只是没有封面。旧 Demo 产物路径和 `content_key` 不要动。
+
+6. **成功事务登记封面，切换和 GC 复用现有前缀**
+   V13 给 `vod_media_asset` 增加可空的 `poster_key`（或等价字段）。Worker 成功事务里，在写 `hls_prefix` / `READY` / 前缀 `ACTIVE` 的**同一事务**里写入本期前缀下的封面键；没有封面就写 NULL。重新转码成功后，封面跟着新前缀走；旧封面留在旧前缀里，由现有 GC 删除，不要另写一套海报生命周期。不要把封面登记成会打乱 `uk_bucket_key` 或源对象角色的东西——HLS 分片本来也不逐条进 `vod_storage_object`，封面同样只挂在前缀和资产字段上即可。已 READY 的旧资产没有封面是正常的，需要重新转码才会生成。
+
+7. **资产查询和播放接口返回签名封面地址**
+   `GET /api/v1/assets`、`GET /api/v1/assets/{id}`，以及 `POST /api/v1/assets/{id}/playback-token`（和现有 `GET .../playback` 如仍返回播放信息），在有 `poster_key` 时返回 `poster_url`：用和该资产当前 `hls_prefix` 相同的签名规则签发，过期时间与播放 URL 同一套上限。没有封面时字段为 `null`，不要 500。跨租户仍然 404。`poster_url` 不要写进 Webhook 事件体（签名 URL 会过期）；若要通知，只允许在 `transcode.succeeded` 上**追加**可选字段比如 `has_poster`，不能改事件名，也不能带密钥或签名 URL。
+
+8. **控制台：大文件走分片，列表和详情能看到封面**
+   控制台上传：小文件可以继续单次 PUT（与默认 `mode=put` 兼容）；达到可配阈值（建议默认等于 `part_size_bytes`）时改走 multipart：按 part 上传、失败重试未完成的 part、最后 complete；提供取消。阈值和 part 大小不要写死在前端常量里，写进 open 接口的响应（例如 `part_size_bytes`），前端照着切。资产列表和详情用 `poster_url` 展示封面，没有则保持现在的占位。不要上新的大型 UI 库。构建产物仍提交到 `nginx/html/vod-console/`，规则与现在一致。
+
+9. **契约、配置与指标**
+   更新 `docs/phase-0-contract.md` 的 Core 上传与资产部分（旧 Demo 条目保持冻结原文）：写清 `mode`、分片接口、complete 对两种模式的差异、abort、过期清理、`poster_url` 与抽帧失败不阻断 READY。README 补接口、配置项（part 大小、会话 TTL 上限、抽帧位置、清理间隔）、以及若有新指标时的名字。指标用 Micrometer 即可，例如分片完成/取消、过期 abort 次数、抽帧成功/跳过；标签不要带 URL、租户或密钥。不要编造性能数字，默认值只是开发默认。
+
+10. **验收脚本与测试**
+    补 Java 测试：`put` 路径原有用例继续通过；multipart 覆盖创建、重放 Idempotency-Key、列出已传分片后续传、complete 后建任务、缺 part / etag 错误不建任务、abort 后存储侧取消、跨租户 404、put 会话调用分片接口 409、已 complete 禁止 abort。`MemoryStorage` 必须能支撑这些测试。有条件时用 MinIO（测试容器或已有栈）再跑一条真实分片上传。Worker 单测覆盖：封面进清单、抽帧失败仍能提交成功且 `poster_key` 为空、成功事务写入的 key 落在当期前缀。控制台构建后核对产物已提交。有 Docker 时用独立项目名（如 `drama-vod-p6`）起栈，跑现有 `e2e.py`、`platform_live.py`（旧能力回归），并新增或扩展脚本覆盖：multipart 上传后转码 READY、资产接口能拿到可访问的 `poster_url`、过期/取消后 MinIO 上没有残留的未完成分片。`playback_live.py` 因 Range 问题已知可能有一项失败，不要为了让它全过而在本分支改回源。
+
+**可选小项（不做不影响验收，做了单独说明）**：雪碧图 + WebVTT 的进度条预览；给已 READY 的资产单独重抽封面而不重转全部码率；multipart 会话在上限内自动续期。
+
+### 本分支不要做
+
+- 同一资产换模板可并行、dev 下管理 JWT 密钥退回固定 `dev`：这两条是 Phase 5 的返工，走单独分支，不要塞进来。
+- Phase 4 遗留的回源 `Content-Length` / 缓存命中 Range 206，以及 `fault_inject.py` 的 MinIO 默认时序、`.gitattributes` 固定 `*.envsh` 为 LF：继续走并行小分支。
+- 可选的 `WORKER_CANCEL_CHECK_SECONDS`。
+- 字幕 / 多音轨、CMAF / fMP4、H.265 / AV1、多对象存储适配、多 CDN、生命周期冷存储（例如改 storage class 或搬迁到低频桶）。这些是 Phase 6 的后续迭代，本分支不做。
+- 旧 Demo 播放链路、`content_key` 迁移、把 Demo 付费集改走加密 Core 资产、Core 加密资产的 iPhone 原生 HLS 改写列表。
+- 改 `uk_asset_profile`、改消息 v1、改 Flyway V1–V12、改 `api/common.py` 或 `worker/common.py` 的 `transcode_message()`。
+- KMS / 信封加密 / DRM、Webhook 密钥入库加密、回源密钥轮换、mTLS、CDN 刷新、Grafana、播放计数 `GETDEL` 丢增量。
+- 完整 RBAC、OAuth、短剧生成、推荐、直播推流。
+- 不要重写 Worker 转码流水线，不要换 MQ，不要改 Windows 或 `~/.claude/settings.json`，不要把密钥写进仓库。
+
+### 写方案时的判断
+
+- 第一刀选 Multipart 和封面，是因为路线图的 API 草案和「项目展示重点」已经写了「预签名上传 + Multipart 扩展」，封面又是控制台和短剧业务立刻用得上的；编码格式、多存储、多 CDN 会显著放大 Worker 和分发面，不适合和续传绑在一次合入里。
+- 单次 PUT 必须保持默认且行为兼容，避免现有控制台、脚本和测试一次性全改。
+- 封面必须放在任务专属前缀里，和 HLS 一起切换、一起 GC。不要写到固定的 `assets/v1/{asset}/poster.jpg`：那种路径的缓存键不带 gen，切封面会打到旧缓存，也会和「先切可播前缀再删旧产物」的规则打架。
+- complete 仍然是「先让对象在桶里完整存在，再 HEAD 校验，再在同一事务里建任务」。Multipart 只是把「怎么把字节凑成一个源对象」换了一种协议，不要绕过校验，也不要把分片信息塞进消息 v1。
+- 抽帧失败不阻断 READY：封面是增强，不是可播的前提；片头黑帧或极短素材不该让整集转码失败。
+
+### 测试要求（开发时）
+
+每个改动点补测试，并保证现有测试仍通过。有 Java 21 和 Maven 就跑 `cd vod-api && mvn test`（未设 `VOD_TEST_MYSQL_URL` 时 MySQL 用例按设计跳过；能连 MySQL 8.4 就设置后再跑一遍）。跑 `python3 scripts/contract_check.py`、`test_bridge.py`、`test_hls_verify.py`、`test_vod_client.py`、`test_worker_fencing.py`、`test_worker_reliability.py`、`test_dlq.py`、`test_output_gc.py`、`test_playback_contract.py`、`test_api_playback.py`、`test_transcode_template.py` 和新增单测。有 Docker 就用独立项目名起栈（如 `docker compose -p drama-vod-p6 up -d --build`，端口冲突时用 override），跑 `test_fencing_mysql.py`、`scripts/platform_live.py`、`scripts/e2e.py`（旧 Demo 回归）和本分支新增的验收脚本。没跑过的不要声称通过，写明原因。改完后在本分支提交（作者 `TinyPandar <meiyoujunlee@foxmail.com>`），可以 push 到 `origin/plan/phase-6`，但不要合并到 `main`。
+
 ## 分支方案：Phase 5 平台化控制台
 
 本分支：`plan/phase-5`，基线 `main` = `9cab039`（Phase 4 已合并）。下面先是方案原文，实现情况见紧接着的「Phase 5 实现说明」。
@@ -109,7 +186,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 
 
-## Phase 5 实现说明（`plan/phase-5`，未合并到 `main`）
+## Phase 5 实现说明（已合并到 `main`，`248b6e3`）
 
 旧 Demo 链路、消息 v1、`uk_asset_profile`、Flyway V1–V11、`mysql/init.sql` 都没动；新表结构在 `V12__platform_console.sql`（H2 MySQL 模式与 MySQL 8.4 都跑过）。
 
