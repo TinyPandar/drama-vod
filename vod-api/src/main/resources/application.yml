@@ -43,6 +43,22 @@ vod:
     # application/octet-stream 兼容不声明类型的客户端；binary/octet-stream 是 AWS S3 对未声明类型对象可能返回的值。
     # 要严格校验可从列表去掉。
     allowed-content-types: ${VOD_UPLOAD_ALLOWED_CONTENT_TYPES:video/mp4,video/quicktime,video/x-m4v,video/x-matroska,video/webm,application/octet-stream,binary/octet-stream}
+    # ---- Phase 6：Multipart（默认值只是开发默认，不是基准或承诺）----
+    # 分片大小（字节）。S3 要求除最后一块外每块不小于 5 MiB，低于 5 MiB 拒绝启动；max-object-bytes / 分片大小不能超过 10000 块。
+    part-size-bytes: ${VOD_UPLOAD_PART_SIZE_BYTES:8388608}
+    # 控制台按文件大小选 multipart 的阈值（字节），由 GET /api/v1/uploads/config 下发；0 表示等于 part-size-bytes。
+    multipart-threshold-bytes: ${VOD_UPLOAD_MULTIPART_THRESHOLD_BYTES:0}
+    # multipart 会话有效期（秒），从 open 起算，不续期；这就是分片会话的上限。不得超过 604800（7 天）。
+    multipart-session-ttl-seconds: ${VOD_UPLOAD_MULTIPART_SESSION_TTL_SECONDS:86400}
+    # 单个分片预签名 URL 的有效期（秒），同时不超过会话剩余时间；过期后在会话内重新 POST /parts 即可。
+    part-url-ttl-seconds: ${VOD_UPLOAD_PART_URL_TTL_SECONDS:900}
+    # 一次 POST /parts 最多签多少个 part。
+    max-parts-per-request: ${VOD_UPLOAD_MAX_PARTS_PER_REQUEST:100}
+    # 过期 multipart 会话清理：轮询间隔、每轮条数、领取时长（失败后过了领取时长再试）。
+    cleanup-interval-ms: ${VOD_UPLOAD_CLEANUP_INTERVAL_MS:60000}
+    cleanup-initial-delay-ms: ${VOD_UPLOAD_CLEANUP_INITIAL_DELAY_MS:30000}
+    cleanup-batch-size: ${VOD_UPLOAD_CLEANUP_BATCH_SIZE:50}
+    cleanup-claim-seconds: ${VOD_UPLOAD_CLEANUP_CLAIM_SECONDS:300}
   quota:
     # vod_tenant.storage_quota_bytes 为 NULL 时使用；0 表示不限制（当前默认不限制）。
     default-storage-bytes: ${VOD_QUOTA_DEFAULT_STORAGE_BYTES:0}

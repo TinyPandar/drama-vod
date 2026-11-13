@@ -18,4 +18,17 @@ class S3PresignTest {
             assertFalse(url.contains("/api/"));
         }
     }
+
+    @Test
+    void partUrlUsesPublicEndpointAndCarriesUploadIdAndPartNumber() {
+        try (var storage = new S3ObjectStorage(
+                "http://minio:9000", "http://localhost:9000", "minioadmin", "minioadmin123")) {
+            String url = storage.presignUploadPart("vod-source", "raw/t1/9/source.mp4", "abc-123", 7, 600);
+            assertTrue(url.startsWith("http://localhost:9000/vod-source/"), url);
+            assertTrue(url.contains("uploadId=abc-123"), url);
+            assertTrue(url.contains("partNumber=7"), url);
+            assertTrue(url.contains("X-Amz-Expires=600"), url);
+            assertFalse(url.contains("minio:9000"));
+        }
+    }
 }

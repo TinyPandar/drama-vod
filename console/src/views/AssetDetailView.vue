@@ -7,7 +7,7 @@ import { useAction } from "../useAction";
 
 type AssetDetail = {
   id: number; status: string; source_size: number; encrypted: boolean; hls_prefix: string | null;
-  duration_ms: number | null; width: number | null; height: number | null;
+  duration_ms: number | null; width: number | null; height: number | null; poster_url: string | null;
 };
 type Hls = { loadSource(url: string): void; attachMedia(v: HTMLVideoElement): void; destroy(): void };
 type HlsCtor = { new (cfg: object): Hls; isSupported(): boolean };
@@ -85,6 +85,10 @@ onMounted(() => run(load));
 onBeforeUnmount(() => hls?.destroy());
 </script>
 
+<style scoped>
+.poster { display: block; max-width: min(320px, 100%); max-height: 320px; border-radius: 8px; margin: 8px 0; background: #171512; }
+</style>
+
 <template>
   <p><RouterLink to="/assets">← 资产列表</RouterLink></p>
   <h1>资产 #{{ id }}</h1>
@@ -93,6 +97,8 @@ onBeforeUnmount(() => hls?.destroy());
     <p>状态 <strong>{{ asset.status }}</strong> · 源文件 {{ bytes(asset.source_size) }} · {{ asset.encrypted ? "加密" : "不加密" }}
       <template v-if="asset.width"> · {{ asset.width }}×{{ asset.height }} · {{ ((asset.duration_ms ?? 0) / 1000).toFixed(1) }}s</template></p>
     <p class="muted small mono">当前播放前缀：{{ asset.hls_prefix ?? "—" }}</p>
+    <img v-if="asset.poster_url" class="poster" :src="asset.poster_url" :alt="`资产 #${asset.id} 封面`" />
+    <p v-else class="muted small">暂无封面（Phase 6 之前转码的资产要重新转码才会生成；抽帧失败也不影响播放）</p>
     <div class="row">
       <button :disabled="busy || asset.status !== 'READY'" @click="play">申请播放 token 并试播</button>
       <button class="ghost" :disabled="busy" @click="run(load)">刷新</button>

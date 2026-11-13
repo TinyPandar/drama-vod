@@ -129,12 +129,15 @@ def renew_lease(c, origin, job_id, version, lease_seconds):
 
 
 def commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, width, height, renditions=(),
-                   episode_id=None):
+                   episode_id=None, poster_key=None):
     """成功事务的写入部分，调用方负责 begin/commit/rollback。
 
     先写带 claim_version 的任务 SUCCEEDED：影响 1 行才继续写资产 READY（Core 同时把 vod_output_prefix 切到本前缀）；这条 UPDATE 同时锁住任务行，
     并发的取消或新 claim 要等本事务结束，不会出现「任务被取消、资产却 READY」。
     返回 False 表示围栏已丢，调用方 rollback 后丢弃。
+
+    Phase 6：Core 的 poster_key 与 hls_prefix / READY / 前缀 ACTIVE 同一事务写入；必须落在本期前缀里，
+    否则当作没有封面写 NULL（重新转码没出封面时也会清掉旧值，旧封面随旧前缀由 GC 删除）。
     """
     table = job_table(origin)
     extra = ", error_code=NULL, next_attempt_at=NULL" + _core_touch(origin) if origin == "core" else ""
@@ -152,8 +155,10 @@ def commit_success(c, origin, job_id, version, asset_id, prefix, dur_ms, width, 
                   "WHERE id=%s", (prefix, dur_ms, width, height, asset_id))
         c.execute("UPDATE episode SET asset_id=%s, status='READY' WHERE id=%s", (asset_id, episode_id))
     else:
-        c.execute("UPDATE vod_media_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s "
-                  "WHERE id=%s", (prefix, dur_ms, width, height, asset_id))
+        if poster_key is not None and not (poster_key.startswith(prefix) and "/" not in poster_key[len(prefix):]):
+            poster_key = None
+        c.execute("UPDATE vod_media_asset SET status='READY', hls_prefix=%s, duration_ms=%s, width=%s, height=%s, "
+                  "poster_key=%s WHERE id=%s", (prefix, dur_ms, width, height, poster_key, asset_id))
         # 原子切换点就是这个事务：hls_prefix 与前缀状态一起提交，同资产别的前缀交给清理线程。
         # 自己的前缀已不是 WRITING（被判为垃圾、可能正在删）就放弃提交，调用方 rollback。
         if not output_prefix.activate(c, asset_id, prefix):

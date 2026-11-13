@@ -38,6 +38,16 @@ public final class HlsSigner {
                 + "/master.m3u8";
     }
 
+    /**
+     * Phase 6：同一个 gen 目录里的其他文件（如 poster.jpg）。签名与 master 相同（签的是整个 gen 目录），
+     * file 只能是 Nginx 带 gen 的 location 能匹配的单段名字。
+     */
+    public static String v1GenFileUrl(long expires, long assetId, String gen, String file, String secret) {
+        if (file == null || !file.matches("[A-Za-z0-9_.-]+") || file.contains("..")) throw new IllegalArgumentException("file");
+        return "/hls/v1/" + v1GenSignature(expires, assetId, gen, secret) + "/" + expires + "/" + assetId + "/" + gen
+                + "/" + file;
+    }
+
     private static String signRaw(String raw) {
         try {
             byte[] md5 = MessageDigest.getInstance("MD5").digest(raw.getBytes(StandardCharsets.UTF_8));

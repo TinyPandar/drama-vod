@@ -110,6 +110,22 @@ API Key 明文只在管理端创建、轮换的响应里出现一次，库里只
 
 **SSRF**：登记和每次投递都要先解析，再要求每个地址都是公网单播（IPv4 内网/保留段；IPv6 只收 `2000::/3` 且排除文档、Teredo、6to4；IPv4 映射与 NAT64 按内嵌 IPv4 判断）。然后连接到这次检查过的 IP，用原主机名做 SNI、证书校验和 `Host`，不按主机名重新解析。dev 开关 `vod.webhook.dev-allow-http`、`dev-allow-private-hosts` 只在 `VOD_ENV=dev` 生效，非 dev 下设置会拒绝启动。
 
+### Core 上传与资产（Phase 6 新增，上面的冻结与 Demo 条目不变）
+
+租户接口，scope `upload`（资产接口 scope `asset`）。跨租户或不存在一律 **404**。
+
+| 接口 | 必须保持 |
+|---|---|
+| `POST /api/v1/uploads` | body 可选 `mode`：缺省或 `"put"` 时响应字段与 Phase 2 完全相同（`session_id`、`asset_id`、`put_url`、`expires_in`、`expires_at`），不多不少。`"multipart"`：在源桶创建 S3 multipart，响应 `session_id`、`asset_id`、`mode: "multipart"`、`part_size_bytes`、`max_parts`、`expires_in`、`expires_at`，**没有** `put_url`。其他值 **400**。可选 `content_type`（只对 multipart 生效，必须在允许列表里，否则 **415**；缺省按扩展名推）。对象键仍是 `raw/t{tenant}/{asset}/source.{ext}`。`Idempotency-Key`：同一租户同一 key、OPEN 未过期时按**原会话的方式**重放（multipart 不会再建一次存储侧上传，与本次请求的 `mode` 无关）；已 COMPLETED / ABORTED 只返回会话信息，不签任何上传地址；OPEN 已过期 **409**。multipart 会话有效期单独配置，从 open 起算、不续期。 |
+| `GET /api/v1/uploads/config` | `part_size_bytes`、`multipart_threshold_bytes`（客户端达到它就走 multipart）、`max_parts`、`max_parts_per_request`、`max_object_bytes`（`null` = 不限）、两种会话的有效期。客户端按它切片，不写死。 |
+| `POST /api/v1/uploads/{id}/parts` | body `{"part_numbers":[1,2,…]}`（1..10000，去重排序，单次不超过 `max_parts_per_request`，否则 **400**）。返回 `parts:[{part_number,url}]`、`expires_in`（不超过会话剩余时间）、`session_expires_at`。put 会话 **409**；非 OPEN 或已过期 **409**。会话内可以重复签（URL 过期后重签同一 part）。 |
+| `GET /api/v1/uploads/{id}/parts` | 存储侧已收到的分片 `parts:[{part_number,etag,size}]` 与 `part_size_bytes`，用于断点续传。状态规则同上。 |
+| `POST /api/v1/uploads/{id}/complete` | put 会话：行为不变（先 HEAD 再校验再建任务）。multipart 会话：body 必须带 `{"parts":[{"part_number","etag"}]}`（缺失 **400**），**先**在存储侧组合，成功后**再**走同一条 HEAD + 大小/MIME/扩展名 + 配额 + 建任务/outbox 事务。etag 对不上、缺 part、顺序不对、非末块小于 5 MiB：**400**，会话保持 OPEN、不建任务，可改正后重试。上一次已组合但建任务失败（如配额）时重试：存储侧 upload 已不存在、桶里已有对象，继续 HEAD 校验；会话此时即使已过期（仍 OPEN）也照此继续，不返回 409。没组合过的过期会话仍 **409**。存储不可用 **503**。multipart 对象的 ETag 不是整文件 MD5，也可能没有 SHA-256：不因缺 checksum 拒绝。已建过任务时重复调用返回同一任务。分片信息不进消息 v1。 |
+| `POST /api/v1/uploads/{id}/abort` | OPEN 会话（含已过期的）可取消：multipart 先在存储侧 abort，再记 `ABORTED`；重复调用 **200**。已 COMPLETED **409**。存储不可用 **503**，会话保持 OPEN。资产保持 `UPLOADING`（没有源文件，不能转码），不删除任何对象。 |
+| 过期清理 | 后台按间隔领取（条件 UPDATE，可多实例）已过期仍 OPEN 的 **multipart** 会话：桶里已有目标对象（已组合、未建任务）就跳过、保持 OPEN 等客户端重试 complete；否则存储侧 abort 后记 `ABORTED`；失败只打日志，领取到期后再试。COMPLETED 不碰；put 会话不处理；不删除任何对象。 |
+| `poster_url` | `GET /api/v1/assets`（每行）、`GET /api/v1/assets/{id}`、`POST .../playback-token`、`GET .../playback` 都带 `poster_url`。只有封面键落在资产**当前** `hls_prefix`（带 gen 的任务专属前缀）里才签发，地址形如 `/hls/v1/{sig}/{exp}/{asset}/{gen}/poster.jpg`，签名与该 gen 的 `master.m3u8` 相同；playback-token / playback 与 `master_url` 同一个 `exp`，列表与详情用 `play-ttl-seconds`，都不超过 `token-ttl-max-seconds`。没有封面为 `null`，不报错。签名地址会过期，**不写进 Webhook 事件体**；事件名与 payload 不变。 |
+| 封面生成 | Worker 在 Core 转码成功时从源视频抽一帧 JPEG，写到当期前缀 `assets/v1/{asset}/{job}-{claim_version}/poster.jpg`，进本地清单并做远端 list 对账；`poster_key` 与 `hls_prefix` / `READY` / 前缀 `ACTIVE` 同一事务写入。抽帧失败不影响 `READY`，只是 `poster_key` 为 `NULL`。重新转码后封面跟新前缀走，旧封面随旧前缀由 GC 删除。旧 Demo 产物与 `content_key` 不变。 |
+
 ## 播放签名
 
 Nginx 和 API 必须用同一条算法。e2e 会改签名、改资产 id、改过期时间。

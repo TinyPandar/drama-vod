@@ -779,6 +779,52 @@ class Phase5Retranscode(Base):
         self.assertEqual(audio, 64)
 
 
+class Phase6Poster(Base):
+    """Phase 6：poster_key 与 hls_prefix / READY / 前缀 ACTIVE 同一事务写入；重转后跟着新前缀走，旧前缀进 GARBAGE；
+    围栏丢失时什么都不写；没有封面写 NULL。"""
+
+    def asset_cols(self, asset_id):
+        self.c.execute("SELECT status, hls_prefix, poster_key FROM vod_media_asset WHERE id=%s", (asset_id,))
+        return self.c.fetchone()
+
+    def succeed(self, job_id, asset_id, poster=True):
+        self.assertTrue(fencing.claim(self.c, "core", job_id, "w", 60))
+        v = self.job(job_id)["claim_version"]
+        self.assertEqual(fencing.mark_transcoding(self.conn, self.c, "core", asset_id, job_id, v), 1)
+        prefix = f"assets/v1/{asset_id}/{job_id}-{v}/"
+        output_prefix.insert_writing(self.c, asset_id, job_id, v, prefix)
+        self.conn.begin()
+        self.assertTrue(fencing.commit_success(self.c, "core", job_id, v, asset_id, prefix, 1000, 720, 1280,
+                                               poster_key=prefix + "poster.jpg" if poster else None))
+        self.conn.commit()
+        return prefix
+
+    def test_poster_follows_active_prefix(self):
+        job_id, asset_id = self.core_job()
+        p1 = self.succeed(job_id, asset_id)
+        self.assertEqual(self.asset_cols(asset_id), {"status": "READY", "hls_prefix": p1, "poster_key": p1 + "poster.jpg"})
+        self.c.execute(RESET_SQL, (None, job_id, "SUCCEEDED"))
+        p2 = self.succeed(job_id, asset_id)
+        self.assertEqual(self.asset_cols(asset_id)["poster_key"], p2 + "poster.jpg")
+        self.c.execute("SELECT prefix, status FROM vod_output_prefix WHERE asset_id=%s", (asset_id,))
+        self.assertEqual({r["prefix"]: r["status"] for r in self.c.fetchall()}, {p1: "GARBAGE", p2: "ACTIVE"})
+        # 第三次没出封面：写 NULL，不保留指向旧前缀（会被 GC）的键
+        self.c.execute(RESET_SQL, (None, job_id, "SUCCEEDED"))
+        p3 = self.succeed(job_id, asset_id, poster=False)
+        self.assertEqual(self.asset_cols(asset_id), {"status": "READY", "hls_prefix": p3, "poster_key": None})
+
+    def test_lost_fence_writes_no_poster(self):
+        job_id, asset_id = self.core_job()
+        self.assertTrue(fencing.claim(self.c, "core", job_id, "w", 60))
+        v = self.job(job_id)["claim_version"]
+        self.c.execute("UPDATE vod_transcode_job SET claim_version=claim_version+1 WHERE id=%s", (job_id,))
+        p = f"assets/v1/{asset_id}/{job_id}-{v}/"
+        self.conn.begin()
+        self.assertFalse(fencing.commit_success(self.c, "core", job_id, v, asset_id, p, 1, 2, 2, poster_key=p + "poster.jpg"))
+        self.conn.rollback()
+        self.assertIsNone(self.asset_cols(asset_id)["poster_key"])
+
+
 class ContentKeys(Base):
     def test_core_and_legacy_keys_do_not_collide(self):
         store = PlaintextKeyStore()

@@ -14,6 +14,7 @@ import vod.auth.TenantPrincipal;
 import vod.job.JobService;
 import vod.job.TranscodeService;
 import vod.template.TemplateService;
+import vod.upload.MultipartUploads;
 import vod.upload.UploadService;
 
 import java.util.Map;
@@ -24,16 +25,19 @@ public class V1Controller {
     private final JobService jobService;
     private final TranscodeService transcodes;
     private final TemplateService templates;
+    private final MultipartUploads multipart;
     private final int defaultPageSize;
     private final int maxPageSize;
 
     public V1Controller(UploadService uploads, JobService jobService, TranscodeService transcodes, TemplateService templates,
+                        MultipartUploads multipart,
                         @Value("${vod.api.page-size-default:20}") int defaultPageSize,
                         @Value("${vod.api.page-size-max:100}") int maxPageSize) {
         this.uploads = uploads;
         this.jobService = jobService;
         this.transcodes = transcodes;
         this.templates = templates;
+        this.multipart = multipart;
         this.defaultPageSize = defaultPageSize;
         this.maxPageSize = maxPageSize;
     }
@@ -45,13 +49,51 @@ public class V1Controller {
         TenantPrincipal tenant = tenant(request, "upload");
         boolean encrypted = body != null && Boolean.TRUE.equals(body.get("encrypted"));
         String filename = body != null && body.get("filename") instanceof String name ? name : null;
-        return uploads.open(tenant.tenantId(), idempotencyKey, encrypted, filename);
+        // Phase 6：可选 mode（缺省 put，响应与原来相同）、content_type（只对 multipart 生效）。
+        Object mode = body == null ? null : body.get("mode");
+        if (mode != null && !(mode instanceof String)) throw new IllegalArgumentException("mode must be a string");
+        Object contentType = body == null ? null : body.get("content_type");
+        if (contentType != null && !(contentType instanceof String)) throw new IllegalArgumentException("content_type must be a string");
+        return uploads.open(tenant.tenantId(), idempotencyKey, encrypted, filename, (String) mode, (String) contentType);
     }
 
+    /** Phase 6：上传参数（分片大小、走 multipart 的阈值等），控制台据此选方式，不在前端写死。scope upload。 */
+    @GetMapping("/api/v1/uploads/config")
+    public Map<String, Object> uploadConfig(HttpServletRequest request) {
+        tenant(request, "upload");
+        return uploads.config();
+    }
+
+    /**
+     * complete：put 会话行为不变。multipart 会话 body 必须带 {"parts":[{"part_number":1,"etag":"..."}]}，
+     * 先在存储侧组合，成功后再走 HEAD 校验 + 建任务。
+     */
     @PostMapping("/api/v1/uploads/{sessionId}/complete")
     public Map<String, Object> complete(HttpServletRequest request, @PathVariable long sessionId,
-                                        @RequestHeader(value = "X-Request-ID", required = false) String traceId) {
-        return uploads.complete(tenant(request, "upload").tenantId(), sessionId, traceId);
+                                        @RequestHeader(value = "X-Request-ID", required = false) String traceId,
+                                        @RequestBody(required = false) Map<String, Object> body) {
+        return multipart.complete(tenant(request, "upload").tenantId(), sessionId,
+                body == null ? null : body.get("parts"), traceId);
+    }
+
+    /** Phase 6：为 multipart 会话签 part URL。body {"part_numbers":[1,2,3]}。 */
+    @PostMapping("/api/v1/uploads/{sessionId}/parts")
+    public Map<String, Object> presignParts(HttpServletRequest request, @PathVariable long sessionId,
+                                            @RequestBody(required = false) Map<String, Object> body) {
+        return multipart.presignParts(tenant(request, "upload").tenantId(), sessionId,
+                body == null ? null : body.get("part_numbers"));
+    }
+
+    /** Phase 6：已上传成功的 part 与 etag，用于断点续传。 */
+    @GetMapping("/api/v1/uploads/{sessionId}/parts")
+    public Map<String, Object> listParts(HttpServletRequest request, @PathVariable long sessionId) {
+        return multipart.listParts(tenant(request, "upload").tenantId(), sessionId);
+    }
+
+    /** Phase 6：取消 OPEN 会话（multipart 同时在存储侧 abort）。已 COMPLETED 409。 */
+    @PostMapping("/api/v1/uploads/{sessionId}/abort")
+    public Map<String, Object> abort(HttpServletRequest request, @PathVariable long sessionId) {
+        return multipart.abort(tenant(request, "upload").tenantId(), sessionId);
     }
 
     @GetMapping("/api/v1/assets/{assetId}")

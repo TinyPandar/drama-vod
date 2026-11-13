@@ -6,6 +6,167 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 路线图见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)，旧接口兼容约定见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
 
+## 分支方案：Phase 6 高级媒体能力（第一刀）
+
+本分支：`plan/phase-6`，基线 `main` = `248b6e3`（Phase 5 已合并）。下面是本分支方案。实现完成后，把实现说明写在本节后面，不要改方案原文。
+
+协作方式：其他 agent 请在**本分支**上按下面清单做最小改动开发；不要自行合并到 `main`，也不要另开平行分支。开发完后由「短剧视频服务器开发bot」检查，没问题再合并。
+
+对照文档：[路线图](docs/panda-vod-roadmap.html) 第 06 节（`POST /uploads` 可返回预签名 URL **或 multipart 信息**）、第 05 节（MinIO 上还有缩略图这类对象）、第 09 节 Phase 6、第 11 节「对象存储直传：预签名上传、校验、Multipart 扩展」。目标：**大文件能断点续传，转码成功后资产有可展示的封面**。Phase 6 在路线图里是长期迭代，本分支只做第一刀，其余明确留到后续。
+
+### 现状（不要推倒重来）
+
+- 上传：`POST /api/v1/uploads` 只签发单次 `put_url`（`ObjectStorage.presignPut`），完整文件一次 PUT 到源桶；`POST /uploads/{id}/complete` 再 HEAD 校验大小、MIME、扩展名和配额，然后同一事务里建任务和 outbox。会话有 TTL（默认 900 秒），过期 complete / 重放会 409；没有 abort 接口，也没有清理未完成分片的后台任务。Nginx 上传网关 `client_max_body_size` 是 5g，小文件这条路径要继续能用。
+- 存储接口：`ObjectStorage` 目前只有 `head` 和 `presignPut`。实现有 `S3ObjectStorage`（预签名用公网地址，HEAD 用内网地址）、测试用 `MemoryStorage`、未配置时的 `UnavailableStorage`。改接口时这三个都要跟上。
+- 封面：资产已有 `duration_ms` / `width` / `height`（Worker 成功事务里用 ffprobe 结果写入），没有海报字段。控制台资产列表和详情也不展示封面。
+- 播放路径：Core 产物在 `assets/v1/{asset_id}/{job_id}-{claim_version}/`，签名 URL 是 `/hls/v1/{sig}/{exp}/{asset}/{gen}/{file}`，`file` 已允许 `poster.jpg` 这种名字；缓存键带 gen，前缀一换就不会命中旧封面。Worker 上传后会按本地清单 list 远端（名字、大小、无多余对象），不一致就 `STORAGE_ERROR` 重试——**封面如果生成了，必须进这份清单**。
+- 成功事务、`claim_version` 围栏、`hls_prefix` 原子切换、旧前缀 GC，都按 Phase 4 的规则走，本分支不要另做一套切换。
+
+### 要做的事
+
+1. **存储层补上 Multipart**
+   在 `ObjectStorage` 增加：创建分片上传、给指定 part 签发预签名 URL、列出已上传分片、完成分片上传、取消分片上传。`S3ObjectStorage` 走 MinIO / S3 的标准 API（创建和完成走内网客户端，分片预签名走公网 presigner，和现在的 PUT 分工一致）。`MemoryStorage` 做成可测的内存实现（能完成、能取消、能列出 etag）；`UnavailableStorage` 继续抛未配置。不要引入第二家云厂商 SDK。
+
+2. **上传会话支持 `mode=multipart`，单次 PUT 保持默认**
+   `POST /api/v1/uploads` 增加可选字段 `mode`：缺省或 `put` 时响应与现在完全兼容（仍返回 `put_url`）。`mode=multipart` 时进入分片会话：在源桶创建 S3 multipart，把 `upload_id`（S3 的 id）和 mode 记到 `vod_upload_session`（Flyway **V13**，只追加列，不要改 V1–V12）。响应返回 `session_id`、`asset_id`、`part_size_bytes`、`expires_at`，**不要**返回 `put_url`。对象键规则仍是 `raw/t{tenant}/{asset}/source.{ext}`。Idempotency-Key 语义与现在相同：同一租户同一 key，OPEN 未过期就重放原会话（multipart 重放不要再 create 一次 S3 上传）；已 COMPLETED 不再签发上传 URL。`part_size_bytes` 做成配置项，默认不得小于 S3 要求的 5 MiB（最后一块可以更小）。会话 TTL 继续可配；multipart 文件可能较慢，允许在 OPEN 且未过期时通过下面的分片接口重新签发 URL，但不要在无上限地续期——如需延长，用配置项设一个上限，并在 README 写清。
+
+3. **分片签发、完成、取消**
+   - `POST /api/v1/uploads/{id}/parts`（或等价清晰的路径）：对仍 OPEN、未过期、且属于本租户的 multipart 会话，为请求里的 part 号列表签发预签名 URL。跨租户或会话不存在按现有规则 404；`put` 模式的会话来调返回 409；过期 409。
+   - `GET /api/v1/uploads/{id}/parts`：列出存储里已经上传成功的 part 及 etag，供断点续传。客户端用这份列表跳过已传分片，再向 POST 要缺失 part 的 URL。
+   - `POST /api/v1/uploads/{id}/complete`：`put` 模式保持现有行为（先 HEAD 再校验再建任务）。multipart 模式必须先用客户端上报的 `{part_number, etag}` 在存储侧 `completeMultipart`，成功后再走现有 HEAD + `UploadPolicy` + 配额 + 建任务/outbox 这条事务；S3 还没组合完就不要建任务。分片 etag 对不上、缺 part、或 completeMultipart 失败，返回 4xx，会话仍是 OPEN，允许重试 complete，不要把源对象留在半组合状态还去转码。Multipart 完成后的对象 ETag 一般不是整个文件的 MD5，SHA-256 也可能没有：校验继续以 HEAD 的 size、content-type、扩展名、配额为准，不要因为缺 checksum 就 422。
+   - 新增 `POST /api/v1/uploads/{id}/abort`：本租户 OPEN 会话可取消；multipart 还要在存储侧 abort，避免 MinIO 留下未完成分片。已 COMPLETED 的会话返回 409，禁止取消以免动到已经在转码的源文件。取消后会话记 `ABORTED`。资产若仍是 `UPLOADING`，按现有上传生命周期的处理方式收尾（不要误删别的资产的源对象）。
+
+4. **过期会话清理未完成的分片上传**
+   增加一个后台清理（间隔可配）：找出已过期仍为 OPEN 的 multipart 会话，abort 存储侧上传，会话打成 `ABORTED`。只处理过期 OPEN，不要碰 COMPLETED，也不要删除已经 HEAD 校验过的源对象。`put` 模式过期会话如果源桶里留下了未 complete 的对象，本分支可以一并删未引用的源对象，但必须先确认会话未完成、资产仍是 `UPLOADING`、对象键与会话一致；吃不准就只做 multipart abort，把 `put` 残留写成风险。清理要可多实例跑（条件更新领取），失败只打日志并下次再试。
+
+5. **转码成功时在同一产物前缀里写出封面**
+   Core Worker 在 HLS 产物之外，用 FFmpeg 参数数组（不拼 shell）从源视频抽一帧 JPEG，上传到**当前任务专属前缀**下的固定名字，例如 `poster.jpg`。抽帧位置做成配置项（例如第 1 秒；比片长短则取 0 秒或中间一帧）。封面必须进入本地清单，并和 m3u8、ts 一起做远端 list 对账，过不了就按现有 `STORAGE_ERROR` 重试，不要单独提交一个没登记的对象。抽帧失败（无视频流、损坏帧等）**不要让整次转码失败**：任务仍可 READY，只是没有封面。旧 Demo 产物路径和 `content_key` 不要动。
+
+6. **成功事务登记封面，切换和 GC 复用现有前缀**
+   V13 给 `vod_media_asset` 增加可空的 `poster_key`（或等价字段）。Worker 成功事务里，在写 `hls_prefix` / `READY` / 前缀 `ACTIVE` 的**同一事务**里写入本期前缀下的封面键；没有封面就写 NULL。重新转码成功后，封面跟着新前缀走；旧封面留在旧前缀里，由现有 GC 删除，不要另写一套海报生命周期。不要把封面登记成会打乱 `uk_bucket_key` 或源对象角色的东西——HLS 分片本来也不逐条进 `vod_storage_object`，封面同样只挂在前缀和资产字段上即可。已 READY 的旧资产没有封面是正常的，需要重新转码才会生成。
+
+7. **资产查询和播放接口返回签名封面地址**
+   `GET /api/v1/assets`、`GET /api/v1/assets/{id}`，以及 `POST /api/v1/assets/{id}/playback-token`（和现有 `GET .../playback` 如仍返回播放信息），在有 `poster_key` 时返回 `poster_url`：用和该资产当前 `hls_prefix` 相同的签名规则签发，过期时间与播放 URL 同一套上限。没有封面时字段为 `null`，不要 500。跨租户仍然 404。`poster_url` 不要写进 Webhook 事件体（签名 URL 会过期）；若要通知，只允许在 `transcode.succeeded` 上**追加**可选字段比如 `has_poster`，不能改事件名，也不能带密钥或签名 URL。
+
+8. **控制台：大文件走分片，列表和详情能看到封面**
+   控制台上传：小文件可以继续单次 PUT（与默认 `mode=put` 兼容）；达到可配阈值（建议默认等于 `part_size_bytes`）时改走 multipart：按 part 上传、失败重试未完成的 part、最后 complete；提供取消。阈值和 part 大小不要写死在前端常量里，写进 open 接口的响应（例如 `part_size_bytes`），前端照着切。资产列表和详情用 `poster_url` 展示封面，没有则保持现在的占位。不要上新的大型 UI 库。构建产物仍提交到 `nginx/html/vod-console/`，规则与现在一致。
+
+9. **契约、配置与指标**
+   更新 `docs/phase-0-contract.md` 的 Core 上传与资产部分（旧 Demo 条目保持冻结原文）：写清 `mode`、分片接口、complete 对两种模式的差异、abort、过期清理、`poster_url` 与抽帧失败不阻断 READY。README 补接口、配置项（part 大小、会话 TTL 上限、抽帧位置、清理间隔）、以及若有新指标时的名字。指标用 Micrometer 即可，例如分片完成/取消、过期 abort 次数、抽帧成功/跳过；标签不要带 URL、租户或密钥。不要编造性能数字，默认值只是开发默认。
+
+10. **验收脚本与测试**
+    补 Java 测试：`put` 路径原有用例继续通过；multipart 覆盖创建、重放 Idempotency-Key、列出已传分片后续传、complete 后建任务、缺 part / etag 错误不建任务、abort 后存储侧取消、跨租户 404、put 会话调用分片接口 409、已 complete 禁止 abort。`MemoryStorage` 必须能支撑这些测试。有条件时用 MinIO（测试容器或已有栈）再跑一条真实分片上传。Worker 单测覆盖：封面进清单、抽帧失败仍能提交成功且 `poster_key` 为空、成功事务写入的 key 落在当期前缀。控制台构建后核对产物已提交。有 Docker 时用独立项目名（如 `drama-vod-p6`）起栈，跑现有 `e2e.py`、`platform_live.py`（旧能力回归），并新增或扩展脚本覆盖：multipart 上传后转码 READY、资产接口能拿到可访问的 `poster_url`、过期/取消后 MinIO 上没有残留的未完成分片。`playback_live.py` 因 Range 问题已知可能有一项失败，不要为了让它全过而在本分支改回源。
+
+**可选小项（不做不影响验收，做了单独说明）**：雪碧图 + WebVTT 的进度条预览；给已 READY 的资产单独重抽封面而不重转全部码率；multipart 会话在上限内自动续期。
+
+### 本分支不要做
+
+- 同一资产换模板可并行、dev 下管理 JWT 密钥退回固定 `dev`：这两条是 Phase 5 的返工，走单独分支，不要塞进来。
+- Phase 4 遗留的回源 `Content-Length` / 缓存命中 Range 206，以及 `fault_inject.py` 的 MinIO 默认时序、`.gitattributes` 固定 `*.envsh` 为 LF：继续走并行小分支。
+- 可选的 `WORKER_CANCEL_CHECK_SECONDS`。
+- 字幕 / 多音轨、CMAF / fMP4、H.265 / AV1、多对象存储适配、多 CDN、生命周期冷存储（例如改 storage class 或搬迁到低频桶）。这些是 Phase 6 的后续迭代，本分支不做。
+- 旧 Demo 播放链路、`content_key` 迁移、把 Demo 付费集改走加密 Core 资产、Core 加密资产的 iPhone 原生 HLS 改写列表。
+- 改 `uk_asset_profile`、改消息 v1、改 Flyway V1–V12、改 `api/common.py` 或 `worker/common.py` 的 `transcode_message()`。
+- KMS / 信封加密 / DRM、Webhook 密钥入库加密、回源密钥轮换、mTLS、CDN 刷新、Grafana、播放计数 `GETDEL` 丢增量。
+- 完整 RBAC、OAuth、短剧生成、推荐、直播推流。
+- 不要重写 Worker 转码流水线，不要换 MQ，不要改 Windows 或 `~/.claude/settings.json`，不要把密钥写进仓库。
+
+### 写方案时的判断
+
+- 第一刀选 Multipart 和封面，是因为路线图的 API 草案和「项目展示重点」已经写了「预签名上传 + Multipart 扩展」，封面又是控制台和短剧业务立刻用得上的；编码格式、多存储、多 CDN 会显著放大 Worker 和分发面，不适合和续传绑在一次合入里。
+- 单次 PUT 必须保持默认且行为兼容，避免现有控制台、脚本和测试一次性全改。
+- 封面必须放在任务专属前缀里，和 HLS 一起切换、一起 GC。不要写到固定的 `assets/v1/{asset}/poster.jpg`：那种路径的缓存键不带 gen，切封面会打到旧缓存，也会和「先切可播前缀再删旧产物」的规则打架。
+- complete 仍然是「先让对象在桶里完整存在，再 HEAD 校验，再在同一事务里建任务」。Multipart 只是把「怎么把字节凑成一个源对象」换了一种协议，不要绕过校验，也不要把分片信息塞进消息 v1。
+- 抽帧失败不阻断 READY：封面是增强，不是可播的前提；片头黑帧或极短素材不该让整集转码失败。
+
+### 测试要求（开发时）
+
+每个改动点补测试，并保证现有测试仍通过。有 Java 21 和 Maven 就跑 `cd vod-api && mvn test`（未设 `VOD_TEST_MYSQL_URL` 时 MySQL 用例按设计跳过；能连 MySQL 8.4 就设置后再跑一遍）。跑 `python3 scripts/contract_check.py`、`test_bridge.py`、`test_hls_verify.py`、`test_vod_client.py`、`test_worker_fencing.py`、`test_worker_reliability.py`、`test_dlq.py`、`test_output_gc.py`、`test_playback_contract.py`、`test_api_playback.py`、`test_transcode_template.py` 和新增单测。有 Docker 就用独立项目名起栈（如 `docker compose -p drama-vod-p6 up -d --build`，端口冲突时用 override），跑 `test_fencing_mysql.py`、`scripts/platform_live.py`、`scripts/e2e.py`（旧 Demo 回归）和本分支新增的验收脚本。没跑过的不要声称通过，写明原因。改完后在本分支提交（作者 `TinyPandar <meiyoujunlee@foxmail.com>`），可以 push 到 `origin/plan/phase-6`，但不要合并到 `main`。
+
+## Phase 6 实现说明（第一刀，本分支 `plan/phase-6`，未合并）
+
+按上面 10 项做的最小改动。旧 Demo 链路、消息 v1、`uk_asset_profile`、Flyway V1–V12、`api/common.py` / `worker/common.py` 的 `transcode_message()` 都没动；表结构只追加在 `V13__multipart_poster.sql`（H2 MySQL 模式与 MySQL 8.4.10 都跑过）。单次 `mode=put` 的请求与响应字段保持不变。可选小项（雪碧图、单独重抽封面、自动续期）和 Webhook `has_poster` 都**没做**。
+
+**接口**（状态码细节见 `docs/phase-0-contract.md`「Core 上传与资产（Phase 6 新增）」）
+
+| 接口 | 说明 |
+|---|---|
+| `POST /api/v1/uploads` | 新增可选 `mode`（`put` 缺省 / `multipart`）、`content_type`（只对 multipart 生效）。multipart 响应 `session_id`、`asset_id`、`mode`、`part_size_bytes`、`max_parts`、`expires_in`、`expires_at`，没有 `put_url`。Idempotency-Key 按原会话的方式重放，multipart 重放不会再建一次存储侧上传 |
+| `GET /api/v1/uploads/config` | 新增，scope `upload`：`part_size_bytes`、`multipart_threshold_bytes`、`max_parts`、`max_parts_per_request`、`max_object_bytes`、两种会话有效期。控制台在 open 之前需要先知道阈值，所以放在这里，put 的 open 响应就不必加字段 |
+| `POST /api/v1/uploads/{id}/parts` | `{"part_numbers":[…]}` → 各 part 的预签名 PUT（分片预签名走公网 presigner），有效期不超过会话剩余时间 |
+| `GET /api/v1/uploads/{id}/parts` | 存储侧已收到的 part、etag、size，用于断点续传 |
+| `POST /api/v1/uploads/{id}/complete` | put 不变。multipart 必须带 `{"parts":[{part_number,etag}]}`：先 `completeMultipart`，成功后才进入原有 HEAD + `UploadPolicy` + 配额 + 任务/outbox 事务。组合失败 400、会话仍 OPEN |
+| `POST /api/v1/uploads/{id}/abort` | 新增。OPEN（含已过期）可取消，multipart 同时在存储侧 abort；COMPLETED 409；重复调用 200；存储不可用 503 |
+| 资产与播放 | `GET /assets`、`GET /assets/{id}`、`POST /assets/{id}/playback-token`、`GET /assets/{id}/playback` 追加 `poster_url`（没有为 `null`） |
+
+**各项做法**
+
+1. **存储层**：`ObjectStorage` 加了 `createMultipart` / `presignUploadPart` / `listParts` / `completeMultipart` / `abortMultipart`。`S3ObjectStorage` 用同一个 AWS SDK v2：创建、列出、完成、取消走内网 client，分片预签名走公网 presigner；S3 的 `NoSuchUpload` 映射为 `NoSuchUploadException`，`InvalidPart` / `InvalidPartOrder` / `EntityTooSmall` 等映射为 `MultipartRejectedException`，abort 遇到 `NoSuchUpload` 视为成功。`MemoryStorage`（测试）按 S3 规则模拟：part 升序、etag 一致、非末块不小于 5 MiB，能列出、完成、取消，并记录被 abort 的 upload id。`UnavailableStorage` 新方法同样抛未配置。没有引入别的 SDK。
+2. **会话**：V13 给 `vod_upload_session` 加了 `upload_mode`（默认 `put`，列名避开 MySQL 关键字 `mode`）、`multipart_upload_id`、`cleanup_until`（清理领取）、`updated_at`，以及 `(status, expires_at)` 索引。multipart 在 open 事务的最后一步调 `createMultipart`；如果事务之后回滚，提交后回调会把刚建的存储侧上传 abort 掉（best-effort）。multipart 会话有效期单独配置（`VOD_UPLOAD_MULTIPART_SESSION_TTL_SECONDS`，默认 86400，硬上限 604800），从 open 起算、**不续期**；会话内可以反复 `POST /parts` 重签 URL，每次有效期取 `part-url-ttl-seconds` 和会话剩余时间的较小值。
+3. **complete / abort 的并发**：`UploadService.complete` 的事务开头改成 `SELECT … FOR UPDATE` 锁会话行，再复核 OPEN / 未过期；abort 也在事务里锁同一行。加锁顺序是会话 → 租户（配额）→ 对象 → 资产 → 任务。真 MySQL 上 10 轮并发「complete 对 abort」，每一轮都只有一方生效：要么 COMPLETED 且有任务（abort 409），要么 ABORTED 且没有任务（complete 409）。multipart 的存储侧组合在这个事务之外进行（`MultipartUploads.complete`），组合成功后再调用原 complete；上一次已组合、但建任务失败（比如配额 403）时重试，存储侧 upload 已不存在、桶里已有对象，就直接走 HEAD 校验。这种情况下即使会话已经过期（仍是 OPEN），`MultipartUploads.complete` 先 HEAD 目标对象、再用 `listParts` 确认 upload 已不存在，两者都成立就照常进入 HEAD + `UploadPolicy` + 配额 + 建任务事务，不再 409（审查 N1：原来过期后这个已组合的对象再也走不完流程）；没组合过的过期会话仍是 409，锁内仍复核 OPEN，所以已 abort 的会话照旧 409。multipart 对象的 ETag（形如 `…-3`）不是整文件 MD5，`checksum` 可能为空，这些都不会导致拒绝。
+4. **过期清理**：`UploadCleanup` 定时任务。只处理 `upload_mode='multipart'`、`status='OPEN'`、已过期的会话，用条件 UPDATE 写入 `cleanup_until` 来领取（可以多实例），领到后先 HEAD 目标对象：对象已存在说明存储侧已组合过（只是没建成任务），跳过、保持 OPEN，让客户端重试 complete（计 `cleanup_skipped_assembled`，领取不清，到期后下一轮再看）；否则在存储侧 abort，再改成 `ABORTED`；存储失败时只打日志，领取到期后下一轮重试。**不删除任何对象**：put 会话的过期残留、已组合但没建任务的源对象都留着（见风险）。abort 和过期后，资产都停在 `UPLOADING`（与原来过期会话一样，不能转码）。
+5. **封面抽帧**：只对 Core 做。Worker 在 `verify_hls` 之后、复核围栏与上传之前，用参数数组调 `ffmpeg -ss {t} -i src -frames:v 1 …` 抽一帧，宽度上限 1280（不放大），先写到临时文件，确认非空后再移进产物目录，和 m3u8、ts 一起上传（master 仍然最后传），并进入本地清单与远端 list 对账，对不上就按 `STORAGE_ERROR` 重试。抽帧位置默认第 1 秒，片长不足时取片长一半。抽帧失败（无帧、坏文件、超时、空文件）记 `poster_skipped`，任务照常 READY；围栏丢失（`FenceLost`）照常中止。旧 Demo 不抽帧，SQL 也不变。
+6. **登记封面**：`fencing.commit_success` 增加 `poster_key` 参数，和 `hls_prefix` / `READY` / 前缀 `ACTIVE` 在同一条 UPDATE、同一事务里写入；键不在本期前缀里时写 NULL。重新转码后封面跟着新前缀走；新一期没出封面时写 NULL，不会继续指向即将被 GC 的旧前缀。封面不进 `vod_storage_object`。
+7. **签名地址**：新增 `PosterUrls`，只在 `poster_key` 落在资产**当前** `hls_prefix`（带 gen）里时签发，地址是 `/hls/v1/{sig}/{exp}/{asset}/{gen}/poster.jpg`，签名与该 gen 的 master 相同（Nginx 带 gen 的 location 本来就能匹配，缓存键也带 gen）。playback-token / playback 与 `master_url` 用同一个 `exp`；列表和详情用 `vod.play-ttl-seconds`，同样不超过 `token-ttl-max-seconds`。旧固定前缀、封面键与当前前缀对不上、没有封面时，都返回 `null`。Webhook 事件没改。
+8. **控制台**：新增 `console/src/upload.ts`。先读 `GET /uploads/config`，文件大小不小于 `multipart_threshold_bytes` 时走 multipart：先 `GET /parts` 跳过已传分片，3 个并发，每片失败时重签 URL 再试，最多 3 次。某片最终失败后不再领新分片，但会等进行中的分片收尾再报错，这样「继续上传」只补真正缺的分片。全部完成后 complete；「取消上传」会停掉进行中的 PUT 并调用 abort。小文件仍走单次 PUT。资产列表加了封面缩略图列，详情页显示封面，没有封面时显示「—」或提示文字。没有引入 UI 库，构建产物已提交到 `nginx/html/vod-console/`。并发数和重试次数是前端常量；分片大小和阈值都来自服务端。
+9. **上传网关（Nginx）**：浏览器要读到每个分片的 `ETag` 才能 complete，所以加了 `Access-Control-Expose-Headers: ETag`。用本机 MinIO 实测发现，MinIO 对带 `Origin` 的预签名 PUT 会自己回 `Access-Control-Allow-Origin`，原来的网关再加一份，浏览器就会看到两个 Allow-Origin，因此用 `proxy_hide_header` 去掉上游自带的 CORS 头。另外查出一个**原有问题**：`limit_except PUT` 在选 location 阶段就把 OPTIONS 切到 deny，`if` 里的预检 204 根本执行不到，所以预检一直是 403，跨源的浏览器直传（包括 Phase 5 控制台的单次 PUT）都会被浏览器拦下。现在改成 `limit_except PUT OPTIONS`，GET 仍然 403。播放侧 location 没动，Range / 回源相关也没动。
+10. **compose**：`worker` 透传 `WORKER_POSTER_*`（留空用开发默认值）。新增 `docker-compose.media-live.yml`，只把清理间隔调成 2 秒，供验收脚本使用。
+
+**配置项**（默认值只是开发默认，不是基准或承诺；vod-api 的数值项在 compose 里没有透传，需要时用 override 设置环境变量）
+
+| 名称（环境变量） | 默认 | 含义 |
+|---|---|---|
+| `VOD_UPLOAD_PART_SIZE_BYTES` | 8388608（8 MiB） | 分片大小；小于 5 MiB 或大于 5 GiB 拒绝启动；`max-object-bytes` 换算成块数超过 10000 也拒绝启动 |
+| `VOD_UPLOAD_MULTIPART_THRESHOLD_BYTES` | 0（= 分片大小） | 控制台达到这个大小就走 multipart |
+| `VOD_UPLOAD_MULTIPART_SESSION_TTL_SECONDS` | 86400 | multipart 会话有效期，不续期，硬上限 604800 |
+| `VOD_UPLOAD_PART_URL_TTL_SECONDS` | 900 | 单个分片 URL 有效期（同时不超过会话剩余时间） |
+| `VOD_UPLOAD_MAX_PARTS_PER_REQUEST` | 100 | 一次 `POST /parts` 最多签多少个 part |
+| `VOD_UPLOAD_CLEANUP_INTERVAL_MS` / `_INITIAL_DELAY_MS` | 60000 / 30000 | 过期 multipart 清理的间隔与首次延迟 |
+| `VOD_UPLOAD_CLEANUP_BATCH_SIZE` / `_CLAIM_SECONDS` | 50 / 300 | 每轮条数 / 领取时长（失败后过了领取时长再试） |
+| `VOD_UPLOAD_SESSION_TTL_SECONDS` | 900（不变） | put 会话有效期 |
+| `WORKER_POSTER_ENABLED` | 1 | 是否抽帧 |
+| `WORKER_POSTER_AT_SECONDS` | 1.0 | 抽帧位置；不小于片长时取片长一半 |
+| `WORKER_POSTER_TIMEOUT_SECONDS` / `WORKER_POSTER_MAX_WIDTH` | 60 / 1280 | 抽帧超时 / 封面宽度上限 |
+
+**新指标**（不带 URL、租户或密钥标签）：vod-api `vod_upload_multipart_total{event=created|completed|complete_rejected|aborted|put_aborted|expired_aborted|cleanup_skipped_assembled|cleanup_failed}`；Worker `vod_worker_poster_total{result=ok|skipped}`。前者在本机 jar 的 `/actuator/prometheus` 里看到了，后者在 `prometheus_client` 的输出里看到了。
+
+**本分支实际跑过的测试**（2026-11-12，macOS arm64，本机**没有 Docker**，也没有可供自动化的 Chrome / Chromium）
+
+- `cd vod-api && mvn test`：共 136 个用例（原 111 个 + 新增 25 个）。不设 `VOD_TEST_MYSQL_URL` 时 0 失败，10 个 MySQL 用例跳过；设到本机 MySQL 8.4.10 再跑，136 个全过、0 跳过（这一轮 Flyway V1–V13 在 MySQL 上执行）。
+  - `MultipartUploadTest`（18 个）：put 响应字段集合不变；config；创建；重放不再 create；列出已传分片后续传；complete 后建任务；缺 part、错 etag、顺序错、非末块太小都 400 且不建任务，改正后可以重试；组合成功但配额 403 时会话仍 OPEN，放开配额后重试走 HEAD；put 会话调分片接口 409；part 号校验；过期 409；part URL 有效期不超过会话剩余时间；跨租户全部 404；abort 后存储侧被取消、之后不能再用；已 complete 不能 abort；存储故障时 abort 返回 503、会话保持 OPEN；清理只处理过期 OPEN 的 multipart，存储失败保留领取、到期后重试，COMPLETED 会话和已校验的源对象不碰；别的实例已领取时本实例跳过。
+  - `PosterUrlTest`（3 个）：详情、列表、playback-token、playback 的签名与 `HlsSigner` 一致，并且与 master 同签名；没有封面、封面键不在当前 gen、旧固定前缀、UPLOADING 都返回 `null`，不报 500；跨租户 404。
+  - `Phase6MysqlTest`（3 个，只跑真 MySQL）：multipart 全流程；10 轮并发 complete 对 abort；清理在 MySQL TIMESTAMP 下的比较与领取。
+  - `S3PresignTest` 新增 1 个：分片 URL 用公网地址，带 `uploadId`、`partNumber` 和有效期。
+- Python 3.12：`contract_check`、`test_bridge`、`test_hls_verify`、`test_vod_client`、`test_worker_fencing`（7）、`test_worker_reliability`（39）、`test_dlq`（5）、`test_output_gc`（9）、`test_playback_contract`、`test_api_playback`（8）、`test_transcode_template`（3）全过；新增 `test_poster.py` 16 个全过，覆盖：封面进清单并先于 master 上传；远端缺封面或封面大小不对时按 STORAGE_ERROR 重试、不提交；抽帧失败、超时、空文件时仍然 ok 且 `poster_key=None`；关闭开关后不抽帧；围栏丢失时丢弃；旧 Demo 不抽帧；成功事务 SQL；键不在当期前缀时写 NULL；另有 5 个用**本机真实 ffmpeg** 的用例，测竖屏、短片取中间帧、横屏缩到 1280、纯音频和垃圾文件返回 False。
+- **N1 补丁**（2026-11-13，box 上 Linux、MySQL 8.4，审查后补）：`MultipartUploadTest` 新增 2 个（组合成功但配额 403、会话过期后，再 complete 仍按 HEAD + 配额走、清理不标 ABORTED、放开配额后建任务；清理跳过已组合会话、照旧 abort 没组合的会话，被主动 abort 后 complete 仍 409），`Phase6MysqlTest` 新增 1 个（同一流程在真 MySQL 上）。`mvn test` 共 139 个：不设 `VOD_TEST_MYSQL_URL` 时 0 失败、11 个跳过；设到 MySQL 8.4 时 139 个全过、0 跳过。
+- `test_fencing_mysql.py` 连本机 MySQL 8.4.10：30 个全过（新增 2 个：封面跟着 ACTIVE 前缀走，重转没封面时写 NULL；围栏丢失时不写封面）。
+- `nginx_local_check.py`（本机 Homebrew nginx）：42/42（原 33 个 + 新增 9 个：gen 目录下的 `poster.jpg` 能取到 200 image/jpeg、immutable，换 gen 后 403；上传网关能转发带 query 的分片 PUT、保留 ETag、只有一份 Allow-Origin、暴露 ETag、预检 204、GET 仍 403）。改动前同一份检查里，后 3 项（单份 Allow-Origin、暴露 ETag、预检 204）是失败的。
+- **本机冒烟**（不是 compose 栈）：
+  - 环境：`vod-api` 打包后的 jar，连本机 MySQL 8.4 空库（Flyway V1–V13）；对象存储是本机 MinIO（Homebrew bottle `2025-10-15T17-29-55Z`，只解压到 `.phase3-tools/`，没有安装进系统）；用仓库 nginx 模板渲染出本机边缘（复用 `nginx_local_check.render`），`/hls/v1` 回源到一个按 `api/origin_path.py` 读 MinIO 的小桩，上传网关指向 MinIO，`S3_PUBLIC_ENDPOINT` 指向网关；Worker 是一个轮询脚本，代替 RabbitMQ 消费者调用**真实的** `worker.process`（真实 ffmpeg 转码与抽帧、真实上传 MinIO、真实 MySQL 成功事务）。
+  - `scripts/media_live.py` 不经边缘时 24/24（跳过边缘取图）；经本机边缘 27/27。覆盖：约 19–25 MB 的视频切 3–4 片走网关直传；断点续传；错 etag 返回 400；READY；三个接口都有 `poster_url`；经边缘取到 200 image/jpeg、篡改签名 403；封面在 `{job}-{claim_version}/` 下，固定路径 `assets/v1/{asset}/poster.jpg` 不存在；complete、abort、过期清理之后，MinIO 的 `list_multipart_uploads` 都为空；默认 put 路径仍可用。
+  - 在同一套环境里重新转码：新前缀 `1-3` 变成 ACTIVE、`poster_key` 跟着切过去，旧前缀 `1-1` 变成 GARBAGE；手动核对过 `poster_url` 的签名与 Nginx `secure_link_md5` 的算法一致，封面是 720×1280 的 MJPEG。
+  - 控制台：本机没有可自动化的浏览器，**没在浏览器里点过**。用 esbuild 把控制台真实的 `upload.ts` / `api.ts` 打包，在 Node 22 里对着本机边缘跑了 7 项全过：阈值来自服务端；第 1 片之后模拟断网 → 服务端保留已传分片 → 「继续上传」只补缺的 3 片 → complete 拿到任务；小文件走 put；取消后再调分片接口 409。第一次跑时发现「某片失败后其它并发分片还在继续传、过早报错」，导致续传时把所有分片又传了一遍，已修。Node 不检查 CORS，浏览器侧的 CORS 只靠上面的 nginx 检查和 MinIO 实测来保证。`vue-tsc` 和生产构建都通过。
+- **没跑**（没有 Docker）：`docker compose -p drama-vod-p6 … up`、compose 栈上的 `scripts/media_live.py`、`scripts/e2e.py`、`scripts/platform_live.py`、`scripts/playback_live.py`；真实 RabbitMQ 消费与 Worker 的 GC 线程删除旧封面（只在 MySQL 层看到旧前缀进入 GARBAGE）；compose 里的 chainguard MinIO 镜像（本机用的是上面那个版本）；控制台在真实浏览器里的交互和 CORS 表现。
+
+```bash
+# 需要 Docker：独立项目名；端口冲突时在 .env 改 HTTP_PORT/UPLOAD_PORT 或加 override
+docker compose -p drama-vod-p6 -f docker-compose.yml -f docker-compose.media-live.yml up -d --build
+COMPOSE_PROJECT_NAME=drama-vod-p6 python3 scripts/media_live.py     # 需要本机 ffmpeg；有 PyMySQL 才测过期清理
+python3 scripts/e2e.py
+COMPOSE_PROJECT_NAME=drama-vod-p6 VOD_ADMIN_USERNAME=… VOD_ADMIN_PASSWORD=… python3 scripts/platform_live.py
+```
+
+**剩余风险**
+
+- **不删除源对象**：put 会话过期后，桶里可能留着已经 PUT、但从没 complete 的源对象；multipart 已组合成功、但被 abort 的源对象也会留着。这两种都没有清理，目前只 abort 未完成的分片。multipart 已组合、没建任务就过期的会话不再卡死（过期后仍可 complete，清理也不会把它标 ABORTED），但客户端如果一直不重试，会话会一直停在 OPEN、对象一直留着，清理每过一个领取时长（默认 300 秒）会再 HEAD 一次。
+- multipart 会话不续期：超过有效期（默认 24 小时）还没传完，只能取消重开。open 事务回滚时的存储侧 abort 是 best-effort，失败只打日志，可能留下一个没有会话指向的未完成上传（MinIO 自身的过期策略之外，没有别的兜底）。
+- 加密资产的封面是**明文 JPEG**（只有签名 URL 保护，不需要内容密钥）。如果付费内容连首帧都不能外露，需要给加密资产关掉封面，这个开关本分支没做。
+- 已 READY 的旧资产没有封面，要重新转码才会生成；没有「只重抽封面」的接口。重新转码时没出封面会写 NULL，旧封面不会保留。
+- complete 现在按会话行串行：同一会话的并发 complete 会排队，HEAD 也在锁内（原来就在同一个事务里）。
+- abort 或过期之后资产会一直停在 `UPLOADING`，资产列表里会看到这些行。
+- 控制台没有在浏览器里实际点过；分片并发数（3）和每片重试次数（3）是前端常量。
+- 上传网关的 CORS 只信请求里的 `Origin`（这是原有做法，本分支只修了重复头、暴露 ETag 和预检）。
+
 ## 分支方案：Phase 5 平台化控制台
 
 本分支：`plan/phase-5`，基线 `main` = `9cab039`（Phase 4 已合并）。下面先是方案原文，实现情况见紧接着的「Phase 5 实现说明」。
@@ -109,7 +270,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 
 
-## Phase 5 实现说明（`plan/phase-5`，未合并到 `main`）
+## Phase 5 实现说明（已合并到 `main`，`248b6e3`）
 
 旧 Demo 链路、消息 v1、`uk_asset_profile`、Flyway V1–V11、`mysql/init.sql` 都没动；新表结构在 `V12__platform_console.sql`（H2 MySQL 模式与 MySQL 8.4 都跑过）。
 

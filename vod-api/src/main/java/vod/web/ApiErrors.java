@@ -32,6 +32,11 @@ public class ApiErrors {
         return ResponseEntity.status(e.status()).body(Map.of("detail", e.getMessage()));
     }
 
+    @ExceptionHandler(UploadService.StorageUnavailableException.class)
+    ResponseEntity<Map<String, String>> storageUnavailable(UploadService.StorageUnavailableException e) {
+        return ResponseEntity.status(503).header("Retry-After", "5").body(Map.of("detail", e.getMessage()));
+    }
+
     @ExceptionHandler(UsageService.QuotaExceededException.class)
     ResponseEntity<Map<String, String>> quota(UsageService.QuotaExceededException e) {
         return ResponseEntity.status(403).body(Map.of("detail", e.getMessage()));

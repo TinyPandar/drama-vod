@@ -27,12 +27,13 @@ public class PlaybackService {
     private final JdbcTemplate jdbc;
     private final UsageService usage;
     private final SecretGuard secrets;
+    private final PosterUrls posters;
     private final long urlTtlSeconds;
     private final long tokenTtlSeconds;
     private final long tokenTtlMaxSeconds;
 
     /** TTL 都是配置项，默认值只是开发默认，不是基准或承诺。 */
-    public PlaybackService(JdbcTemplate jdbc, UsageService usage, SecretGuard secrets,
+    public PlaybackService(JdbcTemplate jdbc, UsageService usage, SecretGuard secrets, PosterUrls posters,
                            @Value("${vod.play-ttl-seconds:600}") long urlTtlSeconds,
                            @Value("${vod.playback.token-ttl-seconds:600}") long tokenTtlSeconds,
                            @Value("${vod.playback.token-ttl-max-seconds:3600}") long tokenTtlMaxSeconds) {
@@ -42,19 +43,21 @@ public class PlaybackService {
         this.jdbc = jdbc;
         this.usage = usage;
         this.secrets = secrets;
+        this.posters = posters;
         this.urlTtlSeconds = urlTtlSeconds;
         this.tokenTtlSeconds = Math.min(tokenTtlSeconds, tokenTtlMaxSeconds);
         this.tokenTtlMaxSeconds = tokenTtlMaxSeconds;
     }
 
-    public record ReadyAsset(long id, long tenantId, boolean encrypted, String hlsPrefix) {}
+    /** posterKey：Phase 6 封面对象键（可空），只在落在当前 hlsPrefix 里时签 poster_url。 */
+    public record ReadyAsset(long id, long tenantId, boolean encrypted, String hlsPrefix, String posterKey) {}
 
     /** 不存在或别的租户：404（不可见）；非 READY：409。 */
     public ReadyAsset readyAsset(long tenantId, long assetId) {
-        var rows = jdbc.query("SELECT id, tenant_id, status, encrypted, hls_prefix FROM vod_media_asset WHERE id = ?",
+        var rows = jdbc.query("SELECT id, tenant_id, status, encrypted, hls_prefix, poster_key FROM vod_media_asset WHERE id = ?",
                 (rs, n) -> Map.entry(rs.getString("status"),
                         new ReadyAsset(rs.getLong("id"), rs.getLong("tenant_id"), rs.getInt("encrypted") == 1,
-                                rs.getString("hls_prefix"))),
+                                rs.getString("hls_prefix"), rs.getString("poster_key"))),
                 assetId);
         if (rows.isEmpty()) throw new TenantGuard.ResourceNotVisibleException();
         TenantGuard.requireVisible(tenantId, rows.get(0).getValue().tenantId());
@@ -77,12 +80,22 @@ public class PlaybackService {
                 .orElseGet(() -> HlsSigner.v1MasterUrl(exp, asset.id(), secret));
     }
 
-    /** GET .../playback：只签地址（Demo 在用，字段不变）。 */
+    /** 封面地址：与 master_url 同一个 exp；没有封面为 null。 */
+    public String posterUrl(ReadyAsset asset, long exp) {
+        return posters.urlOrNull(asset.id(), asset.hlsPrefix(), asset.posterKey(), exp);
+    }
+
+    /** GET .../playback：只签地址（Demo 在用，原有字段不变）。Phase 6 追加 poster_url（可为 null）。 */
     public Map<String, Object> playback(long tenantId, long assetId) {
         ReadyAsset asset = readyAsset(tenantId, assetId);
         usage.addPlay(tenantId);
         long exp = Instant.now().getEpochSecond() + urlTtlSeconds;
-        return Map.of("asset_id", assetId, "master_url", masterUrl(asset, exp), "expires_at", exp);
+        var out = new LinkedHashMap<String, Object>();
+        out.put("asset_id", assetId);
+        out.put("master_url", masterUrl(asset, exp));
+        out.put("expires_at", exp);
+        out.put("poster_url", posterUrl(asset, exp));
+        return out;
     }
 
     /**
@@ -104,6 +117,7 @@ public class PlaybackService {
         out.put("master_url", masterUrl(asset, exp));
         out.put("expires_at", exp);
         out.put("encrypted", asset.encrypted());
+        out.put("poster_url", posterUrl(asset, exp));
         return out;
     }
 

@@ -1,0 +1,8 @@
+# Phase 6 验收脚本 scripts/media_live.py 用的叠加文件（只用于本地 dev 栈）：
+#   docker compose -p drama-vod-p6 -f docker-compose.yml -f docker-compose.media-live.yml up -d --build
+# 只把过期 multipart 清理的间隔调短，让脚本不用等默认的 60 秒；其他配置走默认值。
+services:
+  vod-api:
+    environment:
+      VOD_UPLOAD_CLEANUP_INTERVAL_MS: "2000"
+      VOD_UPLOAD_CLEANUP_INITIAL_DELAY_MS: "2000"
