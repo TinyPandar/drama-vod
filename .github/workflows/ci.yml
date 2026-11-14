@@ -66,7 +66,7 @@ jobs:
           lines = [f"vod-api: {len(by_class)} 个测试类，tests={total['tests']} skipped={total['skipped']} "
                    f"failures={total['failures']} errors={total['errors']}"]
           bad = False
-          for name in ("vod.job.MysqlSemanticsTest", "vod.job.Phase5MysqlTest"):
+          for name in ("vod.job.MysqlSemanticsTest", "vod.job.Phase5MysqlTest", "vod.job.Phase6MysqlTest"):
               c = by_class.get(name)
               if c is None or c["tests"] == 0 or c["skipped"] != 0:
                   bad = True
@@ -112,8 +112,12 @@ jobs:
             worker/requirements.txt
       - name: 安装依赖
         # pymysql 已在两个 requirements 里；httpx 是 FastAPI TestClient 需要的，
-        # 缺了 test_api_playback.py 会整类跳过。ffmpeg 在用例里都是假的，不装。
+        # 缺了 test_api_playback.py 会整类跳过。test_poster.py 有一组用例用真实 ffmpeg 抽帧，
+        # 没有 ffmpeg 会跳过 5 个，所以装系统 ffmpeg；其余用例里的 ffmpeg 仍是假的。
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ffmpeg
+          ffmpeg -version | head -1
           python -m pip install -r api/requirements.txt -r worker/requirements.txt httpx==0.28.1
       - name: contract_check + scripts/test_*.py
         env:

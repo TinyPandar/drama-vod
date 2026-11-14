@@ -149,7 +149,10 @@ public class V1Controller {
         return accepted(tenantId, result);
     }
 
-    /** Phase 5：重试本租户 FAILED（配置允许时含 CANCELLED）的任务。scope job。跨租户 404，其他状态 409。支持 Idempotency-Key。 */
+    /**
+     * Phase 5：重试本租户 FAILED（配置允许时含 CANCELLED）的任务。scope job。跨租户 404，其他状态 409；
+     * 同一资产另有任务（任意模板）在 PENDING/RETRYING/RUNNING 时也 409。支持 Idempotency-Key。
+     */
     @PostMapping("/api/v1/jobs/{jobId}/retry")
     public org.springframework.http.ResponseEntity<Map<String, Object>> retry(
             HttpServletRequest request, @PathVariable long jobId,

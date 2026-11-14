@@ -61,6 +61,10 @@ class Origin(http.server.BaseHTTPRequestHandler):
                 return self.reply(404, b"nope")
             body = (b"#EXTM3U\n" if self.path.endswith(".m3u8") else bytes(range(256)) * 8)
             extra = {"Content-Type": "image/jpeg"} if self.path.endswith(".jpg") else {}
+            if "/nolen/" in self.path:
+                # 对照组：模拟修复前的 FastAPI StreamingResponse（不带 Content-Length，靠关连接结束）
+                return self.reply(200, body, {"Cache-Control": "private, max-age=1", **extra}, content_length=False)
+            # 与 api/main.py internal_origin 一致：对象大小已知就带 Content-Length
             return self.reply(200, body, {"Cache-Control": "private, max-age=1", **extra})  # Nginx 必须隐藏/覆盖
         if self.path.startswith("/keys/v1/"):
             return self.reply(200, b"0123456789abcdef", {"Cache-Control": "no-store, private"})
@@ -80,11 +84,14 @@ class Origin(http.server.BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
         self.reply(204, b"", {"Cache-Control": "no-store"})
 
-    def reply(self, code, body, headers=None):
+    def reply(self, code, body, headers=None, content_length=True):
         self.send_response(code)
         for k, v in (headers or {}).items():
             self.send_header(k, v)
-        self.send_header("Content-Length", str(len(body)))
+        if content_length:
+            self.send_header("Content-Length", str(len(body)))
+        else:
+            self.close_connection = True  # HTTP/1.0 响应，正文靠关连接结束
         self.end_headers()
         if body:
             self.wfile.write(body)
@@ -222,6 +229,26 @@ def run_checks(port):
     check("multi-range on HIT also served by nginx", st3 == 206, st3)
     check("206 keeps immutable Cache-Control", h2.get("Cache-Control") == "public, max-age=86400, immutable",
           h2.get("Cache-Control"))
+    # 不带 Range 先把对象拉进缓存，再在 HIT 上请求中间一段和末尾一段，核对 Content-Range 与正文
+    full_seg = gen_url(exp, 12, "34-2", "480p/seg_00000.ts")
+    full = bytes(range(256)) * 8
+    st0, h0, b0 = req(port, full_seg)
+    check("origin Content-Length passes through on MISS", st0 == 200 and h0.get("X-Cache-Status") == "MISS"
+          and h0.get("Content-Length") == str(len(full)) and b0 == full, f"{st0} {h0.get('X-Cache-Status')} {h0.get('Content-Length')}")
+    for rng, lo, hi in (("bytes=1000-1099", 1000, 1099), ("bytes=-48", len(full) - 48, len(full) - 1)):
+        st, h, b = req(port, full_seg, headers={"Range": rng})
+        check(f"HIT {rng} is 206 with exact Content-Range", st == 206 and h.get("X-Cache-Status") == "HIT"
+              and h.get("Content-Range") == f"bytes {lo}-{hi}/{len(full)}" and b == full[lo:hi + 1],
+              f"{st} {h.get('X-Cache-Status')} {h.get('Content-Range')} len={len(b)}")
+
+    # 对照：回源不带 Content-Length（修复前的 FastAPI 行为）。缓存命中后 Range 拿不到 206，
+    # 说明上面的 206 断言确实依赖回源 Content-Length，假回源不再掩盖这个问题。
+    nolen = gen_url(exp, 12, "34-2", "nolen/seg_00000.ts")
+    stn0, hn0, bn0 = req(port, nolen)
+    stn, hn, bn = req(port, nolen, headers={"Range": "bytes=0-99"})
+    check("control: origin without Content-Length -> HIT Range not 206", stn0 == 200 and bn0 == full
+          and hn.get("X-Cache-Status") == "HIT" and stn == 200 and hn.get("Content-Range") is None and bn == full,
+          f"miss={stn0} hit={stn}/{hn.get('X-Cache-Status')} {hn.get('Content-Range')} len={len(bn)}")
 
     # ---- Phase 6：封面在同一 gen 目录，签名与 master 相同 ----
     Origin.hits.clear()

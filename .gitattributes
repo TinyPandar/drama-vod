@@ -1,0 +1,5 @@
+# 统一换行：仓库里一律存 LF。Windows（core.autocrlf=true）检出时其他文本文件照常可以是 CRLF，
+# 但容器里直接执行的脚本必须是 LF，否则 /docker-entrypoint.d/ 下的 *.envsh 会因为 \r 执行失败。
+* text=auto
+*.envsh text eol=lf
+*.sh    text eol=lf

@@ -95,7 +95,10 @@ def internal_origin(scope: str, asset_id: str, file_path: str,
             body.close()
 
     ctype = obj.get("ContentType") or "application/octet-stream"
-    return StreamingResponse(chunks(), media_type=ctype)
+    # 对象大小已知就带上 Content-Length：没有它 Nginx 的 range 过滤会跳过，缓存命中后的 Range 请求只会回 200 全量。
+    size = obj.get("ContentLength")
+    headers = {"Content-Length": str(size)} if isinstance(size, int) and size >= 0 else None
+    return StreamingResponse(chunks(), media_type=ctype, headers=headers)
 
 
 # ---------------- 启动：建桶 + 播放计数回刷线程 ----------------

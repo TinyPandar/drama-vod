@@ -138,6 +138,56 @@ class Phase5MysqlTest {
     }
 
     @Test
+    void concurrentRetriesAndRetranscodeOnSameAssetLeaveOnlyOneActiveJob() throws Exception {
+        jdbc.update("UPDATE vod_tenant SET max_concurrent_jobs = NULL");
+        jdbc.update("DELETE FROM vod_transcode_template WHERE tenant_id = 1");
+        jdbc.update("INSERT INTO vod_transcode_template(tenant_id, name, ladder_json, audio_kbps) VALUES "
+                + "(1, 'mobile', '[[\"360p\",360,500]]', 64), (1, 'hd', '[[\"720p\",720,2000]]', 128)");
+        jdbc.update("INSERT INTO vod_transcode_job(id, tenant_id, asset_id, profile, status, claim_version) VALUES "
+                + "(11, 1, 6, 'mobile', 'FAILED', 1)");
+        // 顺序：mobile 进行中时重试 ladder_v1 → 409，不改行、不写 outbox
+        jdbc.update("UPDATE vod_transcode_job SET status = 'RUNNING' WHERE id = 11");
+        mvc.perform(post("/api/v1/jobs/10/retry").header("X-Api-Key", "my-a").header("Idempotency-Key", "r-x"))
+                .andExpect(status().isConflict());
+        assertEquals("FAILED", jdbc.queryForObject("SELECT status FROM vod_transcode_job WHERE id = 10", String.class));
+        assertEquals(2, jdbc.queryForObject("SELECT claim_version FROM vod_transcode_job WHERE id = 10", Integer.class));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM vod_outbox", Integer.class));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM vod_idempotency_key", Integer.class));
+        // 并发：两条重试（不同模板）+ 一条第三个模板的重新转码同时打同一个资产，多轮都只能有一个进行中
+        for (int round = 0; round < 10; round++) {
+            jdbc.update("DELETE FROM vod_outbox");
+            jdbc.update("DELETE FROM vod_transcode_job WHERE asset_id = 6 AND profile = 'hd'");
+            jdbc.update("UPDATE vod_transcode_job SET status = 'FAILED' WHERE asset_id = 6");
+            var pool = Executors.newFixedThreadPool(3);
+            var go = new CountDownLatch(1);
+            List<Integer> codes = new ArrayList<>();
+            try {
+                List<Future<Integer>> results = new ArrayList<>();
+                for (String path : List.of("/api/v1/jobs/10/retry", "/api/v1/jobs/11/retry")) {
+                    results.add(pool.submit(() -> {
+                        go.await(5, TimeUnit.SECONDS);
+                        return mvc.perform(post(path).header("X-Api-Key", "my-a")).andReturn().getResponse().getStatus();
+                    }));
+                }
+                results.add(pool.submit(() -> {
+                    go.await(5, TimeUnit.SECONDS);
+                    return mvc.perform(post("/api/v1/assets/6/transcodes").header("X-Api-Key", "my-a")
+                            .contentType("application/json").content("{\"template\":\"hd\"}")).andReturn().getResponse().getStatus();
+                }));
+                go.countDown();
+                for (var f : results) codes.add(f.get(20, TimeUnit.SECONDS));
+            } finally {
+                pool.shutdownNow();
+            }
+            codes.sort(Integer::compare);
+            assertEquals(List.of(202, 409, 409), codes, "round " + round + ": one in-flight job per asset");
+            assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_transcode_job WHERE asset_id = 6 "
+                    + "AND status IN ('PENDING','RETRYING','RUNNING')", Integer.class), "round " + round);
+            assertEquals(1, jdbc.queryForObject("SELECT COUNT(*) FROM vod_outbox", Integer.class), "round " + round);
+        }
+    }
+
+    @Test
     void retranscodeIdempotencyEventsDeliveryAndUsageOnMysql() throws Exception {
         jdbc.update("UPDATE vod_tenant SET max_concurrent_jobs = NULL");
         mvc.perform(post("/api/v1/assets/5/transcodes").header("X-Api-Key", "my-a").header("Idempotency-Key", "k1"))
