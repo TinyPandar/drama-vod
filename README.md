@@ -73,6 +73,9 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
    - 新增 `.gitattributes`：`* text=auto`，`*.envsh`、`*.sh` 设为 `text eol=lf`（仓库里目前只有 `nginx/entrypoint.d/05-vod-env.envsh` 这一个匹配文件，需求里写的 `nginx/templates/` 下实际没有 `.envsh`）。
    - 验证：`git ls-files --eol` 显示 196 个已跟踪文件在索引里全是 LF。`git add --renormalize .` 之后，除本分支改过的文件外没有任何文件变化，没有整体重写换行。用 `git -c core.autocrlf=true clone` 克隆提交后的分支：197 个文件里只有 `05-vod-env.envsh` 检出为 LF（`attr/text eol=lf`，文件里 0 个 `\r`），其余 196 个文本文件照常转成 CRLF（和没有 `.gitattributes` 时一样）。
 5. **CI**：`.github/workflows/ci.yml` 的必跑 MySQL 用例清单加入 `vod.job.Phase6MysqlTest`。第 1 条的 MySQL 用例加在已有的 `Phase5MysqlTest` 里，不是新类，清单不需要再加。README「检查」一节的 CI 说明同步补上这个类名。
+7. **额外：CI 的 python job 装 ffmpeg**（不在 6 条清单里，但不修的话「三个 job 都绿」做不到）
+   - 现状：Phase 6 新增的 `scripts/test_poster.py` 里有一组用例（5 个）要用真实 ffmpeg 抽帧，没有 ffmpeg 时用 `skipUnless` 跳过。CI 是基于 Phase 6 之前的 `main` 写的，没装 ffmpeg；两个分支合并后，「出现 skipped 即失败」的检查让 python job 变红。`main` 上 `ce86b9a` 的 run [43583010001](https://github.com/TinyPandar/drama-vod/actions/runs/43583010001) 和本分支计划提交 `ad75d0f` 的 run [43583046519](https://github.com/TinyPandar/drama-vod/actions/runs/43583046519) 都是这样：`test_poster.py` 输出 `OK (skipped=5)`。
+   - 改动：`.github/workflows/ci.yml` 的 python job 安装依赖时 `apt-get install ffmpeg`（CI 方案原文允许「实际需要就装」），注释同步更新。没有改测试，也没有放宽跳过检查。
 6. **README 状态**：Phase 6、CI 两节实现说明的标题从「未合并」改成「已合并到 `main`」，分别注明 `c7ce6c9`、`ce86b9a`。用 `git merge-base --is-ancestor` 确认这两个提交都在 `origin/main` 上。正文没动。
 
 **本分支实际跑过的测试**（2026-11-14，macOS arm64，本机**没有 Docker，也没有 MySQL**）
