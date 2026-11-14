@@ -82,6 +82,12 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 - `cd vod-api && mvn test`（Temurin 21.0.13 + Maven 3.9.9，H2）：**145 个用例，0 失败，13 个跳过**（跳过的是 MySQL 用例：`MysqlSemanticsTest` 5 个、`Phase5MysqlTest` 4 个、`Phase6MysqlTest` 4 个）。同一台机器上基线 `ad75d0f` 是 143 个用例、12 个跳过；本分支新增 H2 用例 1 个、MySQL 用例 1 个。
 - 连真 MySQL 的 Java 用例本机没有跑，只在 GitHub Actions 的 `mysql:8.4` 服务容器里跑（结果见下面 CI 一条）。
+- **GitHub Actions**：
+  - 第一次推送（`6a57312`）的 run [43584509113](https://github.com/TinyPandar/drama-vod/actions/runs/43584509113)：`vod-api`、`console` 绿；`python` 红，原因是上面第 7 条说的 `test_poster.py` `skipped=5`，和本分支改动无关。
+  - 装 ffmpeg 后（`cc364ab`）的 run [43584712437](https://github.com/TinyPandar/drama-vod/actions/runs/43584712437)：**三个 job 都绿**。
+    - `vod-api`：29 个测试类，**145 个用例**，skipped=0、failures=0、errors=0。`MysqlSemanticsTest` 5 个、`Phase5MysqlTest` 4 个（含第 1 条新增的并发用例）、`Phase6MysqlTest` 4 个，都连 `mysql:8.4` 真跑。
+    - `python`：13 个脚本全过，没有跳过。`test_fencing_mysql` 30、`test_poster` 16（ffmpeg 6.1.1，5 个真实抽帧用例这次真跑了）、`test_api_playback` 9。
+    - `console`：构建通过，提交的产物没过期。
 - Python 3.12.13（按 `api/requirements.txt`、`worker/requirements.txt` 和 `httpx==0.28.1` 新建的 venv）：`contract_check.py`、`test_api_playback`（9，原 8）、`test_bridge`、`test_dlq`（5）、`test_hls_verify`、`test_output_gc`（9）、`test_playback_contract`、`test_poster`（16）、`test_transcode_template`（3）、`test_vod_client`、`test_worker_fencing`（7）、`test_worker_reliability`（39）全过，没有跳过。`test_fencing_mysql.py` 本机连不上 MySQL（退出码 5），只在 CI 里跑。
 - `nginx_local_check.py`（Homebrew nginx 1.31.4，不是 compose 的 `nginx:1.27-alpine`）：**46/46**（基线 42/42，新增 4 项）。
 - **没跑**（需要 Docker）：`docker compose` 起栈、`scripts/playback_live.py`（缓存命中后 Range 206 在真实栈上是否通过）、`scripts/fault_inject.py --only minio`（默认参数下是否稳定 PASS）、`scripts/e2e.py`、`platform_live.py`、`media_live.py`。这些都没有验证结果。
