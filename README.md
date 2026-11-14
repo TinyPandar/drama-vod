@@ -167,6 +167,56 @@ COMPOSE_PROJECT_NAME=drama-vod-p6 VOD_ADMIN_USERNAME=… VOD_ADMIN_PASSWORD=… 
 - 控制台没有在浏览器里实际点过；分片并发数（3）和每片重试次数（3）是前端常量。
 - 上传网关的 CORS 只信请求里的 `Origin`（这是原有做法，本分支只修了重复头、暴露 ETag 和预检）。
 
+## 分支方案：CI（GitHub Actions 跑现有测试）
+
+本分支：`plan/ci`，基线 `main` = `e1e211f`（Phase 5 和返工都已合并）。目前仓库没有任何 CI，测试全靠本地手跑。这一刀只做「每次 push 和 PR 自动跑现有测试」，不新写业务测试，也不改业务代码。
+
+### 要做的事
+
+1. 新增 `.github/workflows/ci.yml`，触发：`push` 到任意分支、`pull_request` 到 `main`，外加 `workflow_dispatch`。设 `concurrency`，同一分支新提交取消旧运行。权限只给 `contents: read`。
+2. **job `vod-api`**：`ubuntu-latest`，`actions/setup-java`（Temurin 21，开 Maven 缓存），起 `mysql:8.4` service（root 空口令或固定测试口令，带健康检查），设置 `VOD_TEST_MYSQL_URL` / `VOD_TEST_MYSQL_USER`（/ `VOD_TEST_MYSQL_PASSWORD`）后在 `vod-api` 下跑 `mvn -B test`。这样 H2 用例和 `Phase5MysqlTest`、`MysqlSemanticsTest` 一次跑完，**MySQL 用例不能被跳过**（在步骤里检查 surefire 报告里这两个类 skipped=0，或用等价办法让「没连上库而全跳过」变成失败）。失败时上传 `target/surefire-reports` 作为 artifact。
+3. **job `python`**：`actions/setup-python`（版本与 `api/Dockerfile`、`worker/Dockerfile` 一致），装 `api/requirements.txt`、`worker/requirements.txt` 和测试要用的 `pymysql`；同样起 `mysql:8.4` service。依次跑 `scripts/contract_check.py` 和 `scripts/test_*.py` 全部 11 个（`test_fencing_mysql.py` 用 service 的端口）。任一脚本非零退出就失败，不要 `|| true`。需要 ffmpeg 的用例目前都是假的 ffmpeg，如果实际需要就 `apt-get install ffmpeg`，不需要就别装。
+4. **job `console`**：`actions/setup-node`（写明主版本，开 npm 缓存），在 `console` 下 `npm ci && npm run build`。现在 `npm ci` 报锁文件和 `package.json` 不同步（Phase 5 审查 N7，main 上本来就有），本分支顺手用 `npm install` 重新生成 `package-lock.json` 修掉，**不升级依赖版本范围**。可选：构建完 `git diff --exit-code` 检查提交里的构建产物没过期（如果仓库确实提交了产物）。
+5. 三个 job 并行；README「检查」一节补一行 CI 说明和徽章（可选），写清楚 CI 里跑什么、不跑什么。
+
+### 本分支不要做
+
+- 不跑需要整套 compose 的脚本：`e2e.py`、`playback_live.py`、`platform_live.py`、`core_live.py`、`drama_vod_live.py`、`fault_inject.py`、`kill_recover_submit.py`、`browser_check.py`、`nginx_local_check.py`。Docker 集成测试以后单独一刀（可能是手动触发或 nightly）。
+- 不改业务代码和现有测试的断言；如果 CI 环境下某个测试暴露问题（比如时序、时区、路径），先在 README 实现说明里记下来，最小修，修法写清楚，不要用跳过掩盖。
+- 不加发布、镜像推送、部署、代码覆盖率服务、需要 secrets 的步骤。
+- 不改 Phase 6 分支（`plan/phase-6`）；它以后合 main 时自然带上 CI。
+
+### 测试要求
+
+推上去后看 Actions 实际结果：三个 job 都绿，并在实现说明里记录 run 链接、`vod-api` 用例数和 MySQL 用例确实没跳过。故意改坏一个断言在临时分支验证 CI 会红（验证完删掉那个临时分支，不要合）。
+
+## CI 实现说明（`plan/ci`，未合并）
+
+改动只有三处：新增 `.github/workflows/ci.yml`；重新生成 `console/package-lock.json`；README「检查」一节补 CI 说明和徽章。没有改业务代码，也没有改测试和断言。
+
+- **触发与权限**：`push` 任意分支、`pull_request` 到 `main`、`workflow_dispatch`；`concurrency` 按 workflow + ref 分组，新提交取消旧运行；`permissions: contents: read`。没有发布、部署、覆盖率服务，也没有 secrets。服务容器里的 MySQL root 口令 `ci-root` 只在 CI 用，不是密钥。
+- **`vod-api`**：Temurin 21 + Maven 缓存，`mysql:8.4` 服务容器（`mysqladmin ping` 健康检查，端口随机映射），`VOD_TEST_MYSQL_URL` / `USER` / `PASSWORD` 指向它，跑 `mvn -B test`。之后用一段 Python 读 `target/surefire-reports/TEST-*.xml`，把总用例数写进 job summary；`MysqlSemanticsTest`、`Phase5MysqlTest` 的报告缺失、`tests=0` 或 `skipped≠0` 都算失败，这样「没连上库导致整类跳过」就会变红。失败时上传 `target/surefire-reports` 作为 artifact（`vod-api-surefire-reports`）。
+- **`python`**：Python 3.12（与两个 Dockerfile 的 `python:3.12-slim` 一致），pip 缓存，装 `api/requirements.txt`、`worker/requirements.txt`（两者已经包含 `pymysql`），另装 `httpx==0.28.1`。同样起 `mysql:8.4`，`MYSQL_HOST` / `MYSQL_PORT` 指向服务端口。依次跑 `scripts/contract_check.py` 和 `scripts/test_*.py`（glob，当前 11 个，共 12 个脚本）：每个脚本单独分组输出，任何一个非零退出或输出里出现 `skipped=` 都算失败，全部跑完后再统一给结论，不用 `|| true`。用例里的 ffmpeg 都是假的（`build_ffmpeg` 被替换），所以没装 ffmpeg。
+- **`console`**：Node 24 + npm 缓存，`npm ci && npm run build`（含 `vue-tsc` 类型检查）。构建后检查 `nginx/html/vod-console/` 没有改动、也没有新增未跟踪文件，也就是确认提交的构建产物和源码一致。
+
+CI 落地时暴露并修掉的问题（都不涉及业务代码和测试断言）：
+
+1. **锁文件不同步（Phase 5 审查 N7）**：`package-lock.json` 缺少 rollup 4.68.0 的可选平台包 `@rollup/rollup-android-x64@4.68.0`。npm 10（Node 22 自带）的 `npm ci` 不检查这一项，所以本地能过；npm 11（Node 24 自带）会报 `Missing: @rollup/rollup-android-x64@4.68.0 from lock file`。修法：用 npm 11 在 `console/` 下跑 `npm install` 重新生成锁文件。结果只多了这一个包条目（+14 行）；`package.json` 和所有已锁定的版本都没变，没有升级依赖范围。npm 10 和 npm 11 的 `npm ci` 都能通过，本地重新构建出的产物和仓库里的逐字节一致。
+2. **`test_api_playback.py` 缺 httpx 会整类跳过**：它在 `ImportError` 时 `skipIf`，而 FastAPI 的 `TestClient` 需要 httpx，两个 requirements 都没有它（它不是运行时依赖）。CI 里单独装 `httpx==0.28.1`（与 fastapi 0.115.6 / starlette 0.41.3 搭配能跑通），并加了「出现 skipped 即失败」的检查。没有改 requirements 文件。
+3. **workflow 自身**：第一次推送（`198d935`）时把 `${{ job.services.mysql.ports['3306'] }}` 写在了 job 级 `env`，但 job 上下文只能在步骤级用，GitHub 在解析阶段直接拒绝（[run 43251392126](https://github.com/TinyPandar/drama-vod/actions/runs/43251392126)，0 秒、没有 job 启动）。`ef70fc1` 把这些变量挪到对应步骤的 `env` 里。
+
+除此之外，CI 环境下没有测试出现时序、时区或路径问题，第一次真正跑起来就三个 job 全绿。
+
+**Actions 结果**
+
+- 绿：[run 43251558134](https://github.com/TinyPandar/drama-vod/actions/runs/43251558134)（`ef70fc1`），`console` 12s、`python` 54s、`vod-api` 1m59s。
+  - `vod-api`：26 个测试类，**115 个用例**，skipped=0、failures=0、errors=0。其中 `MysqlSemanticsTest` 5 个、`Phase5MysqlTest` 3 个，都连 `mysql:8.4` 真跑，skipped=0。
+  - `python`：12 个脚本全部 exit 0，没有 skipped。unittest 用例数：`test_api_playback` 8、`test_dlq` 5、`test_fencing_mysql` 28（日志打印 `mysql 8.4.13 db vod_fence_test`）、`test_output_gc` 9、`test_transcode_template` 3、`test_worker_fencing` 7、`test_worker_reliability` 39，共 99 个；`contract_check`、`test_bridge`、`test_hls_verify`、`test_playback_contract`、`test_vod_client` 是断言脚本，不报用例数，以退出码为准。
+  - `console`：`npm ci` 装了 52 个包，构建产物与仓库一致。
+- 红（验证用）：临时分支 `tmp/ci-red-check` 把 `MysqlSemanticsTest.connectorJCountsMatchedRowsByDefault` 的 `assertEquals(1, …)` 改成 `assertEquals(2, …)`，结果是 [run 43252101699](https://github.com/TinyPandar/drama-vod/actions/runs/43252101699)：`vod-api` 失败（`expected: <2> but was: <1>`，也说明 MySQL 用例确实在跑），surefire 报告 artifact 已上传；`python`、`console` 仍是绿的。验证完已经删掉这个分支（本地和 origin 都删了），没有合并。
+
+`ubuntu-latest` 运行时带一条平台提示：这个标签从 2026-10-19 起陆续切到 Ubuntu 26。目前不影响，以后如果镜像变化导致失败，再考虑固定成 `ubuntu-24.04`。
+
 ## 分支方案：Phase 5 平台化控制台
 
 本分支：`plan/phase-5`，基线 `main` = `9cab039`（Phase 4 已合并）。下面先是方案原文，实现情况见紧接着的「Phase 5 实现说明」。
@@ -270,7 +320,7 @@ COMPOSE_PROJECT_NAME=drama-vod-p6 VOD_ADMIN_USERNAME=… VOD_ADMIN_PASSWORD=… 
 
 
 
-## Phase 5 实现说明（已合并到 `main`，`248b6e3`）
+## Phase 5 实现说明（已合并到 `main`，`248b6e3`；返工 `e1e211f`）
 
 旧 Demo 链路、消息 v1、`uk_asset_profile`、Flyway V1–V11、`mysql/init.sql` 都没动；新表结构在 `V12__platform_console.sql`（H2 MySQL 模式与 MySQL 8.4 都跑过）。
 
@@ -639,6 +689,10 @@ docker compose --profile obs up -d prometheus
 网页静态文件挂载自 `nginx/html`，更新后刷新即可。修改 API 或 Worker 后运行 `docker compose up -d --build api worker vod-api`。控制台源代码位于 `console/`；运行 `npm ci && npm run build` 会更新 `nginx/html/vod-console/`。手机访问请使用运行 Docker 主机的局域网地址。
 
 ## 检查
+
+[![CI](https://github.com/TinyPandar/drama-vod/actions/workflows/ci.yml/badge.svg)](https://github.com/TinyPandar/drama-vod/actions/workflows/ci.yml)
+
+CI（`.github/workflows/ci.yml`）在 push 到任意分支、向 `main` 提 PR 时自动跑，三个 job 并行：`vod-api` 用 `mysql:8.4` 服务容器跑 `mvn -B test`（H2 用例和 `MysqlSemanticsTest`、`Phase5MysqlTest` 一起跑，MySQL 用例缺失或被跳过算失败）；`python` 跑 `contract_check.py` 和全部 `scripts/test_*.py`（`test_fencing_mysql.py` 连服务容器，任何脚本非零退出或出现 skipped 算失败）；`console` 跑 `npm ci && npm run build`，并检查提交的 `nginx/html/vod-console/` 产物没过期。CI **不跑**需要整套 Compose 的脚本（`e2e.py`、`*_live.py`、`fault_inject.py`、`kill_recover_submit.py`、`browser_check.py`、`nginx_local_check.py`），也不发布、不部署、不用 secrets。
 
 ```bash
 python scripts/contract_check.py

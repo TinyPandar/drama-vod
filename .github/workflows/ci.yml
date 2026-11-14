@@ -1,0 +1,165 @@
+# 每次 push / PR 自动跑仓库里现有的测试。不跑需要整套 Docker Compose 的脚本，
+# 不发布、不部署、不用 secrets。MySQL 口令是服务容器里的一次性测试口令，不是密钥。
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  vod-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root
+        ports:
+          - 3306/tcp
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-root"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: vod-api/pom.xml
+      - name: mvn test（H2 + MySQL 8.4）
+        working-directory: vod-api
+        # job 上下文（服务端口）只能在步骤级 env 里用
+        env:
+          VOD_TEST_MYSQL_URL: jdbc:mysql://127.0.0.1:${{ job.services.mysql.ports['3306'] }}
+          VOD_TEST_MYSQL_USER: root
+          VOD_TEST_MYSQL_PASSWORD: ci-root
+        run: mvn -B test
+      - name: 统计用例数，确认 MySQL 用例没有被跳过
+        if: always()
+        working-directory: vod-api/target/surefire-reports
+        shell: python3 {0}
+        run: |
+          import glob, os, sys
+          import xml.etree.ElementTree as ET
+          total = {"tests": 0, "skipped": 0, "failures": 0, "errors": 0}
+          by_class = {}
+          for path in glob.glob("TEST-*.xml"):
+              root = ET.parse(path).getroot()
+              counts = {k: int(root.get(k, 0)) for k in total}
+              by_class[root.get("name")] = counts
+              for k in total:
+                  total[k] += counts[k]
+          lines = [f"vod-api: {len(by_class)} 个测试类，tests={total['tests']} skipped={total['skipped']} "
+                   f"failures={total['failures']} errors={total['errors']}"]
+          bad = False
+          for name in ("vod.job.MysqlSemanticsTest", "vod.job.Phase5MysqlTest"):
+              c = by_class.get(name)
+              if c is None or c["tests"] == 0 or c["skipped"] != 0:
+                  bad = True
+                  lines.append(f"FAIL {name}: {c}（MySQL 用例必须真跑，不能缺失或被跳过）")
+              else:
+                  lines.append(f"ok   {name}: tests={c['tests']} skipped=0")
+          print("\n".join(lines))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write("```\n" + "\n".join(lines) + "\n```\n")
+          sys.exit(1 if bad else 0)
+      - name: 失败时上传 surefire 报告
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: vod-api-surefire-reports
+          path: vod-api/target/surefire-reports
+          if-no-files-found: ignore
+
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root
+        ports:
+          - 3306/tcp
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-root"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # 与 api/Dockerfile、worker/Dockerfile 的 python:3.12-slim 一致
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            api/requirements.txt
+            worker/requirements.txt
+      - name: 安装依赖
+        # pymysql 已在两个 requirements 里；httpx 是 FastAPI TestClient 需要的，
+        # 缺了 test_api_playback.py 会整类跳过。ffmpeg 在用例里都是假的，不装。
+        run: |
+          python -m pip install -r api/requirements.txt -r worker/requirements.txt httpx==0.28.1
+      - name: contract_check + scripts/test_*.py
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: ${{ job.services.mysql.ports['3306'] }}
+          MYSQL_USER: root
+          MYSQL_PASSWORD: ci-root
+        run: |
+          # 默认 shell 带 -e，这里自己收集每个脚本的退出码，最后统一失败
+          set +e -uo pipefail
+          status=0
+          ran=0
+          for f in scripts/contract_check.py scripts/test_*.py; do
+            echo "::group::$f"
+            out=$(python "$f" 2>&1); rc=$?
+            echo "$out"
+            echo "::endgroup::"
+            ran=$((ran + 1))
+            if [ "$rc" -ne 0 ]; then
+              echo "::error file=$f::exit $rc"; status=1
+            elif grep -q "skipped=" <<<"$out"; then
+              echo "::error file=$f::有用例被跳过（CI 里所有用例都要真跑）"; status=1
+            fi
+            summary=$(grep -E '^(Ran [0-9]+ tests?|OK|FAILED)' <<<"$out" | tr '\n' ' ')
+            echo "- \`$f\` exit=$rc ${summary}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "ran $ran scripts"
+          exit $status
+
+  console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: 提交的构建产物与源码一致
+        # vite 输出到 nginx/html/vod-console/，仓库里提交了这份产物；源码改了没重新构建就会在这里失败
+        run: |
+          git status --porcelain --untracked-files=all -- ../nginx/html/vod-console
+          test -z "$(git status --porcelain --untracked-files=all -- ../nginx/html/vod-console)"
