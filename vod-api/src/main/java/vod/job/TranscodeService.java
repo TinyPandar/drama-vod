@@ -21,6 +21,7 @@ import java.util.Set;
 
 /**
  * Phase 5：按模板重新转码（POST /api/v1/assets/{id}/transcodes）与租户侧重试（POST /api/v1/jobs/{id}/retry）。
+ * 两者都锁住同一资产的全部任务行，任意模板有进行中的任务就 409：同一资产同一时间只有一个任务在转。
  *
  * <p>都不拆 uk_asset_profile：一个资产 + 一个模板（profile）永远只有一行任务。终态任务被复用——同一事务里改回 PENDING、
  * claim_version+1、清租约 / 错误 / attempts，写一条新 outbox（消息 v1 不变）和一条 transcode.requested 事件。
@@ -109,21 +110,34 @@ public class TranscodeService {
     @Transactional
     public Result retry(long tenantId, long jobId, String idemKey, String traceId) {
         quotas.lockTenant(tenantId);
-        var jobs = jdbc.query("SELECT tenant_id, asset_id, status, template_id FROM vod_transcode_job WHERE id = ? FOR UPDATE",
-                (rs, n) -> new Object[]{rs.getLong(1), rs.getLong(2), rs.getString(3), rs.getObject(4)}, jobId);
-        if (jobs.isEmpty()) throw new TenantGuard.ResourceNotVisibleException();
-        TenantGuard.requireVisible(tenantId, (Long) jobs.get(0)[0]);
+        // asset_id / tenant_id 建行后不变，这里先不加锁读，下面和 transcode 一样按 id 顺序锁住这个资产的全部任务行，
+        // 加锁顺序保持「租户 → Idempotency-Key → 任务」。
+        var owner = jdbc.query("SELECT tenant_id, asset_id FROM vod_transcode_job WHERE id = ?",
+                (rs, n) -> new long[]{rs.getLong(1), rs.getLong(2)}, jobId);
+        if (owner.isEmpty()) throw new TenantGuard.ResourceNotVisibleException();
+        TenantGuard.requireVisible(tenantId, owner.get(0)[0]);
         var claim = idempotency.claim(tenantId, "retry", idemKey, "job:" + jobId);
         if (claim != null && claim.replayJobId() != null) return new Result(claim.replayJobId(), true);
-        long assetId = (Long) jobs.get(0)[1];
-        String status = (String) jobs.get(0)[2];
+        long assetId = owner.get(0)[1];
+        var all = jdbc.query("SELECT id, status, profile, template_id FROM vod_transcode_job WHERE asset_id = ? ORDER BY id FOR UPDATE",
+                (rs, n) -> new Object[]{rs.getLong(1), rs.getString(2), rs.getString(3), rs.getObject(4)}, assetId);
+        Object[] self = all.stream().filter(j -> (Long) j[0] == jobId).findFirst()
+                .orElseThrow(TenantGuard.ResourceNotVisibleException::new);
+        String status = (String) self[1];
         boolean allowed = "FAILED".equals(status) || (retryCancelled && "CANCELLED".equals(status));
         if (!allowed) {
             throw new UploadService.ConflictException("job is " + status + ", only FAILED"
                     + (retryCancelled ? " or CANCELLED" : "") + " jobs can be retried");
         }
+        // 和 transcode 一致：同一资产任意模板还有进行中的任务就 409，不重置、不写 outbox
+        for (Object[] other : all) {
+            if ((Long) other[0] != jobId && ACTIVE.contains((String) other[1])) {
+                throw new UploadService.ConflictException("job " + other[0] + " (template " + other[2] + ") of this asset is "
+                        + other[1] + ", wait for it to finish or cancel it");
+            }
+        }
         quotas.check(tenantId);
-        Object templateId = jobs.get(0)[3];
+        Object templateId = self[3];
         reset(jobId, status, templateId == null ? null : ((Number) templateId).longValue());
         requeue(tenantId, jobId, assetId, traceId, "retry");
         idempotency.complete(claim, jobId);

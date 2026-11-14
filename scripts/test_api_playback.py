@@ -76,6 +76,31 @@ class ApiTest(unittest.TestCase):
         r = self.client.get("/internal/origin/v1/5/9-1/master.m3u8", headers={"X-Origin-Secret": "origin-secret-value"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(seen, ["assets/v1/5/9-1/master.m3u8"])  # gen 路径按多级对象键回源
+        self.assertNotIn("content-length", r.headers)  # 对象大小未知时不编造
+
+    def test_internal_origin_sends_content_length_when_size_known(self):
+        """Nginx 的 range 过滤要求上游带 Content-Length，否则缓存命中后的 Range 只回 200。"""
+        main.ORIGIN_SECRET = "origin-secret-value"
+        payload = bytes(range(256)) * 1000  # 256000 字节，跨多个 64 KiB 块
+
+        class Body:
+            def iter_chunks(self, n):
+                for i in range(0, len(payload), n):
+                    yield payload[i:i + n]
+
+            def close(self):
+                pass
+
+        class S3:
+            def get_object(self, Bucket, Key):
+                return {"Body": Body(), "ContentType": "video/mp2t", "ContentLength": len(payload)}
+
+        main.s3_internal = S3()
+        r = self.client.get("/internal/origin/v1/5/9-1/720p/seg_00001.ts", headers={"X-Origin-Secret": "origin-secret-value"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["content-length"], str(len(payload)))
+        self.assertNotIn("transfer-encoding", r.headers)
+        self.assertEqual(r.content, payload)
 
     def test_origin_check_uses_constant_time_compare(self):
         src = open(main.__file__, encoding="utf-8").read()

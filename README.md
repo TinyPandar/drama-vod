@@ -50,6 +50,39 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 - `mvn test`（H2）和连真 MySQL 的测试全过；`scripts/contract_check.py` 和 `scripts/test_*.py` 全过；本分支 GitHub Actions 三个 job 都绿。
 - 在下面「实现说明」里写清：每条改了哪些文件、怎么验证的、测试的真实数字、没在 Docker 上跑的项目明确标出来。不要编造任何性能数字。
 
+## 遗留 bug 清理实现说明（`fix/leftovers`，未合并）
+
+按上面 6 条做的最小改动。没有新增 Flyway 迁移，没改消息 v1、V1–V13、Worker 的重试逻辑和 `api/common.py` / `worker/common.py`；没有加新功能。
+
+1. **重试也按资产拦进行中任务**
+   - 改动：`vod-api/src/main/java/vod/job/TranscodeService.java`（`retry`），`V1Controller.java` 只改了接口注释。
+   - `retry` 先不加锁读出任务的租户和资产（建行后不变），校验租户、处理 Idempotency-Key 重放，然后和 `transcode` 一样按 id 顺序 `FOR UPDATE` 锁住这个资产的全部任务行。同一资产另有任务（任意模板）在 `PENDING`/`RETRYING`/`RUNNING` 就 409，消息里写明是哪个任务、哪个模板；这时不重置任务、不写 outbox、不记事件和用量，带 Idempotency-Key 的请求随事务回滚，不留可重放的结果。加锁顺序变成「租户 → Idempotency-Key → 任务」，和类注释里写的一致（原来是先锁任务行再占 key）。没有冲突时行为不变：只允许 `FAILED`（配置允许时含 `CANCELLED`），跨租户 404，重放返回 200 + 同一任务。
+   - H2：`TranscodeApiTest.retryConflictsWhenAnotherJobOfSameAssetIsActive`。另一个模板的任务依次处于 `PENDING`/`RETRYING`/`RUNNING` 时，重试返回 409（带和不带 Idempotency-Key 都测）；任务行状态和 `claim_version` 不变，任务数、outbox、用量、key 表都不变。另一个任务结束后，同一个 key 正常重试（202，`claim_version` +1）；再次重放返回 200 + 同一任务，outbox 不增加。反方向（ladder 在跑时重试 mobile）也是 409，跨租户仍是 404。把这条用例放到基线代码上跑，结果是红的（`expected:<409> but was:<202>`）。
+   - MySQL：加在 `Phase5MysqlTest.concurrentRetriesAndRetranscodeOnSameAssetLeaveOnlyOneActiveJob`，没有新建测试类。先按顺序测一遍：另一个任务 `RUNNING` 时重试返回 409，不改行，也不写 outbox 和 key。再并发跑 10 轮：每轮同时发「重试 ladder_v1」「重试 mobile」「用第三个模板 hd 重新转码」三个请求，打同一个资产。每轮都断言状态码排序后是 `[202, 409, 409]`、该资产进行中的任务恰好 1 个、outbox 恰好 1 条。
+2. **回源带 Content-Length，缓存命中后 Range 返回 206**
+   - 改动：`api/main.py` 的 `internal_origin`：S3 `get_object` 返回整数 `ContentLength` 时，`StreamingResponse` 带上 `Content-Length`；拿不到大小就不带，不编造。
+   - `scripts/test_api_playback.py`：新增 1 个用例，验证大小已知时 `content-length` 等于对象大小、没有 `transfer-encoding`、正文完整；原有用例补一条断言：大小未知时不带这个头。新增用例放到基线 `main.py` 上跑会失败（`KeyError: 'content-length'`）。
+   - `scripts/nginx_local_check.py`：假回源默认和真回源一致，带 `Content-Length`。路径里有 `/nolen/` 时模拟修复前的行为：不带 `Content-Length`，靠关连接结束正文。新增 4 项检查：MISS 时 `Content-Length` 原样透传；缓存命中后 `bytes=1000-1099` 和 `bytes=-48` 都返回 206，`Content-Range` 与正文逐字节正确；对照组的回源不带 `Content-Length`，缓存命中后同样的 Range 请求返回 200 全量、没有 `Content-Range`。对照组说明 206 依赖回源 `Content-Length`，假回源不会再掩盖这个问题。
+   - 另外用真实 uvicorn 起了 `api/main.py`（S3 换成假的，跳过 startup），按 Nginx 回源的 HTTP/1.0 请求：大小已知时响应头里有 `content-length: 256000`；对照路径没有这个头，正文同为 256000 字节。这个检查是临时手跑的，没有提交脚本。
+3. **`fault_inject.py` 的 MinIO 场景**
+   - 改动：只改 `scripts/fault_inject.py`。
+   - 选择：**停机时长跟着故障走**。任务进入 `RUNNING` 后停 MinIO，一直等到 Worker 日志里出现该任务的 `job_error`，或任务已经进入终态，再启动 MinIO。`--outage-seconds` 改为停机上限，默认值从 15 改为 300。判定条件不变：必须看到该任务的 `job_error`，最后 `READY`，或 `FAILED` 且带 `error_code`。
+   - 理由：Worker 只在下载源文件、上传产物和远端校验时访问 MinIO，转码期间不访问。固定 15 秒的停机通常落在 FFmpeg 转码期间，上传前 MinIO 已经恢复；落在下载阶段时，又会被 S3 客户端重试吸收，所以结果取决于转码耗时。改成一直停到 Worker 报错后，最晚也会在上传阶段撞上故障，不再依赖时机。没有改 Worker 的重试逻辑。只延长固定时长（例如 120 秒）也能过，但在慢机器或长源文件上仍可能不够，所以没有采用。
+   - 验证：`py_compile` 通过。另外用桩替换 compose、数据库和日志，在本机走了一遍控制流：停机后第 3 秒出现 `job_error`，脚本立刻启动 MinIO 并判 PASS。**没有在 Docker 上跑**（本机没有 Docker），真实栈上是否稳定 PASS 还没验证。
+4. **`.gitattributes`**
+   - 新增 `.gitattributes`：`* text=auto`，`*.envsh`、`*.sh` 设为 `text eol=lf`（仓库里目前只有 `nginx/entrypoint.d/05-vod-env.envsh` 这一个匹配文件，需求里写的 `nginx/templates/` 下实际没有 `.envsh`）。
+   - 验证：`git ls-files --eol` 显示 196 个已跟踪文件在索引里全是 LF。`git add --renormalize .` 之后，除本分支改过的文件外没有任何文件变化，没有整体重写换行。用 `git -c core.autocrlf=true clone` 克隆提交后的分支：197 个文件里只有 `05-vod-env.envsh` 检出为 LF（`attr/text eol=lf`，文件里 0 个 `\r`），其余 196 个文本文件照常转成 CRLF（和没有 `.gitattributes` 时一样）。
+5. **CI**：`.github/workflows/ci.yml` 的必跑 MySQL 用例清单加入 `vod.job.Phase6MysqlTest`。第 1 条的 MySQL 用例加在已有的 `Phase5MysqlTest` 里，不是新类，清单不需要再加。README「检查」一节的 CI 说明同步补上这个类名。
+6. **README 状态**：Phase 6、CI 两节实现说明的标题从「未合并」改成「已合并到 `main`」，分别注明 `c7ce6c9`、`ce86b9a`。用 `git merge-base --is-ancestor` 确认这两个提交都在 `origin/main` 上。正文没动。
+
+**本分支实际跑过的测试**（2026-11-14，macOS arm64，本机**没有 Docker，也没有 MySQL**）
+
+- `cd vod-api && mvn test`（Temurin 21.0.13 + Maven 3.9.9，H2）：**145 个用例，0 失败，13 个跳过**（跳过的是 MySQL 用例：`MysqlSemanticsTest` 5 个、`Phase5MysqlTest` 4 个、`Phase6MysqlTest` 4 个）。同一台机器上基线 `ad75d0f` 是 143 个用例、12 个跳过；本分支新增 H2 用例 1 个、MySQL 用例 1 个。
+- 连真 MySQL 的 Java 用例本机没有跑，只在 GitHub Actions 的 `mysql:8.4` 服务容器里跑（结果见下面 CI 一条）。
+- Python 3.12.13（按 `api/requirements.txt`、`worker/requirements.txt` 和 `httpx==0.28.1` 新建的 venv）：`contract_check.py`、`test_api_playback`（9，原 8）、`test_bridge`、`test_dlq`（5）、`test_hls_verify`、`test_output_gc`（9）、`test_playback_contract`、`test_poster`（16）、`test_transcode_template`（3）、`test_vod_client`、`test_worker_fencing`（7）、`test_worker_reliability`（39）全过，没有跳过。`test_fencing_mysql.py` 本机连不上 MySQL（退出码 5），只在 CI 里跑。
+- `nginx_local_check.py`（Homebrew nginx 1.31.4，不是 compose 的 `nginx:1.27-alpine`）：**46/46**（基线 42/42，新增 4 项）。
+- **没跑**（需要 Docker）：`docker compose` 起栈、`scripts/playback_live.py`（缓存命中后 Range 206 在真实栈上是否通过）、`scripts/fault_inject.py --only minio`（默认参数下是否稳定 PASS）、`scripts/e2e.py`、`platform_live.py`、`media_live.py`。这些都没有验证结果。
+
 ## 分支方案：Phase 6 高级媒体能力（第一刀）
 
 本分支：`plan/phase-6`，基线 `main` = `248b6e3`（Phase 5 已合并）。下面是本分支方案。实现完成后，把实现说明写在本节后面，不要改方案原文。
@@ -127,7 +160,7 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 每个改动点补测试，并保证现有测试仍通过。有 Java 21 和 Maven 就跑 `cd vod-api && mvn test`（未设 `VOD_TEST_MYSQL_URL` 时 MySQL 用例按设计跳过；能连 MySQL 8.4 就设置后再跑一遍）。跑 `python3 scripts/contract_check.py`、`test_bridge.py`、`test_hls_verify.py`、`test_vod_client.py`、`test_worker_fencing.py`、`test_worker_reliability.py`、`test_dlq.py`、`test_output_gc.py`、`test_playback_contract.py`、`test_api_playback.py`、`test_transcode_template.py` 和新增单测。有 Docker 就用独立项目名起栈（如 `docker compose -p drama-vod-p6 up -d --build`，端口冲突时用 override），跑 `test_fencing_mysql.py`、`scripts/platform_live.py`、`scripts/e2e.py`（旧 Demo 回归）和本分支新增的验收脚本。没跑过的不要声称通过，写明原因。改完后在本分支提交（作者 `TinyPandar <meiyoujunlee@foxmail.com>`），可以 push 到 `origin/plan/phase-6`，但不要合并到 `main`。
 
-## Phase 6 实现说明（第一刀，本分支 `plan/phase-6`，未合并）
+## Phase 6 实现说明（第一刀，`plan/phase-6`，已合并到 `main`，`c7ce6c9`）
 
 按上面 10 项做的最小改动。旧 Demo 链路、消息 v1、`uk_asset_profile`、Flyway V1–V12、`api/common.py` / `worker/common.py` 的 `transcode_message()` 都没动；表结构只追加在 `V13__multipart_poster.sql`（H2 MySQL 模式与 MySQL 8.4.10 都跑过）。单次 `mode=put` 的请求与响应字段保持不变。可选小项（雪碧图、单独重抽封面、自动续期）和 Webhook `has_poster` 都**没做**。
 
@@ -234,7 +267,7 @@ COMPOSE_PROJECT_NAME=drama-vod-p6 VOD_ADMIN_USERNAME=… VOD_ADMIN_PASSWORD=… 
 
 推上去后看 Actions 实际结果：三个 job 都绿，并在实现说明里记录 run 链接、`vod-api` 用例数和 MySQL 用例确实没跳过。故意改坏一个断言在临时分支验证 CI 会红（验证完删掉那个临时分支，不要合）。
 
-## CI 实现说明（`plan/ci`，未合并）
+## CI 实现说明（`plan/ci`，已合并到 `main`，`ce86b9a`）
 
 改动只有三处：新增 `.github/workflows/ci.yml`；重新生成 `console/package-lock.json`；README「检查」一节补 CI 说明和徽章。没有改业务代码，也没有改测试和断言。
 
@@ -736,7 +769,7 @@ docker compose --profile obs up -d prometheus
 
 [![CI](https://github.com/TinyPandar/drama-vod/actions/workflows/ci.yml/badge.svg)](https://github.com/TinyPandar/drama-vod/actions/workflows/ci.yml)
 
-CI（`.github/workflows/ci.yml`）在 push 到任意分支、向 `main` 提 PR 时自动跑，三个 job 并行：`vod-api` 用 `mysql:8.4` 服务容器跑 `mvn -B test`（H2 用例和 `MysqlSemanticsTest`、`Phase5MysqlTest` 一起跑，MySQL 用例缺失或被跳过算失败）；`python` 跑 `contract_check.py` 和全部 `scripts/test_*.py`（`test_fencing_mysql.py` 连服务容器，任何脚本非零退出或出现 skipped 算失败）；`console` 跑 `npm ci && npm run build`，并检查提交的 `nginx/html/vod-console/` 产物没过期。CI **不跑**需要整套 Compose 的脚本（`e2e.py`、`*_live.py`、`fault_inject.py`、`kill_recover_submit.py`、`browser_check.py`、`nginx_local_check.py`），也不发布、不部署、不用 secrets。
+CI（`.github/workflows/ci.yml`）在 push 到任意分支、向 `main` 提 PR 时自动跑，三个 job 并行：`vod-api` 用 `mysql:8.4` 服务容器跑 `mvn -B test`（H2 用例和 `MysqlSemanticsTest`、`Phase5MysqlTest`、`Phase6MysqlTest` 一起跑，MySQL 用例缺失或被跳过算失败）；`python` 跑 `contract_check.py` 和全部 `scripts/test_*.py`（`test_fencing_mysql.py` 连服务容器，任何脚本非零退出或出现 skipped 算失败）；`console` 跑 `npm ci && npm run build`，并检查提交的 `nginx/html/vod-console/` 产物没过期。CI **不跑**需要整套 Compose 的脚本（`e2e.py`、`*_live.py`、`fault_inject.py`、`kill_recover_submit.py`、`browser_check.py`、`nginx_local_check.py`），也不发布、不部署、不用 secrets。
 
 ```bash
 python scripts/contract_check.py

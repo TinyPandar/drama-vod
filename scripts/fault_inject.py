@@ -268,23 +268,33 @@ def scenario_dup(args, media):
 
 
 def scenario_minio(args, media):
-    """转码中途停 MinIO --outage-seconds 秒再启动 → 重试后 READY，或次数用完 FAILED 且带 error_code。
-    要求故障确实打到了任务（日志里出现该任务的 job_error），否则判 FAIL（加大 --video-seconds）。"""
+    """任务 RUNNING 后停 MinIO，一直停到该任务出现 job_error（最长 --outage-seconds 秒）再启动 → 重试后 READY，
+    或次数用完 FAILED 且带 error_code。要求故障确实打到了任务（日志里出现该任务的 job_error），否则判 FAIL。"""
+    # 停机时长跟着故障走，而不是固定秒数：停机落在下载/转码阶段时 Worker 不碰 MinIO（或 S3 客户端重试能吸收短停机），
+    # 固定 15 秒常常在上传前就恢复了。保持停机直到 Worker 真的报错，上传阶段一定会撞上，结果不再取决于转码快慢。
     since = now_utc()
     asset_id, job_id = submit(media, args.video_seconds)
     if not wait(lambda: (job(job_id) or {}).get("status") == "RUNNING", args.timeout, 0.5):
         return False, f"job {job_id} never RUNNING"
+
+    def job_errors():
+        return [e for e in worker_events(since) if e.get("event") == "job_error" and e.get("job_id") == job_id]
+
     compose("stop", "minio")
+    t_down = time.time()
     try:
-        time.sleep(args.outage_seconds)
+        # 任务在停机前就跑完了（源太短）也会让这里等满上限，下面按 hit=False 判 FAIL
+        wait(lambda: job_errors() or (job(job_id) or {}).get("status") in ("SUCCEEDED", "FAILED", "CANCELLED"),
+             args.outage_seconds, 1.0)
     finally:
         compose("start", "minio")
+    down = round(time.time() - t_down, 1)
     final = wait_terminal(asset_id, args.timeout * 2)
     j = job(job_id)
-    errors = [e for e in worker_events(since) if e.get("event") == "job_error" and e.get("job_id") == job_id]
+    errors = job_errors()
     hit = bool(errors)
     ok = hit and (final == "READY" or (final == "FAILED" and j["status"] == "FAILED" and j["error_code"]))
-    return ok, f"asset {asset_id}={final}, job status={j['status']} attempts={j['attempts']} " \
+    return ok, f"minio down {down}s, asset {asset_id}={final}, job status={j['status']} attempts={j['attempts']} " \
                f"error_code={j['error_code']} job_errors={[e.get('error_code') for e in errors]}"
 
 
@@ -414,7 +424,8 @@ def main():
     ap.add_argument("--short-seconds", type=int, default=6)
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--copies", type=int, default=3, help="extra deliveries per job in the dup scenario")
-    ap.add_argument("--outage-seconds", type=int, default=15)
+    ap.add_argument("--outage-seconds", type=int, default=300,
+                    help="minio scenario: max outage; MinIO is started again as soon as the job logs job_error")
     ap.add_argument("--observe-seconds", type=int, default=20, help="extra time to watch a cancelled job")
     ap.add_argument("--gc-grace-seconds", type=int, default=30, help="shortened WORKER_OUTPUT_GC_GRACE_SECONDS")
     ap.add_argument("--gc-interval-seconds", type=int, default=5, help="shortened WORKER_OUTPUT_GC_INTERVAL_SECONDS")

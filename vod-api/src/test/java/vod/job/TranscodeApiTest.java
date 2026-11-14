@@ -183,6 +183,48 @@ class TranscodeApiTest {
     }
 
     @Test
+    void retryConflictsWhenAnotherJobOfSameAssetIsActive() throws Exception {
+        jdbc.update("INSERT INTO vod_transcode_template(tenant_id, name, ladder_json, audio_kbps) VALUES (1, 'mobile', '[[\"360p\",360,500]]', 64)");
+        long[] ids = uploaded("key-a");
+        long assetId = ids[0], ladderJob = ids[1];
+        jdbc.update("UPDATE vod_transcode_job SET status = 'FAILED', claim_version = 2 WHERE id = ?", ladderJob);
+        long mobileJob = body(mvc.perform(post("/api/v1/assets/" + assetId + "/transcodes").header("X-Api-Key", "key-a")
+                .contentType("application/json").content("{\"template\":\"mobile\"}")).andExpect(status().isAccepted())).get("id").asLong();
+        int outbox = count("vod_outbox");
+        int usage = jdbc.queryForObject("SELECT COALESCE(SUM(transcode_jobs), 0) FROM vod_usage_daily WHERE tenant_id = 1", Integer.class);
+        // mobile 任务进行中：重试同资产的 ladder 任务 409，不改行、不新建、不写 outbox、不记用量
+        for (String active : List.of("PENDING", "RETRYING", "RUNNING")) {
+            jdbc.update("UPDATE vod_transcode_job SET status = ? WHERE id = ?", active, mobileJob);
+            mvc.perform(post("/api/v1/jobs/" + ladderJob + "/retry").header("X-Api-Key", "key-a"))
+                    .andExpect(status().isConflict())
+                    .andExpect(jsonPath("$.detail").value(org.hamcrest.Matchers.containsString(active)));
+            mvc.perform(post("/api/v1/jobs/" + ladderJob + "/retry").header("X-Api-Key", "key-a").header("Idempotency-Key", "lr-1"))
+                    .andExpect(status().isConflict());
+        }
+        assertEquals("FAILED", jdbc.queryForObject("SELECT status FROM vod_transcode_job WHERE id = ?", String.class, ladderJob));
+        assertEquals(2, jdbc.queryForObject("SELECT claim_version FROM vod_transcode_job WHERE id = ?", Integer.class, ladderJob));
+        assertEquals(2, jdbc.queryForObject("SELECT COUNT(*) FROM vod_transcode_job WHERE asset_id = ?", Integer.class, assetId));
+        assertEquals(outbox, count("vod_outbox"));
+        assertEquals(usage, jdbc.queryForObject("SELECT COALESCE(SUM(transcode_jobs), 0) FROM vod_usage_daily WHERE tenant_id = 1", Integer.class));
+        assertEquals(0, jdbc.queryForObject("SELECT COUNT(*) FROM vod_idempotency_key WHERE idem_key = 'lr-1'", Integer.class));
+        // mobile 结束后（终态都行），同一个 key 正常重试；重放返回同一个任务，即使此时它自己在进行中
+        jdbc.update("UPDATE vod_transcode_job SET status = 'SUCCEEDED' WHERE id = ?", mobileJob);
+        mvc.perform(post("/api/v1/jobs/" + ladderJob + "/retry").header("X-Api-Key", "key-a").header("Idempotency-Key", "lr-1"))
+                .andExpect(status().isAccepted()).andExpect(jsonPath("$.claim_version").value(3));
+        assertEquals(outbox + 1, count("vod_outbox"));
+        mvc.perform(post("/api/v1/jobs/" + ladderJob + "/retry").header("X-Api-Key", "key-a").header("Idempotency-Key", "lr-1"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.idempotent_replay").value(true)).andExpect(jsonPath("$.id").value(ladderJob));
+        assertEquals(outbox + 1, count("vod_outbox"));
+        // 反过来：ladder 进行中时重试 mobile（先让 mobile 失败）也 409
+        jdbc.update("UPDATE vod_transcode_job SET status = 'FAILED' WHERE id = ?", mobileJob);
+        mvc.perform(post("/api/v1/jobs/" + mobileJob + "/retry").header("X-Api-Key", "key-a")).andExpect(status().isConflict());
+        assertEquals("FAILED", jdbc.queryForObject("SELECT status FROM vod_transcode_job WHERE id = ?", String.class, mobileJob));
+        assertEquals(outbox + 1, count("vod_outbox"));
+        // 跨租户仍是 404（不因为冲突检查泄露存在性）
+        mvc.perform(post("/api/v1/jobs/" + mobileJob + "/retry").header("X-Api-Key", "key-b")).andExpect(status().isNotFound());
+    }
+
+    @Test
     void notUploadedAssetIsConflict() throws Exception {
         JsonNode opened = body(mvc.perform(post("/api/v1/uploads").header("X-Api-Key", "key-a").contentType("application/json").content("{}")));
         mvc.perform(post("/api/v1/assets/" + opened.get("asset_id").asLong() + "/transcodes").header("X-Api-Key", "key-a"))
