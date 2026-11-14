@@ -6,6 +6,50 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 路线图见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)，旧接口兼容约定见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
 
+## 分支方案：遗留 bug 清理（fix/leftovers）
+
+本分支：`fix/leftovers`，基线 `main` = `ce86b9a`（Phase 6 和 CI 都已合并）。下面是需求，实现完成后把实现说明写在本节后面，不要改需求原文。
+
+协作方式：Claude Code 在**本分支**上按清单做最小改动，不要合并到 `main`，不要另开平行分支，不要 force-push。做完由「短剧视频服务器开发bot」验收，Frank 说合再合。
+
+技术怎么改由你定，每条的「验收」是判断做完的标准。不改的东西见最后。
+
+### 要修的
+
+1. **重试接口绕过「同资产有进行中任务就 409」**
+   现状：Phase 5 返工后 `TranscodeService.transcode` 会锁住同一资产的全部任务行，任意模板进行中就返回 409；但 `POST /api/v1/jobs/{id}/retry` 仍只看自己这一行，可能让同一资产同时有两个任务在转。
+   验收：同一资产已有另一个任务处于进行中时，retry 返回 409，且不新建任务、不写 outbox；没有冲突时 retry 行为与现在一致（包括 Idempotency-Key 重放）。H2 和真 MySQL 各有用例覆盖，MySQL 用例需要验证并发下也只有一个进行中任务。
+
+2. **缓存命中后 Range 请求返回 200 而不是 206**
+   现状：Phase 4 Docker 验收时 `playback_live.py` 30 项里唯一失败。回源 `api/main.py` 的 `StreamingResponse` 没带 `Content-Length`，Nginx 的 range 过滤因此跳过；`nginx_local_check.py` 的假回源总带 `Content-Length`，没暴露问题。
+   验收：回源响应带正确的 `Content-Length`（对象大小已知时）；`nginx_local_check.py` 增加一个「回源不带 Content-Length / 带 Content-Length」的对照或直接让假回源与真回源一致，并在缓存命中后断言 Range 返回 206、`Content-Range` 正确；现有 Python 测试全过。
+
+3. **`fault_inject.py` 的 MinIO 场景默认参数下不稳定**
+   现状：默认参数 5/6，MinIO 场景在下载或转码阶段就停 MinIO，S3 客户端重试把短停机吸收了；要 `--outage-seconds 120` 才 PASS。
+   验收：默认参数下 MinIO 场景能稳定触发它想验证的路径（停机时机或默认时长调整都可以，README 写清选择和理由）；不改 Worker 的重试逻辑来迁就脚本。
+
+4. **`.gitattributes` 固定换行**
+   现状：仓库没有 `.gitattributes`；Frank 的 Windows 默认 `core.autocrlf=true`，`nginx/templates/` 下的 `*.envsh` 如果被转成 CRLF，容器里会执行失败。
+   验收：新增 `.gitattributes`，至少让 `*.envsh`、`*.sh` 固定 LF；不对仓库已有文件做整体换行重写（`git diff --stat` 里不应出现大量无关文件）。
+
+5. **CI 把 Phase 6 的 MySQL 用例纳入检查清单**
+   验收：`.github/workflows/ci.yml` 里要求必须执行且不跳过的 MySQL 用例清单加上 `vod.job.Phase6MysqlTest`，以及第 1 条新增的 MySQL 用例类（如果是新类）；push 后本分支 CI 全绿。
+
+6. **README 状态标注**
+   验收：README 里 Phase 6、CI 两节标题中的「未合并」改成已合并（Phase 6 合并提交 `c7ce6c9`，CI 合并提交 `ce86b9a`），只改标注，不改原文内容。
+
+### 本分支不要做
+
+- 新功能、重构、换框架、改消息 v1、改 Flyway V1–V13 已有文件（需要表结构变更就加 V14，但这几条预计不需要）。
+- Phase 6 遗留的 N2–N12、多码率以外的媒体能力、雪碧图等。
+- 不改 Windows 或 `~/.claude/settings.json`，不把密钥写进仓库。
+
+### 怎么算整体做完
+
+- 上面 6 条的验收都满足。
+- `mvn test`（H2）和连真 MySQL 的测试全过；`scripts/contract_check.py` 和 `scripts/test_*.py` 全过；本分支 GitHub Actions 三个 job 都绿。
+- 在下面「实现说明」里写清：每条改了哪些文件、怎么验证的、测试的真实数字、没在 Docker 上跑的项目明确标出来。不要编造任何性能数字。
+
 ## 分支方案：Phase 6 高级媒体能力（第一刀）
 
 本分支：`plan/phase-6`，基线 `main` = `248b6e3`（Phase 5 已合并）。下面是本分支方案。实现完成后，把实现说明写在本节后面，不要改方案原文。
