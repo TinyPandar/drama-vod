@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>资产 · 设计预览（示例数据）</title>
+  <link rel="stylesheet" href="console.css" />
+</head>
+<body>
+<!-- 设计预览：所有资产、编号、大小均为示例数据；封面是色块占位；按钮不执行任何操作。 -->
+<div id="content" hidden style="display:contents">
+
+  <!-- ============ 未选用 Key：整页引导，不显示报错 ============ -->
+  <section class="card" data-show="nokey">
+    <div class="state">
+      <span class="ico tenant"><i data-i="key"></i></span>
+      <h2>先选用一把租户 Key，才能查看资产</h2>
+      <p>你已经用管理员身份登录，但「资产」属于租户端页面，只认租户 Key。管理登录不能代替它。</p>
+      <div class="steps">
+        <div class="step done"><span class="n">✓</span><div><b>管理登录</b><span>已完成</span></div></div>
+        <div class="step now"><span class="n">2</span><div><b>新建或选用 Key</b><span>在「租户与 Key」进入一个租户，新建 Key</span></div></div>
+        <div class="step"><span class="n">3</span><div><b>在本标签页使用</b><span>选用后自动回到这里</span></div></div>
+      </div>
+      <div class="btn-row">
+        <a class="btn primary" href="tenants.html">去「租户与 Key」新建 Key</a>
+        <button class="btn" type="button" title="对应现有的「选用租户 Key」页，本轮未出设计稿">我已有 Key，直接粘贴</button>
+      </div>
+      <p class="tiny faint">Key 只保存在当前浏览器标签页，关闭标签页后需要重新选用。</p>
+    </div>
+  </section>
+
+  <!-- ============ Key 失效：说明是哪种身份失效 ============ -->
+  <section class="card" data-show="badkey">
+    <div class="state">
+      <span class="ico err"><i data-i="key"></i></span>
+      <h2>当前选用的租户 Key 已失效</h2>
+      <p>「示例租户 A · vk_3f9a…」被服务端拒绝了。常见原因：这把 Key 被撤销或轮换、已过期，或所属租户被停用。你的<b>管理登录仍然有效</b>，不需要重新登录。</p>
+      <div class="btn-row">
+        <a class="btn primary" href="tenants.html">去「租户与 Key」换一把</a>
+        <button class="btn" type="button" title="对应现有的「选用租户 Key」页，本轮未出设计稿">粘贴另一把 Key</button>
+        <button class="btn text" type="button">重试</button>
+      </div>
+      <p class="raw">服务端返回：<code>unauthorized（401）</code></p>
+    </div>
+  </section>
+
+  <!-- ============ 正常页面 ============ -->
+  <div class="page-head" data-show="ok uploading resume loading empty quota">
+    <div>
+      <p style="margin:0">当前租户上传的视频。上传完成后自动提交转码，状态变为「可播放」后可在详情里试播。</p>
+    </div>
+    <div class="btn-row"><button class="btn" type="button"><i data-i="refresh"></i>刷新</button></div>
+  </div>
+
+  <div class="alert err" data-show="quota" role="alert">
+    <i data-i="warn"></i>
+    <div class="a-body">
+      <div class="a-title">这次操作没有完成：租户配额已用尽</div>
+      <div class="a-text">当前租户的并发任务数或每日转码次数已达上限。可以稍后再试，或请管理员在「租户与 Key」里调整这个租户的配额。已有资产不受影响。</div>
+      <div class="a-raw">服务端返回：<code>429 quota_exceeded</code>，60 秒后可再试</div>
+      <div class="a-act"><a class="btn sm" href="tenants.html?state=detail">查看租户配额</a><button class="btn sm text" type="button">关闭提示</button></div>
+    </div>
+  </div>
+
+  <section class="card" data-show="ok uploading resume loading empty quota" aria-labelledby="up-title">
+    <div class="card-head"><h3 id="up-title">上传视频</h3></div>
+    <div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+
+      <div class="upload" data-show="ok loading empty quota">
+        <div class="u-text">
+          <b>选择一个视频文件</b>
+          <div class="small muted">小文件一次传完；大文件自动分片，中断后可以继续上传。</div>
+        </div>
+        <label class="check"><input type="checkbox" /> 加密（AES-128 HLS）</label>
+        <button class="btn primary" type="button"><i data-i="upload"></i>选择文件</button>
+      </div>
+
+      <div data-show="uploading" style="display:flex;flex-direction:column;gap:8px" role="status">
+        <div class="btn-row" style="justify-content:space-between">
+          <span><b>示例视频-第 3 集.mp4</b> <span class="muted small">1.6 GB · 分片上传 · 第 14 / 32 片</span> <span class="sample">示例数据</span></span>
+          <button class="btn sm danger" type="button">取消上传</button>
+        </div>
+        <div class="progress" aria-hidden="true"><b style="width:44%"></b></div>
+        <span class="small muted">上传期间请不要关闭或刷新本标签页。</span>
+      </div>
+
+      <div class="alert warn" data-show="resume" role="status">
+        <i data-i="warn"></i>
+        <div class="a-body">
+          <div class="a-title">分片上传中断，还没传完</div>
+          <div class="a-text"><b>示例视频-第 3 集.mp4</b>（1.6 GB，上传会话 #58）已传的分片保留在服务端，可以从断点继续；取消则丢弃已传部分，这个资产不会转码。<span class="sample">示例数据</span></div>
+          <div class="a-raw">原始信息：<code>Failed to fetch</code></div>
+          <div class="a-act"><button class="btn sm primary" type="button">继续上传</button><button class="btn sm danger" type="button">取消上传</button></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" data-show="ok uploading resume loading empty quota">
+    <div class="card-head">
+      <h3>资产列表</h3>
+      <span class="sample" data-show="ok uploading resume quota">示例数据 · 封面为占位色块</span>
+    </div>
+
+    <div class="table-wrap" data-show="ok uploading resume quota">
+      <table class="tbl">
+        <thead><tr><th style="width:96px">封面</th><th>资产 ID</th><th>状态</th><th class="r">源文件大小</th><th>加密</th><th class="ops">操作</th></tr></thead>
+        <tbody>
+          <tr data-show="uploading resume">
+            <td><span class="thumb none">无封面</span></td><td class="mono"><a href="#" onclick="return false">#1047</a></td>
+            <td><span class="badge warn">上传中</span><span class="enum">UPLOADING</span></td><td class="r num">1.6 GB</td><td>否</td>
+            <td class="ops"><button class="btn sm text" type="button">详情</button></td>
+          </tr>
+          <tr>
+            <td><span class="thumb">示例</span></td><td class="mono"><a href="#" onclick="return false">#1046</a></td>
+            <td><span class="badge ok">可播放</span><span class="enum">READY</span></td><td class="r num">482.3 MB</td><td>是</td>
+            <td class="ops"><button class="btn sm text" type="button">详情与试播</button></td>
+          </tr>
+          <tr>
+            <td><span class="thumb none">无封面</span></td><td class="mono"><a href="#" onclick="return false">#1045</a></td>
+            <td><span class="badge run">转码中</span><span class="enum">TRANSCODING</span></td><td class="r num">1.2 GB</td><td>否</td>
+            <td class="ops"><button class="btn sm text" type="button">详情</button></td>
+          </tr>
+          <tr>
+            <td><span class="thumb">示例</span></td><td class="mono"><a href="#" onclick="return false">#1044</a></td>
+            <td><span class="badge ok">可播放</span><span class="enum">READY</span></td><td class="r num">96.0 MB</td><td>否</td>
+            <td class="ops"><button class="btn sm text" type="button">详情与试播</button></td>
+          </tr>
+          <tr>
+            <td><span class="thumb none">无封面</span></td><td class="mono"><a href="#" onclick="return false">#1043</a></td>
+            <td><span class="badge bad">失败</span><span class="enum">FAILED</span></td><td class="r num">310.7 MB</td><td>否</td>
+            <td class="ops"><button class="btn sm text" type="button">详情</button></td>
+          </tr>
+          <tr>
+            <td><span class="thumb none">无封面</span></td><td class="mono"><a href="#" onclick="return false">#1042</a></td>
+            <td><span class="badge">已上传</span><span class="enum">UPLOADED</span></td><td class="r num">54.1 MB</td><td>是</td>
+            <td class="ops"><button class="btn sm text" type="button">详情</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="table-wrap" data-show="loading" aria-busy="true" aria-label="正在加载资产">
+      <table class="tbl">
+        <thead><tr><th style="width:96px">封面</th><th>资产 ID</th><th>状态</th><th>源文件大小</th><th>加密</th><th></th></tr></thead>
+        <tbody>
+          <tr><td><span class="skel" style="width:64px;height:36px"></span></td><td><span class="skel" style="width:48px"></span></td><td><span class="skel" style="width:72px"></span></td><td><span class="skel" style="width:64px"></span></td><td><span class="skel" style="width:24px"></span></td><td></td></tr>
+          <tr><td><span class="skel" style="width:64px;height:36px"></span></td><td><span class="skel" style="width:48px"></span></td><td><span class="skel" style="width:72px"></span></td><td><span class="skel" style="width:64px"></span></td><td><span class="skel" style="width:24px"></span></td><td></td></tr>
+          <tr><td><span class="skel" style="width:64px;height:36px"></span></td><td><span class="skel" style="width:48px"></span></td><td><span class="skel" style="width:72px"></span></td><td><span class="skel" style="width:64px"></span></td><td><span class="skel" style="width:24px"></span></td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="state" data-show="empty">
+      <span class="ico"><i data-i="inbox"></i></span>
+      <h3>这个租户还没有资产</h3>
+      <p>用上面的「选择文件」上传第一个视频。上传完成后会自动提交转码，并出现在这里。</p>
+    </div>
+
+    <div class="card-foot" data-show="ok uploading resume quota">
+      <span>已显示 <span data-show="ok quota">5</span><span data-show="uploading resume">6</span> 条</span>
+      <button class="btn sm" type="button">加载下一页</button>
+    </div>
+  </section>
+
+</div>
+
+<script>
+  window.PREVIEW = {
+    page: "assets", title: "资产", crumb: "租户端",
+    states: [
+      { id: "ok", label: "正常", key: "ok" },
+      { id: "nokey", label: "未选用 Key", key: "none" },
+      { id: "badkey", label: "Key 已失效", key: "invalid" },
+      { id: "uploading", label: "上传中", key: "ok" },
+      { id: "resume", label: "上传中断可续传", key: "ok" },
+      { id: "loading", label: "加载中", key: "ok" },
+      { id: "empty", label: "空列表", key: "ok" },
+      { id: "quota", label: "操作失败（配额用尽）", key: "ok" }
+    ]
+  };
+</script>
+<script src="preview.js"></script>
+</body>
+</html>
