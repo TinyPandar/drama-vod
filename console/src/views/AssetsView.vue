@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { bytes, tenantApi, type Asset } from "../api";
+import Icon from "../components/Icon.vue";
+import ListState from "../components/ListState.vue";
 import Notice from "../components/Notice.vue";
+import StatusBadge from "../components/StatusBadge.vue";
 import { abortUpload, openMultipart, putUpload, runMultipart, uploadConfig, type PendingUpload } from "../upload";
 import { useAction } from "../useAction";
 
@@ -11,7 +14,10 @@ const encrypted = ref(false);
 /** 分片上传失败后保留会话，可以「继续上传」或「取消」。 */
 const pending = ref<PendingUpload | null>(null);
 let controller: AbortController | null = null;
-const { busy, message, error, run } = useAction();
+const { busy, message, raw, error, loaded, run } = useAction();
+/** 上传进度文字（来自 upload.ts 的回调），和操作结果提示分开显示。 */
+const step = ref("");
+const uploadingName = ref("");
 
 async function load(cursor?: number) {
   const page = await tenantApi<{ assets: Asset[]; next_cursor: number | null }>(`/assets${cursor ? `?cursor=${cursor}` : ""}`);
@@ -20,7 +26,7 @@ async function load(cursor?: number) {
 }
 
 function progress(text: string) {
-  message.value = text;
+  step.value = text;
 }
 
 /** 达到服务端下发的阈值（默认等于分片大小）走 multipart，否则仍是单次 PUT。 */
@@ -28,6 +34,7 @@ function onUpload(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   if (!file) return;
+  uploadingName.value = `${file.name}（${bytes(file.size)}）`;
   run(async () => {
     const cfg = await uploadConfig();
     controller = new AbortController();
@@ -41,6 +48,7 @@ function onUpload(event: Event) {
       return await finishMultipart();
     } finally {
       input.value = "";
+      step.value = "";
     }
   });
 }
@@ -55,7 +63,14 @@ async function finishMultipart() {
 }
 
 function resume() {
-  run(finishMultipart);
+  uploadingName.value = pending.value ? `${pending.value.file.name}（${bytes(pending.value.file.size)}）` : "";
+  run(async () => {
+    try {
+      return await finishMultipart();
+    } finally {
+      step.value = "";
+    }
+  });
 }
 
 /** 取消：停掉进行中的 PUT，再让服务端 abort（存储侧丢掉已传分片）。 */
@@ -75,37 +90,73 @@ onMounted(() => run(() => load()));
 </script>
 
 <template>
-  <h1>资产</h1>
-  <div class="row">
-    <label class="small"><input v-model="encrypted" type="checkbox" style="width:auto" /> 加密（AES-128 HLS）</label>
-    <label class="small" style="margin:0"><span class="muted">上传视频（大文件自动分片、可续传）</span>
-      <input type="file" accept="video/*" :disabled="busy || !!pending" @change="onUpload" />
-    </label>
-    <button class="ghost" :disabled="busy" @click="run(() => load())">刷新</button>
+  <div class="page-head">
+    <p>当前租户上传的视频。上传完成后自动提交转码，状态变为「可播放」后可在详情里试播。</p>
+    <div class="btn-row"><button class="btn" type="button" :disabled="busy" @click="run(() => load())"><Icon name="refresh" />刷新</button></div>
   </div>
-  <div v-if="pending" class="row">
-    <span class="small muted">分片上传未完成：{{ pending.file.name }}（{{ bytes(pending.file.size) }}，会话 #{{ pending.sessionId }}）</span>
-    <button :disabled="busy" @click="resume">继续上传</button>
-    <button class="danger" @click="cancel">取消上传</button>
-  </div>
-  <Notice :text="message" :error="error" />
-  <table>
-    <thead><tr><th>封面</th><th>ID</th><th>状态</th><th>大小</th><th>加密</th></tr></thead>
-    <tbody>
-      <tr v-for="a in assets" :key="a.id">
-        <td class="thumb">
-          <img v-if="a.poster_url" :src="a.poster_url" :alt="`资产 #${a.id} 封面`" loading="lazy" />
-          <span v-else class="muted">—</span>
-        </td>
-        <td><RouterLink :to="`/assets/${a.id}`">#{{ a.id }}</RouterLink></td><td>{{ a.status }}</td>
-        <td>{{ bytes(a.source_size) }}</td><td>{{ a.encrypted ? "是" : "否" }}</td>
-      </tr>
-    </tbody>
-  </table>
-  <div class="row"><button v-if="next" class="ghost" :disabled="busy" @click="run(() => load(next!))">下一页</button></div>
-</template>
 
-<style scoped>
-.thumb { width: 56px; }
-.thumb img { display: block; width: 48px; height: 48px; object-fit: cover; border-radius: 6px; background: #171512; }
-</style>
+  <Notice :text="message" :error="error" :raw="raw" />
+
+  <section class="card" aria-labelledby="up-title">
+    <div class="card-head"><h3 id="up-title">上传视频</h3></div>
+    <div class="card-body stack">
+      <div v-if="step" class="stack" role="status">
+        <div class="btn-row" style="justify-content: space-between">
+          <span><b>{{ uploadingName }}</b> <span class="muted small">{{ step }}</span></span>
+          <button v-if="pending" class="btn sm danger" type="button" @click="cancel">取消上传</button>
+        </div>
+        <div class="btn-row small muted"><span class="spin"></span>上传期间请不要关闭或刷新本标签页。</div>
+      </div>
+
+      <div v-else-if="pending" class="alert warn" role="status">
+        <Icon name="warn" />
+        <div class="a-body">
+          <div class="a-title">分片上传中断，还没传完</div>
+          <div class="a-text"><b>{{ pending.file.name }}</b>（{{ bytes(pending.file.size) }}，上传会话 #{{ pending.sessionId }}）已传的分片保留在服务端，可以从断点继续；取消则丢弃已传部分，这个资产不会转码。</div>
+          <div class="a-act">
+            <button class="btn sm primary" type="button" :disabled="busy" @click="resume">继续上传</button>
+            <button class="btn sm danger" type="button" @click="cancel">取消上传</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-else class="upload">
+        <div class="u-text">
+          <b>选择一个视频文件</b>
+          <div class="small muted">小文件一次传完；大文件自动分片，中断后可以继续上传。</div>
+        </div>
+        <label class="check"><input v-model="encrypted" type="checkbox" /> 加密（AES-128 HLS）</label>
+        <label class="btn primary" :class="{ 'is-disabled': busy }"><Icon name="upload" />选择文件
+          <input type="file" accept="video/*" :disabled="busy || !!pending" @change="onUpload" />
+        </label>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h3>资产列表</h3></div>
+    <div v-if="assets.length" class="table-wrap">
+      <table class="tbl">
+        <thead><tr><th style="width: 96px">封面</th><th>资产 ID</th><th>状态</th><th class="r">源文件大小</th><th>加密</th><th class="ops">操作</th></tr></thead>
+        <tbody>
+          <tr v-for="a in assets" :key="a.id">
+            <td>
+              <img v-if="a.poster_url" class="thumb" :src="a.poster_url" :alt="`资产 #${a.id} 封面`" loading="lazy" />
+              <span v-else class="thumb none">无封面</span>
+            </td>
+            <td class="mono"><RouterLink :to="`/assets/${a.id}`">#{{ a.id }}</RouterLink></td>
+            <td><StatusBadge :value="a.status" /></td>
+            <td class="r num">{{ bytes(a.source_size) }}</td><td>{{ a.encrypted ? "是" : "否" }}</td>
+            <td class="ops"><RouterLink class="btn sm text" :to="`/assets/${a.id}`">{{ a.status === "READY" ? "详情与试播" : "详情" }}</RouterLink></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <ListState :loaded="loaded" :count="assets.length" :failed="error" title="这个租户还没有资产"
+      hint="用上面的「选择文件」上传第一个视频。上传完成后会自动提交转码，并出现在这里。" />
+    <div v-if="assets.length" class="card-foot">
+      <span>已显示 {{ assets.length }} 条</span>
+      <button v-if="next" class="btn sm" type="button" :disabled="busy" @click="run(() => load(next!))">加载下一页</button>
+    </div>
+  </section>
+</template>
