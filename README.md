@@ -339,7 +339,15 @@ Frank 回复「风格可以，按这个做」。各项结论如下，实现时�
 
 ### CI
 
-本分支推送后的 CI 结果见下一次提交补充（run 链接和各任务结论）。
+提交 `d519bfa`（界面实现与构建产物）推送后的 CI 运行：<https://github.com/TinyPandar/drama-vod/actions/runs/43806925163>，结论 success。
+
+| 任务 | 结论 |
+| --- | --- |
+| `console`（`npm ci`、`npm run build`、提交的构建产物与源码一致） | success |
+| `vod-api` | success |
+| `python` | success |
+
+`console` 任务在 Node 24 下重新构建，产物与本地用 Node 22 构建后提交的一致。补充本小节的这次提交只改 README，其 CI 结果以 GitHub 上该提交的运行为准，这里不预先写结论。
 
 ## 分支方案：遗留 bug 清理（fix/leftovers）
 
