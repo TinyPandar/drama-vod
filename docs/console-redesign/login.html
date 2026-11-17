@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>管理登录 · 设计预览（示例数据）</title>
+  <link rel="stylesheet" href="console.css" />
+</head>
+<body>
+<!-- 设计预览：登录页不套后台外壳。表单不提交、不连接接口；不预填任何账号或口令。 -->
+<div class="login">
+  <section class="login-info" aria-label="两种身份的说明">
+    <div class="brand" style="height:auto;padding:0;border:0">
+      <span class="brand-mark"><svg viewBox="0 0 16 16"><path d="M5 3.2v9.6L13 8z"/></svg></span>视频云控制台
+    </div>
+    <div>
+      <h1>先登录管理端，再选一把租户 Key</h1>
+      <p class="muted" style="margin-top:8px;max-width:52ch">控制台里有两种身份，各管一部分页面，互相不能代替。登录后页面右上角会一直显示这两项的当前状态。</p>
+    </div>
+    <div class="id-cards">
+      <div class="id-card admin">
+        <span class="ic"><i data-i="user"></i></span>
+        <div>
+          <h3>管理登录 <span class="badge plain tiny" style="background:#fff;color:var(--primary);border-color:var(--primary-border)">本页登录的就是它</span></h3>
+          <p>用管理员用户名和口令登录。可以进入「租户与 Key」「模板」：建租户、调配额、新建或撤销 Key。</p>
+        </div>
+      </div>
+      <div class="id-card tenant">
+        <span class="ic"><i data-i="key"></i></span>
+        <div>
+          <h3>租户 Key <span class="badge plain tiny" style="background:#fff;color:var(--tenant);border-color:var(--tenant-border)">登录后再选用</span></h3>
+          <p>某个租户的 API Key。「资产」「任务」「Webhook」「用量与配额」只认它，管理登录进不去这些页面。Key 只保存在当前浏览器标签页。</p>
+        </div>
+      </div>
+    </div>
+    <div class="flow" aria-label="首次使用的顺序">
+      <b>① 管理登录</b><span class="arrow">→</span>
+      <b>② 建租户、新建 Key</b><span class="arrow">→</span>
+      <b>③ 点「在本标签页使用」</b><span class="arrow">→</span>
+      <span>进入资产等租户页</span>
+    </div>
+  </section>
+
+  <section class="login-form">
+    <div class="login-card">
+      <div class="alert warn" data-show="expired" role="status">
+        <i data-i="warn"></i>
+        <div class="a-body">
+          <div class="a-title">管理登录已过期</div>
+          <div class="a-text">请重新登录，登录后会回到刚才的页面。已选用的租户 Key 不受影响。</div>
+        </div>
+      </div>
+
+      <form class="card" onsubmit="return false" aria-labelledby="login-title">
+        <div>
+          <h2 id="login-title">管理登录</h2>
+          <p class="muted small" style="margin-top:2px">使用部署时配置的管理员账号。</p>
+        </div>
+
+        <div class="alert err" data-show="wrong" role="alert">
+          <i data-i="warn"></i>
+          <div class="a-body">
+            <div class="a-title">用户名或口令不正确</div>
+            <div class="a-text">请检查后重新输入。</div>
+            <div class="a-raw">服务端返回：<code>unauthorized（401）</code></div>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="u">用户名</label>
+          <input class="input" id="u" autocomplete="username" data-show="default expired" />
+          <input class="input" id="u2" aria-label="用户名" value="（已输入的用户名）" data-show="wrong busy" />
+        </div>
+        <div class="field">
+          <label for="p">口令</label>
+          <input class="input" id="p" type="password" autocomplete="off" data-show="default expired busy" />
+          <input class="input invalid" id="p2" type="password" aria-label="口令" autocomplete="off" data-show="wrong" />
+        </div>
+
+        <button class="btn primary lg" type="submit" data-show="default expired wrong">登录</button>
+        <button class="btn primary lg" type="button" disabled data-show="busy"><span class="spin"></span>正在登录…</button>
+      </form>
+
+      <p class="small muted" style="text-align:center">
+        没有管理账号，只有一把租户 Key？<a href="#" onclick="return false" title="对应现有的「选用租户 Key」页，本轮未出设计稿">直接选用租户 Key</a>
+      </p>
+    </div>
+  </section>
+</div>
+
+<script>
+  window.PREVIEW = {
+    page: "login", shell: false,
+    states: [
+      { id: "default", label: "默认" },
+      { id: "busy", label: "登录中" },
+      { id: "wrong", label: "口令错误" },
+      { id: "expired", label: "登录已过期后跳回" }
+    ]
+  };
+</script>
+<script src="preview.js"></script>
+</body>
+</html>

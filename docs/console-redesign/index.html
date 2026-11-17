@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>管理控制台改版 · 设计预览总览</title>
+  <link rel="stylesheet" href="console.css" />
+</head>
+<body>
+<div class="guide">
+  <header>
+    <span class="sample">设计预览 · 待 Frank 确认 · 全部为示例数据</span>
+    <h1 style="margin-top:8px;font-size:24px;line-height:32px">管理控制台改版：整体风格预览</h1>
+    <p class="muted" style="margin-top:4px;max-width:76ch">
+      这一版只出三个核心页面，用来确认整体风格。它们是静态页面，不连接任何接口，按钮不执行操作。
+      每个页面顶部有一条深色「预览条」，可以切换示例状态；预览条本身不属于产品界面。
+    </p>
+  </header>
+
+  <section>
+    <h2 style="margin-bottom:12px">三个核心页面</h2>
+    <div class="pages">
+      <div class="card">
+        <h3><a href="login.html">登录页</a></h3>
+        <p class="small muted">不套后台外壳。左边讲清「管理登录」和「租户 Key」两种身份，右边是登录表单。</p>
+        <div class="links"><a href="login.html">默认</a><a href="login.html?state=busy">登录中</a><a href="login.html?state=wrong">口令错误</a><a href="login.html?state=expired">登录已过期</a></div>
+      </div>
+      <div class="card">
+        <h3><a href="tenants.html">租户与 Key</a></h3>
+        <p class="small muted">后台外壳 + 租户列表；进入租户后是 Key 管理，新 Key 明文只出现一次并可「在本标签页使用」。</p>
+        <div class="links"><a href="tenants.html">租户列表</a><a href="tenants.html?state=detail">租户详情 · Key</a><a href="tenants.html?state=fresh">新 Key 明文</a><a href="tenants.html?state=loading">加载中</a><a href="tenants.html?state=empty">空列表</a><a href="tenants.html?state=error">加载失败</a></div>
+      </div>
+      <div class="card">
+        <h3><a href="assets.html">资产列表</a></h3>
+        <p class="small muted">租户端页面。没选 Key 或 Key 失效时给整页引导，而不是只显示 401。</p>
+        <div class="links"><a href="assets.html">正常</a><a href="assets.html?state=nokey">未选用 Key</a><a href="assets.html?state=badkey">Key 已失效</a><a href="assets.html?state=uploading">上传中</a><a href="assets.html?state=resume">中断可续传</a><a href="assets.html?state=loading">加载中</a><a href="assets.html?state=empty">空列表</a><a href="assets.html?state=quota">配额用尽</a></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2 style="margin-bottom:4px">配色建议</h2>
+    <p class="muted small" style="margin-bottom:12px">浅色后台。靛蓝是主色，同时代表「管理登录」；青绿只代表「租户 Key」。两种身份在侧栏分组、右上角和引导页里始终用这两种颜色加文字区分。</p>
+    <div class="swatches">
+      <div class="swatch"><i style="background:#3451d1"></i><div><b>主色 / 管理登录</b><br /><code>#3451D1</code></div></div>
+      <div class="swatch"><i style="background:#eef1fd"></i><div><b>主色浅底</b><br /><code>#EEF1FD</code></div></div>
+      <div class="swatch"><i style="background:#0b7a75"></i><div><b>租户 Key</b><br /><code>#0B7A75</code></div></div>
+      <div class="swatch"><i style="background:#e5f4f2"></i><div><b>租户浅底</b><br /><code>#E5F4F2</code></div></div>
+      <div class="swatch"><i style="background:#f4f6f9"></i><div><b>页面背景</b><br /><code>#F4F6F9</code></div></div>
+      <div class="swatch"><i style="background:#ffffff"></i><div><b>卡片 / 侧栏</b><br /><code>#FFFFFF</code></div></div>
+      <div class="swatch"><i style="background:#1b2430"></i><div><b>正文</b><br /><code>#1B2430</code></div></div>
+      <div class="swatch"><i style="background:#566173"></i><div><b>次要文字</b><br /><code>#566173</code></div></div>
+      <div class="swatch"><i style="background:#1c7c4f"></i><div><b>成功</b><br /><code>#1C7C4F</code></div></div>
+      <div class="swatch"><i style="background:#9a5b00"></i><div><b>提醒</b><br /><code>#9A5B00</code></div></div>
+      <div class="swatch"><i style="background:#c0352d"></i><div><b>危险 / 错误</b><br /><code>#C0352D</code></div></div>
+      <div class="swatch"><i style="background:#e2e6ec"></i><div><b>分隔线</b><br /><code>#E2E6EC</code></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2 style="margin-bottom:12px">统一规范（节选，全部写在 console.css）</h2>
+    <div class="spec">
+      <div class="card"><div class="card-head"><h3>字体与层级</h3></div><div class="card-body" style="display:flex;flex-direction:column;gap:8px">
+        <h1>页面主标题 20 / 600</h1>
+        <h2>区块标题 16 / 600</h2>
+        <h3>卡片标题 14 / 600</h3>
+        <p>正文 14 / 400，行高 1.55</p>
+        <p class="small muted">说明文字 13，次要色</p>
+        <p class="mono">编号与前缀用等宽字 #1046 vk_3f9a…</p>
+        <p class="tiny faint">系统字体：苹方 / 微软雅黑 / Segoe UI，不加载外部字体</p>
+      </div></div>
+
+      <div class="card"><div class="card-head"><h3>按钮</h3></div><div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+        <div class="btn-row"><button class="btn primary">主要操作</button><button class="btn">次要操作</button><button class="btn text">文字按钮</button></div>
+        <div class="btn-row"><button class="btn danger">危险操作</button><button class="btn primary" disabled><span class="spin"></span>处理中…</button><button class="btn" disabled>不可用</button></div>
+        <div class="btn-row"><button class="btn sm">表格内小按钮</button><button class="btn sm danger">撤销</button></div>
+        <p class="tiny faint">每个区块最多一个主要按钮；高度 36，表格内 28；圆角 6。</p>
+      </div></div>
+
+      <div class="card"><div class="card-head"><h3>表单</h3></div><div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+        <div class="field"><label for="g1">字段名</label><input class="input" id="g1" placeholder="占位提示" /><span class="hint">辅助说明写在输入框下方</span></div>
+        <div class="field"><label for="g2">出错的字段</label><input class="input invalid" id="g2" value="abc" /><span class="err">这里要填数字</span></div>
+        <label class="check"><input type="checkbox" checked /> 勾选项</label>
+      </div></div>
+
+      <div class="card"><div class="card-head"><h3>状态徽标</h3></div><div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+        <div class="btn-row"><span class="badge ok">可播放</span><span class="badge run">转码中</span><span class="badge warn">上传中</span><span class="badge bad">失败</span><span class="badge">已停用</span></div>
+        <p class="tiny faint">颜色加文字，不只靠颜色；需要时在旁边用小号等宽字保留接口原值，例如 <span class="enum" style="margin:0">READY</span>。</p>
+        <div class="btn-row"><span class="who admin"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.5c.6-2.4 2.6-3.6 5-3.6s4.4 1.2 5 3.6"/></svg><span class="k">管理员</span><span class="v">admin</span></span>
+          <span class="who tenant"><svg class="i" viewBox="0 0 16 16"><circle cx="5.2" cy="10.8" r="2.4"/><path d="M7 9l5.5-5.5M10.5 5.5l1.6 1.6M9 7l1.2 1.2"/></svg><span class="k">租户 Key</span><span class="v">备注 · 前缀…</span></span></div>
+        <p class="tiny faint">右上角的两枚身份胶囊：只显示备注和前缀，不显示 Key 明文。</p>
+      </div></div>
+
+      <div class="card"><div class="card-head"><h3>提示条</h3></div><div class="card-body" style="display:flex;flex-direction:column;gap:8px">
+        <div class="alert ok"><svg class="i" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M5.4 8.2l1.8 1.8 3.4-3.6"/></svg><div class="a-body"><div class="a-title">操作成功</div><div class="a-text">说明发生了什么。</div></div></div>
+        <div class="alert err"><svg class="i" viewBox="0 0 16 16"><path d="M8 2.5l6 10.5H2z"/><path d="M8 6.8v2.8M8 11.4v.2"/></svg><div class="a-body"><div class="a-title">先说人话：哪里没成功</div><div class="a-text">再说原因和下一步。</div><div class="a-raw">最后才是接口原文：<code>状态码 / code</code></div></div></div>
+      </div></div>
+
+      <div class="card"><div class="card-head"><h3>加载 / 空 / 错误</h3></div><div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+        <div style="display:flex;flex-direction:column;gap:8px"><span class="skel" style="width:70%"></span><span class="skel" style="width:45%"></span><span class="skel" style="width:60%"></span></div>
+        <p class="tiny faint">加载中：保留表头，用骨架条占位，不整页转圈。</p>
+        <p class="tiny faint">空：图标 + 一句现状 + 一句下一步。错误：页面上方提示条说明原因并给「重试」，列表区保持稳定。三者都在卡片内同一位置出现。</p>
+      </div></div>
+    </div>
+  </section>
+</div>
+</body>
+</html>
