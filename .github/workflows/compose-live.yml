@@ -31,6 +31,8 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: drama-vod-live
       COMPOSE_FILE: docker-compose.yml:docker-compose.platform-live.yml:docker-compose.media-live.yml
+      # api / worker 的 build 用了 network: host；Compose 默认的 bake 构建要额外授权 network.host，这里用经典构建
+      COMPOSE_BAKE: "false"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
