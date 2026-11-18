@@ -31,8 +31,6 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: drama-vod-live
       COMPOSE_FILE: docker-compose.yml:docker-compose.platform-live.yml:docker-compose.media-live.yml
-      # api / worker 的 build 用了 network: host；Compose 默认的 bake 构建要额外授权 network.host，这里用经典构建
-      COMPOSE_BAKE: "false"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -56,9 +54,14 @@ jobs:
             echo "VOD_ADMIN_USERNAME=ops"; echo "VOD_ADMIN_PASSWORD=$(r)"
           } > .env
       - name: 起栈
+        # api / worker 的 build 用了 network: host，Compose 的 bake 构建要额外授权 network.host；
+        # 这里先用 docker build 按 Compose 默认的镜像名（项目名-服务名）构建，再 --no-build 起栈
         run: |
-          docker compose up -d --build --wait --wait-timeout 300 mysql redis rabbitmq
-          docker compose up -d --build
+          docker build --network host -t drama-vod-live-api ./api
+          docker build --network host -t drama-vod-live-worker ./worker
+          docker build -t drama-vod-live-vod-api ./vod-api
+          docker compose up -d --no-build --wait --wait-timeout 300 mysql redis rabbitmq
+          docker compose up -d --no-build
           for i in $(seq 90); do curl -fs localhost:8080/api/v1/healthz && break; sleep 2; done
           curl -fs localhost:8080/api/v1/healthz
       - name: 验收脚本
