@@ -1,0 +1,19 @@
+# 路线 B 验收脚本 scripts/lifecycle_live.py 用的叠加文件（只用于本地 dev 栈）：
+#   docker compose -f docker-compose.yml -f docker-compose.lifecycle-live.yml up -d --build
+# 把各个清理的间隔和宽限期调短，让脚本不用等默认的几分钟到一天；其他配置走默认值。
+# Worker 会把前缀清理宽限期抬到不小于租约时长，所以这里同时缩短租约和心跳（与 fault_inject.py 的做法一样）。
+services:
+  vod-api:
+    environment:
+      VOD_UPLOAD_CLEANUP_INTERVAL_MS: "2000"
+      VOD_UPLOAD_CLEANUP_INITIAL_DELAY_MS: "2000"
+      VOD_UPLOAD_PUT_ABANDON_GRACE_SECONDS: "0"
+      VOD_UPLOAD_SESSION_TTL_SECONDS: "60"
+      VOD_ASSET_OBJECT_CLEANUP_INTERVAL_MS: "2000"
+      VOD_ASSET_OBJECT_CLEANUP_INITIAL_DELAY_MS: "2000"
+  worker:
+    environment:
+      WORKER_LEASE_SECONDS: "20"
+      WORKER_HEARTBEAT_SECONDS: "5"
+      WORKER_OUTPUT_GC_GRACE_SECONDS: "5"
+      WORKER_OUTPUT_GC_INTERVAL_SECONDS: "2"

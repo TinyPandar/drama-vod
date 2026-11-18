@@ -1,4 +1,4 @@
-import { post, tenantApi } from "./api";
+import { post, tenantApi, type AssetMeta } from "./api";
 
 /** GET /uploads/config：分片大小与阈值都来自服务端配置，前端不写死。 */
 export type UploadConfig = {
@@ -22,10 +22,10 @@ export async function uploadConfig(): Promise<UploadConfig> {
 }
 
 /** 小文件：一次预签名 PUT（与原来完全一样）。返回任务号。 */
-export async function putUpload(file: File, encrypted: boolean, progress: Progress, signal: AbortSignal) {
+export async function putUpload(file: File, encrypted: boolean, progress: Progress, signal: AbortSignal, meta: AssetMeta = {}) {
   progress("申请直传地址");
   const opened = await tenantApi<{ session_id: number; put_url: string; asset_id: number }>("/uploads", post({
-    filename: file.name, encrypted
+    filename: file.name, encrypted, ...meta
   }));
   progress("直传对象存储中（不经过 API）");
   const put = await fetch(opened.put_url, { method: "PUT", body: file, signal });
@@ -35,9 +35,9 @@ export async function putUpload(file: File, encrypted: boolean, progress: Progre
 }
 
 /** 大文件：开 multipart 会话。 */
-export async function openMultipart(file: File, encrypted: boolean): Promise<PendingUpload> {
+export async function openMultipart(file: File, encrypted: boolean, meta: AssetMeta = {}): Promise<PendingUpload> {
   const opened = await tenantApi<{ session_id: number; asset_id: number; part_size_bytes: number }>("/uploads", post({
-    filename: file.name, encrypted, mode: "multipart", content_type: file.type || undefined
+    filename: file.name, encrypted, mode: "multipart", content_type: file.type || undefined, ...meta
   }));
   return { file, sessionId: opened.session_id, assetId: opened.asset_id, partSize: opened.part_size_bytes };
 }

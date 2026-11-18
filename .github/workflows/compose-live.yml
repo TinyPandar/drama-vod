@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 75
     env:
       COMPOSE_PROJECT_NAME: drama-vod-live
-      COMPOSE_FILE: docker-compose.yml:docker-compose.platform-live.yml:docker-compose.media-live.yml
+      COMPOSE_FILE: docker-compose.yml:docker-compose.platform-live.yml:docker-compose.media-live.yml:docker-compose.lifecycle-live.yml
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -88,6 +88,7 @@ jobs:
           run playback_live.py python scripts/playback_live.py
           run platform_live.py python scripts/platform_live.py
           run media_live.py python scripts/media_live.py
+          run lifecycle_live.py python scripts/lifecycle_live.py
           run core_live.py inside core_live.py
           run drama_vod_live.py inside drama_vod_live.py
           run browser_check.py python scripts/browser_check.py

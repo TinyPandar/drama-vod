@@ -11,7 +11,7 @@
 页头不出现明文；新建租户模板；未选 Key 时租户页给引导；小文件直传、大文件分片中断后续传、分片上传取消；
 资产详情封面与试播（浏览器里真的播放）、按模板转码；任务详情重转、取消、重试；Webhook 登记、签名密钥只显示一次、
 停用/启用、投递记录；用量与配额；模板页；轮换后旧 Key 失效引导、管理登录仍有效、换上新 Key；撤销后失效；
-管理登录过期回登录页且 Key 保留；退出；375 宽抽屉开合与无横向溢出；全程无页面脚本错误。
+管理登录过期回登录页且 Key 保留；上传时填标题和标签、按关键字 / 标签 / 状态筛选、详情页改标题标签、删除资产；退出；375 宽抽屉开合与无横向溢出；全程无页面脚本错误。
 --shots 给目录时在 1440×900 / 1280×800 / 375×812 下截图，一次性密钥区域会被打码。
 只报告真实跑出的结果。
 """
@@ -101,6 +101,14 @@ def main():
                 return True
             except Exception:
                 return False
+
+        def until(pred, timeout=15):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if pred():
+                    return True
+                page.wait_for_timeout(300)
+            return False
 
         def body():
             return page.locator("body").inner_text()
@@ -209,6 +217,8 @@ def main():
             return set(int(h.rsplit("/", 1)[1]) for h in hrefs)
 
         before = asset_ids()
+        page.fill("#mt", f"短剧样片 {suffix}")
+        page.fill("#mg", "console-live, 第一季")
         page.set_input_files("input[type=file]", str(small))
         refresh_until(lambda: len(asset_ids() - before) >= 1, "小文件出现在资产列表", 120)
         small_id = max(asset_ids() - before)
@@ -318,7 +328,42 @@ def main():
         check("用量与配额页显示配额和历史", "配额" in body() and page.locator("table").count() >= 1)
         shot("usage")
         go("/templates")
-        check("模板页同时有系统模板和租户模板", "ladder_v1" in body() and f"tpl_{suffix}" in body())
+        check("模板页同时有系统模板和租户模板", seen(page.get_by_text("ladder_v1")) and seen(page.get_by_text(f"tpl_{suffix}")))
+
+        # ---------- 9a. 标题、搜索与删除（路线 B） ----------
+        print("== 8b. 资产标题、搜索与删除", flush=True)
+        go("/assets")
+        check("列表显示上传时填的标题和标签", seen(page.get_by_text(f"短剧样片 {suffix}")) and seen(page.locator(".tag", has_text="第一季")))
+        page.fill("#fq", suffix)
+        page.get_by_role("button", name="筛选", exact=True).click()
+        page.wait_for_load_state("networkidle")
+        check("按标题关键字筛选只剩这一条", until(lambda: asset_ids() == {small_id}), asset_ids())
+        page.get_by_role("button", name="清除", exact=True).click()
+        page.wait_for_load_state("networkidle")
+        page.fill("#ft", "第一季")
+        page.get_by_role("button", name="筛选", exact=True).click()
+        page.wait_for_load_state("networkidle")
+        check("按标签筛选", until(lambda: asset_ids() == {small_id}), asset_ids())
+        go(f"/assets/{big_id}")
+        refresh_until(lambda: "READY" in page.locator("h2").first.inner_text(), f"资产 #{big_id} READY")
+        page.fill("#et", f"待删除 {suffix}")
+        page.fill("#eg", "trash")
+        page.get_by_role("button", name="保存", exact=True).click()
+        check("详情页保存标题和标签", seen(page.get_by_text("标题和标签已保存")))
+        shot("asset-detail-meta")
+        dialogs.clear()
+        page.get_by_role("button", name="删除这个资产", exact=True).click()
+        page.wait_for_url(re.compile(r"#/assets\?deleted="))
+        check("删除前有确认框", any("删除资产" in m for m in dialogs))
+        check("删除后回到列表并提示", seen(page.get_by_text(f"资产 #{big_id} 已删除")))
+        page.wait_for_load_state("networkidle")
+        check("列表里不再有已删除的资产", until(lambda: small_id in asset_ids() and big_id not in asset_ids()))
+        page.select_option("#fs", "DELETED")
+        page.get_by_role("button", name="筛选", exact=True).click()
+        page.wait_for_load_state("networkidle")
+        check("按「DELETED」筛选能看到它", until(lambda: big_id in asset_ids() and small_id not in asset_ids()))
+        go(f"/assets/{big_id}")
+        check("已删除资产的详情显示不可用", seen(page.get_by_text("暂时无法显示")))
 
         # ---------- 9. 轮换、撤销、失效引导 ----------
         print("== 9. Key 失效与管理登录过期", flush=True)

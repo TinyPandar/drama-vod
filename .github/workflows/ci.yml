@@ -66,7 +66,8 @@ jobs:
           lines = [f"vod-api: {len(by_class)} 个测试类，tests={total['tests']} skipped={total['skipped']} "
                    f"failures={total['failures']} errors={total['errors']}"]
           bad = False
-          for name in ("vod.job.MysqlSemanticsTest", "vod.job.Phase5MysqlTest", "vod.job.Phase6MysqlTest"):
+          for name in ("vod.job.MysqlSemanticsTest", "vod.job.Phase5MysqlTest", "vod.job.Phase6MysqlTest",
+                       "vod.job.AssetLifecycleMysqlTest"):
               c = by_class.get(name)
               if c is None or c["tests"] == 0 or c["skipped"] != 0:
                   bad = True

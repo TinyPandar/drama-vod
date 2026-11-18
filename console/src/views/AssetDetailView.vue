@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { bytes, post, tenantApi, type Job, type Template } from "../api";
+import { bytes, parseTags, post, tenantApi, type Job, type Template } from "../api";
 import Icon from "../components/Icon.vue";
 import ListState from "../components/ListState.vue";
 import Notice from "../components/Notice.vue";
@@ -11,6 +11,7 @@ import { useAction } from "../useAction";
 type AssetDetail = {
   id: number; status: string; source_size: number; encrypted: boolean; hls_prefix: string | null;
   duration_ms: number | null; width: number | null; height: number | null; poster_url: string | null;
+  title: string | null; tags: string[]; created_at: string | null; updated_at: string | null;
 };
 type Hls = { loadSource(url: string): void; attachMedia(v: HTMLVideoElement): void; destroy(): void };
 type HlsCtor = { new (cfg: object): Hls; isSupported(): boolean };
@@ -27,10 +28,39 @@ const playing = ref(false);
 let hls: Hls | null = null;
 const { busy, message, raw, error, loaded, run } = useAction();
 
+/** 标题与标签的编辑框（载入资产时填入当前值）。 */
+const editTitle = ref("");
+const editTags = ref("");
+const ACTIVE_JOBS = ["PENDING", "RETRYING", "RUNNING"];
+const hasActiveJob = computed(() => jobs.value.some((j) => ACTIVE_JOBS.includes(j.status)));
+
 async function load() {
   asset.value = await tenantApi<AssetDetail>(`/assets/${id.value}`);
+  editTitle.value = asset.value.title ?? "";
+  editTags.value = (asset.value.tags ?? []).join(" ");
   jobs.value = (await tenantApi<{ jobs: Job[] }>("/jobs")).jobs.filter((j) => j.asset_id === id.value);
   templates.value = (await tenantApi<{ templates: Template[] }>("/templates")).templates;
+}
+
+function saveMeta() {
+  run(async () => {
+    asset.value = await tenantApi<AssetDetail>(`/assets/${id.value}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: editTitle.value.trim(), tags: parseTags(editTags.value) })
+    });
+    editTitle.value = asset.value.title ?? "";
+    editTags.value = (asset.value.tags ?? []).join(" ");
+    return "标题和标签已保存";
+  });
+}
+
+function remove() {
+  const name = asset.value?.title ? `「${asset.value.title}」（#${id.value}）` : `#${id.value}`;
+  if (!confirm(`删除资产 ${name}？删除后不能再播放或转码，源文件和转码产物会在后台清理，不能恢复。`)) return;
+  run(async () => {
+    await tenantApi(`/assets/${id.value}`, { method: "DELETE" });
+    await router.push({ path: "/assets", query: { deleted: String(id.value) } });
+  });
 }
 
 function transcode() {
@@ -107,7 +137,10 @@ onBeforeUnmount(() => hls?.destroy());
     <template v-if="asset">
       <table class="kv">
         <tbody>
+          <tr><th>标题</th><td>{{ asset.title ?? "—" }}</td></tr>
+          <tr><th>标签</th><td><span v-if="!asset.tags?.length" class="muted">—</span><span v-for="t in asset.tags" :key="t" class="tag" style="margin: 0 6px 0 0">{{ t }}</span></td></tr>
           <tr><th>状态</th><td><StatusBadge :value="asset.status" /></td></tr>
+          <tr v-if="asset.created_at"><th>创建时间</th><td class="num">{{ new Date(asset.created_at).toLocaleString() }}</td></tr>
           <tr><th>源文件大小</th><td class="num">{{ bytes(asset.source_size) }}</td></tr>
           <tr><th>加密</th><td>{{ asset.encrypted ? "加密（AES-128 HLS）" : "不加密" }}</td></tr>
           <tr v-if="asset.width"><th>画面与时长</th><td class="num">{{ asset.width }}×{{ asset.height }} · {{ ((asset.duration_ms ?? 0) / 1000).toFixed(1) }}s</td></tr>
@@ -157,5 +190,27 @@ onBeforeUnmount(() => hls?.destroy());
       </table>
     </div>
     <ListState :loaded="loaded" :count="jobs.length" :failed="error" title="这个资产还没有转码任务" />
+  </section>
+
+  <section v-if="asset" class="card" aria-labelledby="meta-title">
+    <div class="card-head"><h3 id="meta-title">标题与标签</h3></div>
+    <form class="card-body form-row" @submit.prevent="saveMeta">
+      <div class="field"><label for="et">标题</label><input id="et" v-model="editTitle" class="input" maxlength="200" />
+        <span class="hint">最长 200 字；留空表示不设标题。</span></div>
+      <div class="field"><label for="eg">标签</label><input id="eg" v-model="editTags" class="input" placeholder="用逗号或空格分隔" />
+        <span class="hint">每个标签最多 32 个字符（文字、数字、_ . -），最多 10 个。</span></div>
+      <button class="btn" type="submit" :disabled="busy" style="margin-bottom: 20px">保存</button>
+    </form>
+  </section>
+
+  <section v-if="asset" class="card" aria-labelledby="del-title">
+    <div class="card-head"><h3 id="del-title">删除资产</h3></div>
+    <div class="card-body stack">
+      <p class="small muted">删除后这个资产不能再播放、转码或重试，列表里也不再显示；源文件和转码产物在后台清理，已经发出去的播放地址会在宽限期后失效。存储配额会退回。</p>
+      <div class="btn-row">
+        <button class="btn danger" type="button" :disabled="busy || hasActiveJob" @click="remove">删除这个资产</button>
+        <span v-if="hasActiveJob" class="small muted">有任务正在排队或运行，先在任务详情里取消，再删除。</span>
+      </div>
+    </div>
   </section>
 </template>

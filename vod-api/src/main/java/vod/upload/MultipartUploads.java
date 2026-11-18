@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import vod.asset.AssetLifecycle;
 import vod.storage.ObjectStorage;
 import vod.tenant.TenantGuard;
 
@@ -26,13 +27,16 @@ import java.util.TreeSet;
 @Service
 public class MultipartUploads {
     private static final Logger log = LoggerFactory.getLogger(MultipartUploads.class);
+    private final AssetLifecycle lifecycle;
 
     private final JdbcTemplate jdbc;
     private final ObjectStorage storage;
     private final UploadPolicy policy;
     private final UploadService uploads;
 
-    public MultipartUploads(JdbcTemplate jdbc, ObjectStorage storage, UploadPolicy policy, UploadService uploads) {
+    public MultipartUploads(JdbcTemplate jdbc, ObjectStorage storage, UploadPolicy policy, UploadService uploads,
+                            AssetLifecycle lifecycle) {
+        this.lifecycle = lifecycle;
         this.jdbc = jdbc;
         this.storage = storage;
         this.policy = policy;
@@ -136,7 +140,7 @@ public class MultipartUploads {
     /**
      * POST /uploads/{id}/abort：本租户 OPEN 会话可取消（含已过期的），multipart 同时在存储侧 abort。
      * 已 COMPLETED（源文件已校验、可能正在转码）409；已 ABORTED 重复调用 200。
-     * 资产保持 UPLOADING（与过期会话相同：没有源文件，不能转码），不删除任何源对象。
+     * 路线 B：资产随之改为 DELETED（原因 UPLOAD_ABORTED），源对象（已经 PUT 或已组合的）排进删除。
      */
     @Transactional
     public Map<String, Object> abort(long tenantId, long sessionId) {
@@ -159,6 +163,7 @@ public class MultipartUploads {
         }
         jdbc.update("UPDATE vod_upload_session SET status = 'ABORTED', cleanup_until = NULL, updated_at = ? "
                 + "WHERE id = ? AND tenant_id = ? AND status = 'OPEN'", Timestamp.from(Instant.now()), sessionId, tenantId);
+        lifecycle.abandonUpload(tenantId, session.assetId(), AssetLifecycle.REASON_UPLOAD_ABORTED);
         uploads.multipartEvent(session.multipart() ? "aborted" : "put_aborted");
         return aborted(session);
     }

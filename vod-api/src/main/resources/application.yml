@@ -59,6 +59,28 @@ vod:
     cleanup-initial-delay-ms: ${VOD_UPLOAD_CLEANUP_INITIAL_DELAY_MS:30000}
     cleanup-batch-size: ${VOD_UPLOAD_CLEANUP_BATCH_SIZE:50}
     cleanup-claim-seconds: ${VOD_UPLOAD_CLEANUP_CLAIM_SECONDS:300}
+    # ---- 路线 B：上传没完成的收尾（默认值只是开发默认，不是基准或承诺）----
+    # put 会话过期后再等多久收尾（资产 DELETED、源对象删除），给过期前已开始的 PUT 留时间。
+    put-abandon-grace-seconds: ${VOD_UPLOAD_PUT_ABANDON_GRACE_SECONDS:300}
+    # multipart 已在存储侧组合、但一直没建任务的会话：过期后再保留多久（期间仍可 complete），之后收尾并删对象。
+    assembled-retention-seconds: ${VOD_UPLOAD_ASSEMBLED_RETENTION_SECONDS:604800}
+  # ---- 路线 B：资产删除与源对象清理 ----
+  asset:
+    # 资产删除后多久删源文件；0 表示下一轮清理就删。转码产物由 Worker 的前缀清理按 WORKER_OUTPUT_GC_GRACE_SECONDS 删。
+    source-delete-grace-seconds: ${VOD_ASSET_SOURCE_DELETE_GRACE_SECONDS:0}
+    object-cleanup-interval-ms: ${VOD_ASSET_OBJECT_CLEANUP_INTERVAL_MS:60000}
+    object-cleanup-initial-delay-ms: ${VOD_ASSET_OBJECT_CLEANUP_INITIAL_DELAY_MS:30000}
+    object-cleanup-batch-size: ${VOD_ASSET_OBJECT_CLEANUP_BATCH_SIZE:50}
+    object-cleanup-claim-seconds: ${VOD_ASSET_OBJECT_CLEANUP_CLAIM_SECONDS:300}
+  # ---- 路线 B：流水表保留期；<= 0 表示这张表不清理 ----
+  retention:
+    webhook-days: ${VOD_RETENTION_WEBHOOK_DAYS:30}
+    outbox-days: ${VOD_RETENTION_OUTBOX_DAYS:30}
+    idempotency-hours: ${VOD_RETENTION_IDEMPOTENCY_HOURS:168}
+    batch-size: ${VOD_RETENTION_BATCH_SIZE:500}
+    max-batches: ${VOD_RETENTION_MAX_BATCHES:20}
+    interval-ms: ${VOD_RETENTION_INTERVAL_MS:3600000}
+    initial-delay-ms: ${VOD_RETENTION_INITIAL_DELAY_MS:60000}
   quota:
     # vod_tenant.storage_quota_bytes 为 NULL 时使用；0 表示不限制（当前默认不限制）。
     default-storage-bytes: ${VOD_QUOTA_DEFAULT_STORAGE_BYTES:0}

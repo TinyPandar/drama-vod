@@ -61,6 +61,8 @@ public class PlaybackService {
                 assetId);
         if (rows.isEmpty()) throw new TenantGuard.ResourceNotVisibleException();
         TenantGuard.requireVisible(tenantId, rows.get(0).getValue().tenantId());
+        // 路线 B：已删除的资产对租户不可见（404），不是「还没就绪」（409）。
+        if (vod.asset.AssetLifecycle.DELETED.equals(rows.get(0).getKey())) throw new TenantGuard.ResourceNotVisibleException();
         if (!"READY".equals(rows.get(0).getKey())) throw new NotReady();
         return rows.get(0).getValue();
     }

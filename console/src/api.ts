@@ -115,7 +115,7 @@ const STATUS: Record<string, [string, string]> = {
   ACTIVE: ["启用", "ok"], DISABLED: ["已停用", ""], REVOKED: ["已撤销", ""], EXPIRED: ["已过期", ""],
   UPLOADING: ["上传中", "warn"], UPLOADED: ["已上传", ""], TRANSCODING: ["转码中", "run"], READY: ["可播放", "ok"],
   PENDING: ["排队中", "warn"], RETRYING: ["等待重试", "warn"], RUNNING: ["运行中", "run"], SUCCEEDED: ["成功", "ok"],
-  FAILED: ["失败", "bad"], CANCELLED: ["已取消", ""], DELIVERED: ["已送达", "ok"]
+  FAILED: ["失败", "bad"], CANCELLED: ["已取消", ""], DELIVERED: ["已送达", "ok"], DELETED: ["已删除", ""]
 };
 export function statusInfo(value: string, kind?: "key"): { label: string; tone: string } {
   const hit = STATUS[value];
@@ -134,7 +134,15 @@ export type ApiKey = {
 /** poster_url：Phase 6 封面签名地址（会过期，刷新列表重新签），没有封面为 null。 */
 export type Asset = {
   id: number; status: string; source_size: number; encrypted: boolean; hls_prefix?: string | null; poster_url?: string | null;
+  /** 路线 B：标题、标签、创建时间（旧资产的创建时间是迁移时刻）。 */
+  title?: string | null; tags?: string[]; created_at?: string | null;
 };
+/** 新建上传时可带的元数据。 */
+export type AssetMeta = { title?: string; tags?: string[] };
+/** 「短剧, ep-1 第一集」→ ["短剧", "ep-1", "第一集"]：逗号、顿号或空白分隔，去空去重。 */
+export function parseTags(text: string): string[] {
+  return [...new Set(text.split(/[\s,，、]+/).map((t) => t.trim()).filter(Boolean))];
+}
 export type Job = {
   id: number; asset_id: number; profile: string; status: string; attempts: number; claim_version: number;
   max_attempts?: number; last_error?: string | null; error_code?: string | null; next_attempt_at?: string | null;

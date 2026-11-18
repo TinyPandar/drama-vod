@@ -68,6 +68,8 @@ public class TranscodeService {
                 (rs, n) -> new Object[]{rs.getLong(1), rs.getString(2), rs.getObject(3)}, assetId);
         if (assets.isEmpty()) throw new TenantGuard.ResourceNotVisibleException();
         TenantGuard.requireVisible(tenantId, (Long) assets.get(0)[0]);
+        // 路线 B：已删除的资产对租户不可见。
+        if (vod.asset.AssetLifecycle.DELETED.equals(assets.get(0)[1])) throw new TenantGuard.ResourceNotVisibleException();
         TemplateService.Template template = templates.resolve(tenantId, templateName);
         var claim = idempotency.claim(tenantId, "transcode", idemKey, "asset:" + assetId + ":template:" + template.name());
         if (claim != null && claim.replayJobId() != null) return new Result(claim.replayJobId(), true);
@@ -135,6 +137,11 @@ public class TranscodeService {
                 throw new UploadService.ConflictException("job " + other[0] + " (template " + other[2] + ") of this asset is "
                         + other[1] + ", wait for it to finish or cancel it");
             }
+        }
+        // 路线 B：资产已删除时不能再重试（任务行保留作历史）。删除事务也先锁这些任务行，这里读到的状态是稳定的。
+        String assetStatus = jdbc.queryForObject("SELECT status FROM vod_media_asset WHERE id = ?", String.class, assetId);
+        if (vod.asset.AssetLifecycle.DELETED.equals(assetStatus)) {
+            throw new UploadService.ConflictException("asset " + assetId + " has been deleted");
         }
         quotas.check(tenantId);
         Object templateId = self[3];

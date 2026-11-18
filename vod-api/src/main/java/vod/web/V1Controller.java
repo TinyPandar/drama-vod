@@ -2,13 +2,17 @@ package vod.web;
 
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import vod.asset.AssetLifecycle;
+import vod.asset.AssetMetadata;
 import vod.auth.ApiKeyFilter;
 import vod.auth.TenantPrincipal;
 import vod.job.JobService;
@@ -26,11 +30,13 @@ public class V1Controller {
     private final TranscodeService transcodes;
     private final TemplateService templates;
     private final MultipartUploads multipart;
+    private final AssetMetadata metadata;
+    private final AssetLifecycle lifecycle;
     private final int defaultPageSize;
     private final int maxPageSize;
 
     public V1Controller(UploadService uploads, JobService jobService, TranscodeService transcodes, TemplateService templates,
-                        MultipartUploads multipart,
+                        MultipartUploads multipart, AssetMetadata metadata, AssetLifecycle lifecycle,
                         @Value("${vod.api.page-size-default:20}") int defaultPageSize,
                         @Value("${vod.api.page-size-max:100}") int maxPageSize) {
         this.uploads = uploads;
@@ -38,6 +44,8 @@ public class V1Controller {
         this.transcodes = transcodes;
         this.templates = templates;
         this.multipart = multipart;
+        this.metadata = metadata;
+        this.lifecycle = lifecycle;
         this.defaultPageSize = defaultPageSize;
         this.maxPageSize = maxPageSize;
     }
@@ -54,7 +62,10 @@ public class V1Controller {
         if (mode != null && !(mode instanceof String)) throw new IllegalArgumentException("mode must be a string");
         Object contentType = body == null ? null : body.get("content_type");
         if (contentType != null && !(contentType instanceof String)) throw new IllegalArgumentException("content_type must be a string");
-        return uploads.open(tenant.tenantId(), idempotencyKey, encrypted, filename, (String) mode, (String) contentType);
+        // 路线 B：可选 title、tags。
+        String title = AssetMetadata.title(body == null ? null : body.get("title"));
+        var tags = AssetMetadata.tags(body == null ? null : body.get("tags"));
+        return uploads.open(tenant.tenantId(), idempotencyKey, encrypted, filename, (String) mode, (String) contentType, title, tags);
     }
 
     /** Phase 6：上传参数（分片大小、走 multipart 的阈值等），控制台据此选方式，不在前端写死。scope upload。 */
@@ -101,16 +112,44 @@ public class V1Controller {
         return uploads.asset(tenant(request, "asset").tenantId(), assetId);
     }
 
-    /** 游标分页：limit 默认与上限来自配置，cursor 传上一页返回的 next_cursor。 */
+    /**
+     * 游标分页：limit 默认与上限来自配置，cursor 传上一页返回的 next_cursor。
+     * 路线 B 筛选：status（缺省不含 DELETED，给 DELETED 才列出已删除的）、q（标题包含，或等于资产 id）、tag（精确）。
+     */
     @GetMapping("/api/v1/assets")
     public Map<String, Object> assets(HttpServletRequest request,
                                       @RequestParam(value = "limit", required = false) Integer limit,
-                                      @RequestParam(value = "cursor", required = false) Long cursor) {
+                                      @RequestParam(value = "cursor", required = false) Long cursor,
+                                      @RequestParam(value = "status", required = false) String status,
+                                      @RequestParam(value = "q", required = false) String q,
+                                      @RequestParam(value = "tag", required = false) String tag) {
         long tenantId = tenant(request, "asset").tenantId();
         if (limit != null && limit <= 0) throw new IllegalArgumentException("limit must be positive");
         if (cursor != null && cursor <= 0) throw new IllegalArgumentException("cursor must be positive");
+        String st = status == null || status.isBlank() ? null : status.strip().toUpperCase(java.util.Locale.ROOT);
+        if (st != null && !UploadService.ASSET_STATUSES.contains(st)) throw new IllegalArgumentException("unknown status " + st);
+        String query = q == null || q.isBlank() ? null : q.strip();
+        if (query != null && query.length() > AssetMetadata.MAX_TITLE) throw new IllegalArgumentException("q is too long");
         int size = Math.min(limit == null ? defaultPageSize : limit, maxPageSize);
-        return uploads.assets(tenantId, size, cursor);
+        return uploads.assets(tenantId, size, cursor, new UploadService.AssetFilter(st, query, AssetMetadata.tagFilter(tag)));
+    }
+
+    /** 路线 B：改标题 / 标签。body 里出现的字段才改；返回改后的资产详情。scope asset。 */
+    @PatchMapping("/api/v1/assets/{assetId}")
+    public Map<String, Object> updateAsset(HttpServletRequest request, @PathVariable long assetId,
+                                           @RequestBody(required = false) Map<String, Object> body) {
+        long tenantId = tenant(request, "asset").tenantId();
+        metadata.update(tenantId, assetId, body);
+        return uploads.asset(tenantId, assetId);
+    }
+
+    /**
+     * 路线 B：删除资产（软删除）。200 返回 {id, status: DELETED, deleted_at, deleted_reason}；已删除再调同样 200。
+     * 有进行中的任务 409（先取消）；跨租户 404。转码产物和源文件异步删除。scope asset。
+     */
+    @DeleteMapping("/api/v1/assets/{assetId}")
+    public Map<String, Object> deleteAsset(HttpServletRequest request, @PathVariable long assetId) {
+        return lifecycle.delete(tenant(request, "asset").tenantId(), assetId);
     }
 
     @GetMapping("/api/v1/jobs")

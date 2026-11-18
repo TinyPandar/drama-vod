@@ -99,17 +99,25 @@ class DlqTest(unittest.TestCase):
         with self.assertRaises(dlq.ReplayRefused):
             dlq.replay_job(conn, 99, message)
 
+    def test_replay_refuses_deleted_asset(self):
+        conn = FakeConn([{"id": 7, "tenant_id": 1, "asset_id": 3, "status": "FAILED"}, {"status": "DELETED"}])
+        with self.assertRaises(dlq.ReplayRefused):
+            dlq.replay_job(conn, 7, message)
+        self.assertEqual(conn.events, ["begin", "rollback"])
+        self.assertFalse(any(s.startswith("UPDATE") or s.startswith("INSERT") for s, _ in conn.cur.calls))
+
     def test_replay_resets_job_and_writes_outbox(self):
-        conn = FakeConn([{"id": 7, "tenant_id": 1, "asset_id": 3, "status": "FAILED"}])
+        conn = FakeConn([{"id": 7, "tenant_id": 1, "asset_id": 3, "status": "FAILED"}, {"status": "FAILED"}])
         self.assertEqual(dlq.replay_job(conn, 7, message), 42)
         self.assertEqual(conn.events, ["begin", "commit"])
         sqls = [s for s, _ in conn.cur.calls]
         self.assertIn("FOR UPDATE", sqls[0])
-        self.assertIn("status='PENDING', attempts=0, error_code=NULL", sqls[1])
-        self.assertIn("claim_version=claim_version+1", sqls[1])
-        self.assertIn("UPDATE vod_media_asset SET status='UPLOADED'", sqls[2])
-        self.assertIn("INSERT INTO vod_outbox", sqls[3])
-        payload = json.loads(conn.cur.calls[3][1][2])
+        self.assertIn("FROM vod_media_asset WHERE id=%s FOR UPDATE", sqls[1])
+        self.assertIn("status='PENDING', attempts=0, error_code=NULL", sqls[2])
+        self.assertIn("claim_version=claim_version+1", sqls[2])
+        self.assertIn("UPDATE vod_media_asset SET status='UPLOADED'", sqls[3])
+        self.assertIn("INSERT INTO vod_outbox", sqls[4])
+        payload = json.loads(conn.cur.calls[4][1][2])
         self.assertEqual((payload["job_id"], payload["asset_id"], payload["origin"]), (7, 3, "core"))
         self.assertEqual(payload["schema_version"], 1)
 

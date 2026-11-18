@@ -6,6 +6,77 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 路线图见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)，旧接口兼容约定见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
 
+## 路线 B：资产生命周期（`plan/asset-lifecycle`，从 `plan/live-verify` 叠出，未合并）
+
+### 为什么
+
+此前资产只进不出：Core 没有任何删除接口，源文件和转码产物删不掉，存储用量只增不减；取消或过期的上传会留下源对象，资产永远停在 `UPLOADING`；Webhook 事件、投递、outbox、幂等键几张流水表没有保留期；资产没有标题、标签、创建时间，列表不能搜索筛选。
+
+### 做了什么
+
+**删除资产**：`DELETE /api/v1/assets/{id}`（scope `asset`）。
+
+- 软删除：资产行保留，`status='DELETED'`，记 `deleted_at` 和 `deleted_reason`（`USER` / `UPLOAD_ABORTED` / `UPLOAD_EXPIRED`）。返回 `{id, status, deleted_at, deleted_reason}`；已删除再调同样 200（不重复退配额）；别的租户 404。
+- 同一资产有任务在 `PENDING` / `RETRYING` / `RUNNING` 时 409，先取消再删。还 OPEN 的上传会话一并取消（multipart 在存储侧 abort，存储不可用时 503、什么都不改）。
+- 删除后：详情、播放、播放 token、密钥接口、重新转码都 404；这个资产的任务重试 409；默认列表不再出现，`?status=DELETED` 能查到。任务行保留作历史。
+- 存储配额退回 `source_size`（complete 时占用的那部分）。
+- 转码产物：所有 `ACTIVE` / `WRITING` 输出前缀改成 `GARBAGE`、资产的 `hls_prefix` / `poster_key` 清空，由 Worker 现有的前缀清理在宽限期（`WORKER_OUTPUT_GC_GRACE_SECONDS`，且不小于租约）后删掉。Worker 没有改。
+- 源文件：`vod_storage_object.delete_after` 到期后由新增的 `StorageObjectCleanup` 删除（默认删除后下一轮就删，`VOD_ASSET_SOURCE_DELETE_GRACE_SECONDS` 可调）。删前复核对象是 `SOURCE` 且所属资产确实已 `DELETED`，存储失败保留领取、过期后重试，多实例用条件 UPDATE 领取。
+- 内容密钥行、标签一并删除。`scripts/dlq.py replay` 遇到已删除资产拒绝重放。
+- 加锁顺序：会话 → 租户 → 任务 → 资产 → 前缀，和 complete、建任务、取消、Worker 成功事务不成环（真 MySQL 上 10 轮「删除 vs 重转」并发只有一方生效、不死锁）。
+
+**没完成的上传收尾**（`UploadCleanup` 扩展）：
+
+- 取消上传（`POST /uploads/{id}/abort`，put 和 multipart 都适用）后资产改为 `DELETED`（`UPLOAD_ABORTED`），已经 PUT 或已组合的源对象排进删除。原来资产会一直停在 `UPLOADING`。
+- put 会话过期后再过 `VOD_UPLOAD_PUT_ABANDON_GRACE_SECONDS`（默认 300 秒，给过期前已开始的 PUT 留时间）收尾：会话 `ABORTED`、资产 `DELETED`（`UPLOAD_EXPIRED`）、源对象删除。put 会话过期后 complete 本来就 409，留下的对象不可能再被用到。
+- multipart 没组合的：照旧在存储侧 abort，再做同样的收尾。
+- multipart 已在存储侧组合、但一直没建任务的（N1）：过期后再保留 `VOD_UPLOAD_ASSEMBLED_RETENTION_SECONDS`（默认 7 天），期间仍可 complete；之后收尾、删对象。原来这种对象会一直留着。
+
+**保留期清理**（新增 `RetentionCleanup`，默认每小时一轮，分批删）：
+
+| 表 | 删什么 | 默认保留 |
+| --- | --- | --- |
+| `vod_webhook_delivery` | `DELIVERED` / `FAILED`，按创建时间 | 30 天（`VOD_RETENTION_WEBHOOK_DAYS`） |
+| `vod_webhook_event` | `DISPATCHED`、按创建时间、且已没有投递行引用 | 同上 |
+| `vod_outbox` | `PUBLISHED`，按发布时间 | 30 天（`VOD_RETENTION_OUTBOX_DAYS`） |
+| `vod_idempotency_key` | 按创建时间 | 168 小时（`VOD_RETENTION_IDEMPOTENCY_HOURS`）；之后同一个 Idempotency-Key 当成新请求 |
+
+`PENDING` 的行永远不删；保留期 `<= 0` 表示这张表不清理。
+
+**标题、标签与搜索**：
+
+- `POST /uploads` 可带 `title`（最长 200 字）和 `tags`（最多 10 个，每个 1–32 个字符：文字、数字、`_`、`.`、`-`，去重保序）；Idempotency-Key 重放不改已有资产。
+- `PATCH /api/v1/assets/{id}`（scope `asset`）：body 里出现的字段才改；`title` 为空串或 null 表示清空；`tags` 整体替换；未知字段 400。返回改后的详情。
+- `GET /api/v1/assets` 新增筛选：`status`（缺省不含 `DELETED`）、`q`（标题包含，`%` `_` 按字面匹配；纯数字时也匹配资产 id）、`tag`（精确）。列表和详情多了 `title`、`tags`、`created_at`，详情还有 `updated_at`。
+- 迁移 `V14__asset_lifecycle.sql`：只追加列、表、索引。已有资产的 `created_at` 是迁移时刻（此前没有记录）。
+
+**控制台**：上传卡片可填标题（留空用文件名）和标签；资产列表有关键字 / 状态 / 标签筛选，显示标题、标签和创建时间；资产详情显示标题和标签、可编辑，有「删除这个资产」（有进行中的任务时按钮不可点并说明原因，点了有确认框），删除后回列表并提示。状态 `DELETED` 显示为「已删除」。
+
+**指标**：`vod_asset_deleted_total{reason}`、`vod_asset_source_delete_total{result}`、`vod_retention_deleted_total{table}`、`vod_upload_multipart_total{event}` 新增 `put_expired`、`assembled_expired`。
+
+### 跑过的检查
+
+| 检查 | 结果 |
+| --- | --- |
+| `mvn test`（H2 + MySQL 8.4，Flyway V1–V14） | 161 个，0 失败 0 跳过。新增 `AssetLifecycleTest` 13 个、`AssetLifecycleMysqlTest` 3 个（CI 里已列为必须真跑的 MySQL 用例）；`MultipartUploadTest` 里「取消后资产仍 UPLOADING」的断言改成 `DELETED` / `UPLOAD_ABORTED` |
+| 新增 `scripts/lifecycle_live.py`（Compose 栈 + `docker-compose.lifecycle-live.yml`） | 28/28：标题、标签、筛选、PATCH；删除后各接口 404、存储用量退回、源文件和转码产物从 MinIO 删掉（清理后原播放地址 404）；有进行中的任务 409；取消上传和上传过期后资产 `DELETED`、源对象删除、过期后 complete 409 |
+| `scripts/console_live.py`（加了路线 B 的界面步骤） | 61/61 |
+| `e2e.py`、`playback_live.py`、`platform_live.py`、`media_live.py` 回归 | 30/30、30/30、40/40、27/27 |
+| `test_fencing_mysql.py`、`contract_check.py` 与其余 `scripts/test_*.py` | 全过（`test_dlq.py` 新增「已删除资产拒绝重放」） |
+| 已有数据的 MySQL 上执行 V14 | 在 A 留下的验收库（几十个资产）上升级，迁移成功 |
+
+真 MySQL 测试抓到一个问题并已修：MySQL `TIMESTAMP`（无小数位）会把小数秒四舍五入，「现在」写进去可能变成下一秒，源对象清理就要多等一轮。排期时间截到整秒。
+
+验收截图已按本分支的控制台重新生成（[docs/console-redesign/acceptance/](docs/console-redesign/acceptance/)，新增 `asset-detail-meta-*`）。
+
+### 已知边界
+
+- Phase 4 之前写的固定前缀 `assets/v1/{id}/`（没有输出前缀行）和旧 Demo 的 `assets/{id}/` 删资产时不会被清理；旧 Demo 本身没有删除接口（C 会收掉旧链路）。
+- 删除后，Nginx 边缘缓存里的播放列表和分片在缓存有效期内仍可能被拿到；之后回源会失败。没有做 CDN 刷新。
+- 软删除的资产行和任务行永久保留（体积很小），没有彻底删除的接口。
+- 已删除资产没有 Webhook 事件（`asset.deleted` 未做）。
+- `created_at` 对 V14 之前的资产不准确。
+
 ## 路线 A：在 Compose 栈上把账还清（`plan/live-verify`，未合并）
 
 基线 `main` = `c102205`（控制台改版已合并）。目标：Phase 3–6 和控制台改版各节「没跑」清单里、需要整套 Docker Compose 的检查全部真跑一遍；跑出来的问题就地修；以后由 CI 自动跑。后续 B（资产生命周期）、C（Demo 迁到 Core）的分支从本分支往下叠，合并时请按 A → B → C 的顺序。
@@ -62,6 +133,7 @@ export COMPOSE_PROJECT_NAME=drama-vod-live
 export COMPOSE_FILE=docker-compose.yml:docker-compose.platform-live.yml:docker-compose.media-live.yml
 docker compose up -d --build
 python3 scripts/e2e.py && python3 scripts/playback_live.py && python3 scripts/platform_live.py && python3 scripts/media_live.py
+# 路线 B 起：COMPOSE_FILE 末尾再加 :docker-compose.lifecycle-live.yml，然后 python3 scripts/lifecycle_live.py
 python3 scripts/fault_inject.py
 python3 scripts/console_live.py --shots /tmp/console-shots     # 需要 playwright；或 CHROME_BIN 指向本机 Chrome
 # 早期在 Compose 网络里跑的脚本

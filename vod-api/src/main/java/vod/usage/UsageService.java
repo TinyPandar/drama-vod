@@ -35,6 +35,13 @@ public class UsageService {
         this.maxHistoryDays = Math.max(1, maxHistoryDays);
     }
 
+    /** 路线 B：删除资产时退回它占用的源文件大小；不会减到 0 以下。必须在调用方事务里执行。 */
+    public void releaseStorage(long tenantId, long bytes) {
+        if (bytes <= 0) return;
+        jdbc.update("UPDATE vod_tenant SET storage_used_bytes = CASE WHEN storage_used_bytes > ? THEN storage_used_bytes - ? ELSE 0 END "
+                + "WHERE id = ?", bytes, bytes, tenantId);
+    }
+
     /**
      * 原子占用存储配额：单条条件 UPDATE 同时判断上限并累加，并发 complete 不会一起越过上限。
      * 必须在调用方事务里执行，后续失败回滚时占用一并回滚。

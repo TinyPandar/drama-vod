@@ -29,6 +29,9 @@ public interface ObjectStorage {
     /** 取消分片上传，丢掉已传分片。upload 已不存在时视为成功（幂等）。 */
     void abortMultipart(String bucket, String key, String uploadId);
 
+    /** 路线 B：删除对象。对象不存在视为成功（幂等）。 */
+    void delete(String bucket, String key);
+
     /** 一个分片：complete 时 size 不参与（填 0 即可）；listParts 返回存储侧的 size。etag 不带引号。 */
     record MultipartPart(int partNumber, String etag, long size) {
     }

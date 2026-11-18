@@ -39,6 +39,11 @@ public class UnavailableStorage implements ObjectStorage {
         throw notConfigured();
     }
 
+    @Override
+    public void delete(String bucket, String key) {
+        throw notConfigured();
+    }
+
     private static IllegalStateException notConfigured() {
         return new IllegalStateException("object storage is not configured");
     }

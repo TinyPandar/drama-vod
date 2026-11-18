@@ -359,7 +359,10 @@ class MultipartUploadTest {
         assertTrue(storage.aborted.contains(uploadId));
         assertFalse(storage.uploadOpen(uploadId));
         assertEquals("ABORTED", sessionStatus(sessionId));
-        assertEquals("UPLOADING", jdbc.queryForObject("SELECT status FROM vod_media_asset WHERE id = ?", String.class,
+        // 路线 B：取消上传后资产改为 DELETED（原因 UPLOAD_ABORTED），不再一直停在 UPLOADING。
+        assertEquals("DELETED", jdbc.queryForObject("SELECT status FROM vod_media_asset WHERE id = ?", String.class,
+                opened.get("asset_id").asLong()));
+        assertEquals("UPLOAD_ABORTED", jdbc.queryForObject("SELECT deleted_reason FROM vod_media_asset WHERE id = ?", String.class,
                 opened.get("asset_id").asLong()));
         abort("key-a", sessionId, status().isOk());  // 重复取消幂等
         complete("key-a", sessionId, partsBody(e1), status().isConflict());

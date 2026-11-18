@@ -87,6 +87,11 @@ def replay_job(conn, job_id, message_fn):
                 raise ReplayRefused(f"core job {job_id} not found")
             if job["status"] != "FAILED":
                 raise ReplayRefused(f"core job {job_id} is {job['status']}; only FAILED can be replayed")
+            # 路线 B：资产已删除（软删除）时不重放；锁顺序与删除事务一致（任务 → 资产）
+            c.execute("SELECT status FROM vod_media_asset WHERE id=%s FOR UPDATE", (job["asset_id"],))
+            asset = c.fetchone()
+            if asset and asset["status"] == "DELETED":
+                raise ReplayRefused(f"core job {job_id}: asset {job['asset_id']} has been deleted")
             c.execute("UPDATE vod_transcode_job SET status='PENDING', attempts=0, error_code=NULL, last_error=NULL, "
                       "locked_until=NULL, worker_id=NULL, next_attempt_at=NULL, claim_version=claim_version+1, "
                       "updated_at=CURRENT_TIMESTAMP WHERE id=%s AND status='FAILED'", (job_id,))

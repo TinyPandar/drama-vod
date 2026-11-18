@@ -28,6 +28,10 @@ public class MemoryStorage implements ObjectStorage {
     public final Set<String> aborted = ConcurrentHashMap.newKeySet();
     /** 置为 true 时 abortMultipart 抛异常，模拟存储不可用。 */
     public volatile boolean failAbort;
+    /** 置为 true 时 delete 抛异常，模拟存储不可用。 */
+    public volatile boolean failDelete;
+    /** 被删除过的对象（bucket/key）。 */
+    public final Set<String> deleted = ConcurrentHashMap.newKeySet();
 
     public void put(String bucket, String key) {
         put(bucket, key, 128, "video/mp4");
@@ -41,7 +45,9 @@ public class MemoryStorage implements ObjectStorage {
         objects.clear();
         uploads.clear();
         aborted.clear();
+        deleted.clear();
         failAbort = false;
+        failDelete = false;
     }
 
     @Override
@@ -126,6 +132,13 @@ public class MemoryStorage implements ObjectStorage {
     public void abortMultipart(String bucket, String key, String uploadId) {
         if (failAbort) throw new IllegalStateException("storage unavailable");
         if (uploads.remove(uploadId) != null) aborted.add(uploadId);
+    }
+
+    @Override
+    public void delete(String bucket, String key) {
+        if (failDelete) throw new IllegalStateException("storage unavailable");
+        objects.remove(bucket + "/" + key);
+        deleted.add(bucket + "/" + key);
     }
 
     private Upload existing(String bucket, String key, String uploadId) {

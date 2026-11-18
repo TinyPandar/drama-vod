@@ -11,6 +11,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import vod.asset.AssetLifecycle;
+import vod.asset.AssetMetadata;
 import vod.job.OutboxWriter;
 import vod.media.PosterUrls;
 import vod.quota.QuotaService;
@@ -36,8 +38,8 @@ public class UploadService {
     public static final String ROLE_SOURCE = "SOURCE";
     public static final String MODE_PUT = "put";
     public static final String MODE_MULTIPART = "multipart";
-    static final String SESSION_COLUMNS = "id, asset_id, status, object_key, expires_at, upload_mode, multipart_upload_id";
-    static final RowMapper<Session> SESSION_ROW = (rs, n) -> new Session(
+    public static final String SESSION_COLUMNS = "id, asset_id, status, object_key, expires_at, upload_mode, multipart_upload_id";
+    public static final RowMapper<Session> SESSION_ROW = (rs, n) -> new Session(
             rs.getLong("id"), rs.getLong("asset_id"), rs.getString("status"), rs.getString("object_key"),
             rs.getTimestamp("expires_at") == null ? null : rs.getTimestamp("expires_at").toInstant(),
             rs.getString("upload_mode") == null ? MODE_PUT : rs.getString("upload_mode"),
@@ -52,10 +54,12 @@ public class UploadService {
     private final UploadPolicy policy;
     private final PosterUrls posters;
     private final MeterRegistry registry;
+    private final AssetMetadata metadata;
 
     public UploadService(JdbcTemplate jdbc, ObjectStorage storage, OutboxWriter outbox,
                          UsageService usage, QuotaService quotas, WebhookEvents events, UploadPolicy policy,
-                         PosterUrls posters, MeterRegistry registry) {
+                         PosterUrls posters, MeterRegistry registry, AssetMetadata metadata) {
+        this.metadata = metadata;
         this.posters = posters;
         this.registry = registry;
         this.jdbc = jdbc;
@@ -80,6 +84,13 @@ public class UploadService {
     @Transactional
     public Map<String, Object> open(long tenantId, String idempotencyKey, boolean encrypted, String filename,
                                     String mode, String contentType) {
+        return open(tenantId, idempotencyKey, encrypted, filename, mode, contentType, null, java.util.List.of());
+    }
+
+    /** 路线 B：可选 title / tags 写到新资产上（同一事务）；Idempotency-Key 重放不改已有资产的元数据。 */
+    @Transactional
+    public Map<String, Object> open(long tenantId, String idempotencyKey, boolean encrypted, String filename,
+                                    String mode, String contentType, String title, java.util.List<String> tags) {
         String uploadMode = mode(mode);
         String ext = policy.extensionFor(filename);
         String multipartType = MODE_MULTIPART.equals(uploadMode) ? policy.multipartContentType(ext, contentType) : null;
@@ -116,6 +127,7 @@ public class UploadService {
                 key, objectId, assetId, tenantId);
         jdbc.update("UPDATE vod_upload_session SET asset_id = ?, object_key = ? WHERE id = ? AND tenant_id = ?",
                 assetId, key, sessionId, tenantId);
+        metadata.initial(tenantId, assetId, title, tags == null ? java.util.List.of() : tags);
         if (MODE_PUT.equals(uploadMode)) {
             return putResponse(new Session(sessionId, assetId, "OPEN", key, expiresAt, MODE_PUT, null));
         }
@@ -243,13 +255,49 @@ public class UploadService {
         return Map.of("asset_id", assetId, "job_id", jobId, "job_status", "PENDING");
     }
 
+    /** 路线 B：列表筛选。status 为 null 时不含 DELETED；q 匹配标题（包含）或资产 id（等于）；tag 精确匹配。 */
+    public record AssetFilter(String status, String q, String tag) {
+        public static final AssetFilter NONE = new AssetFilter(null, null, null);
+    }
+
+    public static final java.util.Set<String> ASSET_STATUSES =
+            java.util.Set.of("UPLOADING", "UPLOADED", "TRANSCODING", "READY", "FAILED", "CANCELLED", AssetLifecycle.DELETED);
+
     /** 按 id 倒序的游标分页：cursor 是上一页最后一个 id，next_cursor 为 null 表示没有下一页。 */
     public Map<String, Object> assets(long tenantId, int limit, Long cursor) {
-        String sql = "SELECT id, status, source_size, encrypted, hls_prefix, poster_key FROM vod_media_asset WHERE tenant_id = ?"
-                + (cursor == null ? "" : " AND id < ?") + " ORDER BY id DESC LIMIT ?";
-        Object[] args = cursor == null ? new Object[]{tenantId, limit + 1} : new Object[]{tenantId, cursor, limit + 1};
+        return assets(tenantId, limit, cursor, AssetFilter.NONE);
+    }
+
+    public Map<String, Object> assets(long tenantId, int limit, Long cursor, AssetFilter filter) {
+        var sql = new StringBuilder("SELECT a.id, a.status, a.source_size, a.encrypted, a.hls_prefix, a.poster_key, a.title, a.created_at "
+                + "FROM vod_media_asset a WHERE a.tenant_id = ?");
+        var args = new java.util.ArrayList<Object>();
+        args.add(tenantId);
+        if (filter.status() != null) {
+            sql.append(" AND a.status = ?");
+            args.add(filter.status());
+        } else {
+            sql.append(" AND a.status <> 'DELETED'");
+        }
+        if (filter.q() != null) {
+            String like = "%" + filter.q().replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%";
+            Long id = asId(filter.q());
+            sql.append(id == null ? " AND a.title LIKE ? ESCAPE '!'" : " AND (a.title LIKE ? ESCAPE '!' OR a.id = ?)");
+            args.add(like);
+            if (id != null) args.add(id);
+        }
+        if (filter.tag() != null) {
+            sql.append(" AND EXISTS (SELECT 1 FROM vod_asset_tag t WHERE t.asset_id = a.id AND t.tenant_id = a.tenant_id AND t.tag = ?)");
+            args.add(filter.tag());
+        }
+        if (cursor != null) {
+            sql.append(" AND a.id < ?");
+            args.add(cursor);
+        }
+        sql.append(" ORDER BY a.id DESC LIMIT ?");
+        args.add(limit + 1);
         long exp = posters.defaultExpiry();
-        var rows = jdbc.query(sql,
+        var rows = jdbc.query(sql.toString(),
                 (rs, n) -> {
                     var row = new LinkedHashMap<String, Object>();
                     row.put("id", rs.getLong("id"));
@@ -259,15 +307,24 @@ public class UploadService {
                     // Phase 6：封面签名地址，没有封面为 null。
                     row.put("poster_url", posters.urlOrNull(rs.getLong("id"), rs.getString("hls_prefix"),
                             rs.getString("poster_key"), exp));
+                    row.put("title", rs.getString("title"));
+                    row.put("created_at", iso(rs.getTimestamp("created_at")));
                     return (Map<String, Object>) row;
                 },
-                args);
+                args.toArray());
         boolean more = rows.size() > limit;
         var page = more ? rows.subList(0, limit) : rows;
+        var tags = metadata.tagsOf(page.stream().map(r -> (Long) r.get("id")).toList());
+        for (var row : page) row.put("tags", tags.getOrDefault((Long) row.get("id"), java.util.List.of()));
         var out = new LinkedHashMap<String, Object>();
         out.put("assets", page);
         out.put("next_cursor", more ? page.get(page.size() - 1).get("id") : null);
         return out;
+    }
+
+    private static Long asId(String q) {
+        if (q.length() > 18 || !q.chars().allMatch(Character::isDigit)) return null;
+        return Long.parseLong(q);
     }
 
     public java.util.List<Map<String, Object>> jobs(long tenantId) {
@@ -312,6 +369,7 @@ public class UploadService {
     public Map<String, Object> asset(long tenantId, long assetId) {
         var rows = jdbc.query(
                 "SELECT a.id, a.tenant_id, a.status, a.source_size, a.encrypted, a.hls_prefix, a.duration_ms, a.width, a.height, a.poster_key, "
+                        + "a.title, a.created_at, a.updated_at, "
                         + "o.id AS object_id, o.bucket AS object_bucket, o.object_key AS object_key, o.size AS object_size, "
                         + "o.etag AS object_etag, o.content_type AS object_content_type, o.checksum AS object_checksum "
                         + "FROM vod_media_asset a "
@@ -319,6 +377,8 @@ public class UploadService {
                         + "WHERE a.id = ?",
                 (rs, n) -> {
                     TenantGuard.requireVisible(tenantId, rs.getLong("tenant_id"));
+                    // 路线 B：已删除的资产对租户不可见（列表默认也不含），删除接口自己返回删除结果。
+                    if (AssetLifecycle.DELETED.equals(rs.getString("status"))) throw new TenantGuard.ResourceNotVisibleException();
                     var out = new LinkedHashMap<String, Object>();
                     out.put("id", rs.getLong("id"));
                     out.put("status", rs.getString("status"));
@@ -342,10 +402,15 @@ public class UploadService {
                         source.put("checksum", rs.getString("object_checksum"));
                     }
                     out.put("source", source);
+                    out.put("title", rs.getString("title"));
+                    out.put("created_at", iso(rs.getTimestamp("created_at")));
+                    out.put("updated_at", iso(rs.getTimestamp("updated_at")));
                     return out;
                 }, assetId);
         if (rows.isEmpty()) throw new TenantGuard.ResourceNotVisibleException();
-        return rows.get(0);
+        var out = rows.get(0);
+        out.put("tags", metadata.tagsOf(java.util.List.of(assetId)).get(assetId));
+        return out;
     }
 
     private java.util.List<Session> sessionByIdempotencyKey(long tenantId, String idem, boolean forUpdate) {
@@ -473,13 +538,13 @@ public class UploadService {
         }
     }
 
-    record Session(long id, long assetId, String status, String objectKey, Instant expiresAt, String mode,
-                   String uploadId) {
+    public record Session(long id, long assetId, String status, String objectKey, Instant expiresAt, String mode,
+                          String uploadId) {
         boolean expired(Instant now) {
             return expiresAt == null || !expiresAt.isAfter(now);
         }
 
-        boolean multipart() {
+        public boolean multipart() {
             return MODE_MULTIPART.equals(mode);
         }
     }

@@ -11,6 +11,7 @@ import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListPartsRequest;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
@@ -159,6 +160,17 @@ public final class S3ObjectStorage implements ObjectStorage, AutoCloseable {
             // 已完成或已取消：幂等
         } catch (S3Exception e) {
             if (!isNoSuchUpload(e)) throw e;
+        }
+    }
+
+    @Override
+    public void delete(String bucket, String key) {
+        try {
+            internal.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
+        } catch (NoSuchKeyException e) {
+            // 已不存在：幂等（S3 / MinIO 删除不存在的键本来也返回 204）
+        } catch (S3Exception e) {
+            if (e.statusCode() != 404) throw e;
         }
     }
 
