@@ -318,7 +318,7 @@ def main():
         check("用量与配额页显示配额和历史", "配额" in body() and page.locator("table").count() >= 1)
         shot("usage")
         go("/templates")
-        check("模板页同时有系统模板和租户模板", "ladder_v1" in body() and f"tpl_{suffix}" in body())
+        check("模板页同时有系统模板和租户模板", seen(page.get_by_text("ladder_v1")) and seen(page.get_by_text(f"tpl_{suffix}")))
 
         # ---------- 9. 轮换、撤销、失效引导 ----------
         print("== 9. Key 失效与管理登录过期", flush=True)
