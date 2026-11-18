@@ -1,8 +1,12 @@
-"""可选：用无头 Chrome 打开测试页，验证 hls.js 在真实浏览器里能播放（需要本机 google-chrome + websocket-client）。"""
-import json, subprocess, sys, time, urllib.request, websocket
+"""可选：用无头 Chrome 打开测试页，验证 hls.js 在真实浏览器里能播放（需要本机 Chrome/Chromium + websocket-client）。
+
+浏览器默认 google-chrome；别的路径用环境变量 CHROME_BIN 指定（如 Playwright 下载的 Chrome for Testing）。
+"""
+import json, os, subprocess, sys, time, urllib.request, websocket
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080/?ep=1&uid=7"
-p = subprocess.Popen(["google-chrome", "--headless=new", "--no-sandbox", "--disable-gpu",
+p = subprocess.Popen([os.environ.get("CHROME_BIN", "google-chrome"), "--headless=new", "--no-sandbox", "--disable-gpu",
     "--autoplay-policy=no-user-gesture-required", "--remote-debugging-port=9333",
+    "--remote-allow-origins=http://127.0.0.1:9333",
     "--user-data-dir=/tmp/cdp", "about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
     for _ in range(50):

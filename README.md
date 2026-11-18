@@ -6,6 +6,77 @@ Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama D
 
 路线图见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)，旧接口兼容约定见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
 
+## 路线 A：在 Compose 栈上把账还清（`plan/live-verify`，未合并）
+
+基线 `main` = `c102205`（控制台改版已合并）。目标：Phase 3–6 和控制台改版各节「没跑」清单里、需要整套 Docker Compose 的检查全部真跑一遍；跑出来的问题就地修；以后由 CI 自动跑。后续 B（资产生命周期）、C（Demo 迁到 Core）的分支从本分支往下叠，合并时请按 A → B → C 的顺序。
+
+### 环境
+
+- 2026-11-18，macOS 26.2 / Apple M4。开发机本来没有 Docker：用 colima 0.10.3（Lima 2.3.0，Apple Virtualization 虚拟机，4 核 / 6 GB）+ Docker CLI 29.10 + Compose 5.8，二进制都只放在仓库外的 `.phase3-tools/dockerkit/`，没有装进系统。引擎是 Linux 上的 Docker 29.5（虚拟机里），不是 Docker Desktop。
+- 一个栈跑全部脚本：项目名 `drama-vod-live`，叠加 `docker-compose.platform-live.yml` 和 `docker-compose.media-live.yml`；`.env` 里的口令和密钥都是 `openssl rand -hex 32` 生成的一次性值，没有提交。
+- 宿主访问 Maven Central 返回 403（本机代理），`mvn test` 改在 `maven:3.9-eclipse-temurin-21` 容器里跑；本机 Node 24 缺动态库，控制台在 `node:24` 容器里构建（与 CI 同版本）。
+
+### 跑过的检查与结果
+
+| 检查 | 结果 | 说明 |
+| --- | --- | --- |
+| `scripts/e2e.py`（旧 Demo） | 30/30 | 上传、转码、签名、付费集 AES-128、ffmpeg 完整解码、播放计数回刷 |
+| `scripts/playback_live.py`（Core 播放） | 30/30 | Phase 4 时写着「Range 问题已知会有一项失败」，`fix/leftovers` 之后已全过 |
+| `scripts/platform_live.py`（Phase 5） | 40/40 | 改了脚本两处，见下 |
+| `scripts/media_live.py`（Phase 6） | 27/27 | 经 Nginx 边缘；chainguard MinIO 镜像下分片、续传、过期清理都正常 |
+| `scripts/fault_inject.py` 全部 6 个场景 | 6/6 | kill、dup、minio、rabbitmq、cancel、gc；rabbitmq 场景改了脚本，另修了发布器，见下 |
+| `scripts/core_live.py`、`scripts/drama_vod_live.py` | 全过 | 早期脚本假设在 Compose 网络里，用 host 网络的一次性 worker 容器跑（命令见下），脚本没改 |
+| `scripts/kill_recover_submit.py` 手动流程 | 恢复成功 | 旧 Demo 路径转码中强杀 worker，另一个 worker 接手，`claim_version=2`、资产 READY。按默认 1800 秒租约领到的任务要等租约到期才被接手，也实测到了（到期后由补偿扫描完成） |
+| `scripts/browser_check.py`（hls.js 真浏览器） | 播放正常 | 首帧 219 ms、自动切档、预加载下一集；脚本加了 `CHROME_BIN` 和 `--remote-allow-origins` |
+| 新增 `scripts/console_live.py`（控制台真实后端验收） | 52/52 | 见「控制台验收」 |
+| `scripts/test_fencing_mysql.py`（连 Compose 里的 MySQL 8.4） | 30/30 | |
+| `vod-api` `mvn test`（MySQL 用例连 Compose MySQL） | 145 个，0 失败 0 跳过 | |
+| `contract_check.py` 和其余 `scripts/test_*.py` | 全过 | |
+| Prometheus（`--profile obs`） | 4 个目标都 up | `api`、`vod-api`、`rabbitmq`（`rabbitmq_prometheus` 的 per-object 端点）、`worker`（DNS 发现）；`vod_jobs_backlog`、`vod_transcode_jobs_total`、`rabbitmq_queue_messages_ready` 有数据 |
+
+### 跑出来并修掉的问题
+
+1. **RabbitMQ 重启后 vod-api 的发布连接泄漏**（`RabbitTranscodePublisher`）。原来用 amqp-client 默认的自动恢复连接，而每次发布都开一个临时 channel 并声明队列；RabbitMQ 重启后客户端去恢复这些早已关闭的 channel 上的队列，持续刷 `AlreadyClosedException`；同时 `isOpen()` 为假时代码又新建一条连接，旧的那条留着继续重试。改为关掉自动恢复，发布失败或确认超时就丢弃连接，下次发布重连。业务上原来也能最终发布（outbox 有退避重试），这次修的是泄漏和日志刷屏。修后 rabbitmq 场景里 outbox 行在恢复后按退避（2+4+8+16 秒）发布成功。
+2. **控制台分片上传开始时闪出「分片上传中断」**（`AssetsView.vue`）。建好分片会话、第一行进度还没写出来的那一小段时间里，页面会显示橙色的「分片上传中断，还没传完」和灰掉的「继续上传」。改为上传进行中不显示这块提示。产物已在 `node:24` 里重新构建并提交。
+3. **`platform_live.py` 起不来**：脚本里自定义的 `http()` 函数把 `http` 模块覆盖了，`http.server` 报 `AttributeError`。改成 `from http.server import …`。
+4. **`platform_live.py` 重转断言有竞态**：重转后 Worker 可能在响应读回任务前就已领取，`claim_version` 是 +2 而不是 +1。断言改为接受 +1 或 +2（任务 id 不变的检查保留）。
+5. **`fault_inject.py` 的 rabbitmq 场景有时序问题**：故障注入把 Worker 补偿扫描调得很短，资产会先被扫描兜底做完，脚本在 READY 的那一刻查 outbox，发布器还在退避中。改为 READY 后再等 outbox 变 PUBLISHED（新参数 `--outbox-wait-seconds`，默认 330，不小于 `vod.outbox.max-backoff-seconds`）。
+
+### 控制台验收（原「实现说明」里没跑的第 1–5 条）
+
+`scripts/console_live.py` 用 Playwright 驱动真实控制台，连真实后端，只通过界面操作（最后用无效身份直接请求接口，核对服务端仍拒绝）。52 项全部通过，覆盖：未登录跳登录页、口令错误中文提示、登录后回原页并高亮；未选 Key 时「资产」「用量与配额」出现引导且不含 401；建租户、停用 / 启用、改配额刷新后仍在；新建 Key 明文只出现一次、「在本标签页使用」后页头只有备注和前缀、整页不含明文；新建租户模板；小文件直传；大文件分片在第 2 片持续失败时出现续传提示、点「继续上传」完成；分片上传取消；资产详情封面加载、浏览器里真实播放（`currentTime > 1s`）、按租户模板转码成功；任务列表、按同一模板重转、取消、重试后成功；Webhook 登记、签名密钥只显示一次、刷新后不再出现、停用 / 启用、投递记录；用量历史天数；模板页同时有系统和租户模板；轮换后旧 Key 出现失效引导、页头变红、说明管理登录仍有效、管理页仍可用，粘贴新 Key 恢复；撤销有确认框、撤销后失效；管理 JWT 被拒绝后回登录页并说明「管理登录已过期」、租户 Key 保留、重新登录回原页；服务端直接拒绝被撤销的 Key 和伪造的 JWT；375 宽无横向溢出、抽屉打开后 Esc 关闭；「短剧场」指向旧播放页；退出；全程无页面脚本错误。旧播放页 `nginx/html/index.html` 自 Phase 4（`155f647`）以来没有改动。
+
+验收截图在 [docs/console-redesign/acceptance/](docs/console-redesign/acceptance/)：11 个页面 / 状态 × 1440、1280、375 三种宽度，共 33 张，来自真实后端，数据是脚本建的测试租户。新 Key 明文和 Webhook 签名密钥所在区域已打码（品红色块）；页面上能看到的 `vk_…` 只是前缀，不是密钥，这些 Key 在验收结束前已被轮换和撤销。
+
+还没看过的：Safari、Firefox、真实手机；读屏和对比度。
+
+### CI：新增 Compose live 工作流
+
+`.github/workflows/compose-live.yml`：push 到 `main`、`plan/**`、`fix/**`，向 `main` 提 PR，以及手动触发时起整套栈，依次跑 `e2e.py`、`playback_live.py`、`platform_live.py`、`media_live.py`、`core_live.py`、`drama_vod_live.py`、`browser_check.py`、`console_live.py`、`test_fencing_mysql.py`，任何一个非零退出都算失败，每个脚本的结论写进 Step Summary；每天定时跑一次并加跑 `fault_inject.py`（手动触发时可勾选）。密钥是运行时生成的随机值，不用 GitHub secrets，不发布、不部署。原来的 `ci.yml` 不变。
+
+### 怎么在本机重跑
+
+```bash
+# 在仓库根目录；.env 写好口令和 VOD_ADMIN_USERNAME / VOD_ADMIN_PASSWORD（不要提交）
+export COMPOSE_PROJECT_NAME=drama-vod-live
+export COMPOSE_FILE=docker-compose.yml:docker-compose.platform-live.yml:docker-compose.media-live.yml
+docker compose up -d --build
+python3 scripts/e2e.py && python3 scripts/playback_live.py && python3 scripts/platform_live.py && python3 scripts/media_live.py
+python3 scripts/fault_inject.py
+python3 scripts/console_live.py --shots /tmp/console-shots     # 需要 playwright；或 CHROME_BIN 指向本机 Chrome
+# 早期在 Compose 网络里跑的脚本
+set -a; . ./.env; set +a
+docker run --rm --network host --add-host nginx:127.0.0.1 --add-host mysql:127.0.0.1 \
+  -e MYSQL_HOST=mysql -e MYSQL_USER=vod -e MYSQL_PASSWORD="$MYSQL_PASSWORD" -e MYSQL_DB=vod \
+  -v "$PWD/scripts:/scripts:ro" drama-vod-live-worker python /scripts/core_live.py
+```
+
+### 仍然存在的边界
+
+- 早期的 `core_live.py`、`drama_vod_live.py`、`kill_recover_submit.py` 仍按「在 Compose 网络内运行」编写，要用上面的 host 网络容器跑。
+- 新工作流在合并前只在分支推送时跑；GitHub 托管 runner 上的耗时和稳定性以实际运行为准。
+- Worker 启动时如果 vod-api 还没跑完 Flyway，补偿扫描会记一条 `sweeper_core_skip`（表不存在），下一轮自动恢复，不影响结果。
+
 ## 分支方案：管理控制台界面改版（plan/console-redesign）
 
 本分支：`plan/console-redesign`，基线 `main` = `7bc59d3`（`7bc59d34812507c2fad6230f52f59f7525eda45d`，fix/leftovers 已合并）。下面是产品需求，实现完成后把实现说明写在本节后面，不要改需求原文。
@@ -1120,6 +1191,9 @@ docker compose --profile obs up -d prometheus
 ## 检查
 
 [![CI](https://github.com/TinyPandar/drama-vod/actions/workflows/ci.yml/badge.svg)](https://github.com/TinyPandar/drama-vod/actions/workflows/ci.yml)
+[![Compose live](https://github.com/TinyPandar/drama-vod/actions/workflows/compose-live.yml/badge.svg)](https://github.com/TinyPandar/drama-vod/actions/workflows/compose-live.yml)
+
+需要整套 Compose 栈的脚本由 `.github/workflows/compose-live.yml` 跑，见上文「路线 A」。
 
 CI（`.github/workflows/ci.yml`）在 push 到任意分支、向 `main` 提 PR 时自动跑，三个 job 并行：`vod-api` 用 `mysql:8.4` 服务容器跑 `mvn -B test`（H2 用例和 `MysqlSemanticsTest`、`Phase5MysqlTest`、`Phase6MysqlTest` 一起跑，MySQL 用例缺失或被跳过算失败）；`python` 跑 `contract_check.py` 和全部 `scripts/test_*.py`（`test_fencing_mysql.py` 连服务容器，任何脚本非零退出或出现 skipped 算失败）；`console` 跑 `npm ci && npm run build`，并检查提交的 `nginx/html/vod-console/` 产物没过期。CI **不跑**需要整套 Compose 的脚本（`e2e.py`、`*_live.py`、`fault_inject.py`、`kill_recover_submit.py`、`browser_check.py`、`nginx_local_check.py`），也不发布、不部署、不用 secrets。
 

@@ -108,7 +108,7 @@ onMounted(() => run(() => load()));
         <div class="btn-row small muted"><span class="spin"></span>上传期间请不要关闭或刷新本标签页。</div>
       </div>
 
-      <div v-else-if="pending" class="alert warn" role="status">
+      <div v-else-if="pending && !busy" class="alert warn" role="status">
         <Icon name="warn" />
         <div class="a-body">
           <div class="a-title">分片上传中断，还没传完</div>

@@ -309,7 +309,10 @@ def scenario_rabbitmq(args, media):
     finally:
         compose("start", "rabbitmq")
     final = wait_terminal(opened["asset_id"], args.timeout * 2)
-    row = one("SELECT status, attempts FROM vod_outbox WHERE payload LIKE %s", f'%"job_id":{job_id},%')
+    # 资产可能先被 Worker 的补偿扫描做完；OutboxPublisher 此时还在指数退避里，再等它真的发布出去
+    q = ("SELECT status, attempts FROM vod_outbox WHERE payload LIKE %s", f'%"job_id":{job_id},%')
+    wait(lambda: (one(*q) or {}).get("status") == "PUBLISHED", args.outbox_wait_seconds, 2)
+    row = one(*q)
     ok = bool(pending_while_down) and final == "READY" and row and row["status"] == "PUBLISHED"
     return ok, f"outbox while down={'PENDING' if pending_while_down else 'not PENDING'}, " \
                f"after={row}, asset {opened['asset_id']}={final}"
@@ -427,6 +430,8 @@ def main():
     ap.add_argument("--outage-seconds", type=int, default=300,
                     help="minio scenario: max outage; MinIO is started again as soon as the job logs job_error")
     ap.add_argument("--observe-seconds", type=int, default=20, help="extra time to watch a cancelled job")
+    ap.add_argument("--outbox-wait-seconds", type=int, default=330,
+                    help="rabbitmq: after READY, wait this long for the outbox row to be PUBLISHED (>= vod.outbox.max-backoff-seconds)")
     ap.add_argument("--gc-grace-seconds", type=int, default=30, help="shortened WORKER_OUTPUT_GC_GRACE_SECONDS")
     ap.add_argument("--gc-interval-seconds", type=int, default=5, help="shortened WORKER_OUTPUT_GC_INTERVAL_SECONDS")
     ap.add_argument("--no-restore", action="store_true")

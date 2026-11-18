@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 @Profile("!test")
 public class RabbitTranscodePublisher implements TranscodePublisher, AutoCloseable {
     private static final long CONFIRM_TIMEOUT_MILLIS = 5000;
+    private static final int CONFIRM_TIMEOUT_MILLIS_INT = (int) CONFIRM_TIMEOUT_MILLIS;
     private final String url;
     private Connection connection;
 
@@ -25,8 +26,14 @@ public class RabbitTranscodePublisher implements TranscodePublisher, AutoCloseab
         if (url.isBlank()) return false;
         try {
             if (connection == null || !connection.isOpen()) {
+                closeQuietly();
                 ConnectionFactory factory = new ConnectionFactory();
                 factory.setUri(url);
+                // 不用客户端自带的自动恢复：它会按记录重放每个 channel 上声明过的队列，而这些 channel 早已关闭，
+                // RabbitMQ 重启后恢复失败、isOpen() 却可能仍为 true，发布就一直失败。失败时由这里丢弃连接、下次重连。
+                factory.setAutomaticRecoveryEnabled(false);
+                factory.setTopologyRecoveryEnabled(false);
+                factory.setConnectionTimeout(CONFIRM_TIMEOUT_MILLIS_INT);
                 connection = factory.newConnection();
             }
             try (Channel channel = connection.createChannel()) {
@@ -38,15 +45,29 @@ public class RabbitTranscodePublisher implements TranscodePublisher, AutoCloseab
                                 .contentType("application/json")
                                 .build(),
                         payload.getBytes(StandardCharsets.UTF_8));
-                return channel.waitForConfirms(CONFIRM_TIMEOUT_MILLIS);
+                boolean confirmed = channel.waitForConfirms(CONFIRM_TIMEOUT_MILLIS);
+                if (!confirmed) closeQuietly();
+                return confirmed;
             }
         } catch (Exception e) {
+            closeQuietly();
             return false;
         }
     }
 
+    private void closeQuietly() {
+        Connection c = connection;
+        connection = null;
+        if (c == null) return;
+        try {
+            c.abort((int) CONFIRM_TIMEOUT_MILLIS);
+        } catch (Exception ignored) {
+            // 连接已断，丢弃即可
+        }
+    }
+
     @Override
-    public void close() throws Exception {
-        if (connection != null) connection.close();
+    public synchronized void close() {
+        closeQuietly();
     }
 }

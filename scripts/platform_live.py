@@ -14,8 +14,9 @@ SSRF 地址登记被拒；上传 → READY → 收到签名正确的 transcode.s
 也可以设 PLATFORM_LIVE_HOOK_URL 指向一个公网 HTTPS 接收端，那时只按投递记录判断（拿不到请求体，无法核对签名）。
 只报告真实跑出的结果，不做性能结论。
 """
-import base64, hashlib, hmac, http.server, json, os, pathlib, socket, subprocess, sys, tempfile, threading, time
+import base64, hashlib, hmac, json, os, pathlib, socket, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.request, uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -71,7 +72,7 @@ def js(resp):
         return {}
 
 
-class Hook(http.server.BaseHTTPRequestHandler):
+class Hook(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         received.append((dict(self.headers), body))
@@ -171,7 +172,7 @@ def main():
     if not user or not password:
         raise SystemExit("set VOD_ADMIN_USERNAME / VOD_ADMIN_PASSWORD (same values the stack was started with)")
     if LOCAL_HOOK:
-        server = http.server.ThreadingHTTPServer(("0.0.0.0", HOOK_PORT), Hook)
+        server = ThreadingHTTPServer(("0.0.0.0", HOOK_PORT), Hook)
         threading.Thread(target=server.serve_forever, daemon=True).start()
     tmp = tempfile.mkdtemp()
     src = os.path.join(tmp, "src.mp4")
@@ -250,8 +251,10 @@ def main():
     r = http("POST", f"/api/v1/assets/{asset_id}/transcodes", {"template": "ladder_v1"}, key=keys["a"],
              headers={"Idempotency-Key": f"live-{suffix}"})
     re1 = js(r)
-    check("重新转码 202，同一任务 id，claim_version +1", r[0] == 202 and re1.get("id") == job_id
-          and re1.get("claim_version") == before + 1, f"{r[0]} {re1.get('claim_version')} vs {before}")
+    # 重置时 claim_version +1；Worker 可能在响应读回任务之前就已领取（再 +1），两种都算对
+    check("重新转码 202，同一任务 id，claim_version 已增加", r[0] == 202 and re1.get("id") == job_id
+          and re1.get("claim_version") in (before + 1, before + 2),
+          f"{r[0]} id={re1.get('id')} vs {job_id} cv={re1.get('claim_version')} vs {before}")
     replay = http("POST", f"/api/v1/assets/{asset_id}/transcodes", {"template": "ladder_v1"}, key=keys["a"],
                   headers={"Idempotency-Key": f"live-{suffix}"})
     check("同一 Idempotency-Key 重放 200", replay[0] == 200 and js(replay).get("idempotent_replay") is True, replay[0])
