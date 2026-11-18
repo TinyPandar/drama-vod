@@ -262,7 +262,7 @@ def main():
         page.select_option("#tpl", f"tpl_{suffix}")
         page.get_by_role("button", name="发起转码", exact=True).click()
         page.wait_for_url(re.compile(r"#/jobs/\d+$"))
-        check("发起转码后跳到新任务详情", f"tpl_{suffix}" in body())
+        check("发起转码后跳到新任务详情", seen(page.get_by_text(f"tpl_{suffix}")))
         refresh_until(lambda: "SUCCEEDED" in page.locator("h2").first.inner_text(), "按模板转码成功")
         check("按模板转码成功", "SUCCEEDED" in page.locator("h2").first.inner_text())
 
