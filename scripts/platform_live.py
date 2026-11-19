@@ -282,8 +282,10 @@ def main():
         check("收到 transcode.failed 回调", wait_for(lambda: event("transcode.failed", bad_job), 60))
     v = j.get("claim_version", 0)
     r = http("POST", f"/api/v1/jobs/{bad_job}/retry", key=keys["a"])
-    check("重试 202、回到 PENDING、claim_version+1", r[0] == 202 and js(r).get("status") == "PENDING"
-          and js(r).get("claim_version") == v + 1, f"{r[0]} {r[2][:120]!r}")
+    # 重置后回到 PENDING、claim_version+1；Worker 可能在响应读回前就已领取（RUNNING、再 +1），两种都算对
+    check("重试 202、回到 PENDING（或已被领取）、claim_version 增加", r[0] == 202
+          and (js(r).get("status"), js(r).get("claim_version")) in (("PENDING", v + 1), ("RUNNING", v + 2)),
+          f"{r[0]} {r[2][:120]!r}")
     check("SUCCEEDED 的任务重试 409", http("POST", f"/api/v1/jobs/{job_id}/retry", key=keys["a"])[0] == 409)
 
     print("== 7. 配额与停用", flush=True)
