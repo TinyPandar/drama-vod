@@ -15,20 +15,29 @@
   GET  /api/playback/{asset}/master.m3u8   给不能设请求头的播放器（iPhone）改写播放列表
   GET  /api/episodes/{id}/vod-play?user_id=  Demo 解锁后经视频云签 Core 播放 token（Core 的 key 走 /keys/v1/，在 vod-api）
   GET  /api/rank/hot  /api/episodes/{id}/stats  /metrics
+
+路线 C（Demo 改为视频云的客户）：
+  POST /api/auth/register  /api/auth/login   观众注册、登录，返回 Demo 会话 token（Authorization: Bearer dsess1.…）
+  GET  /api/me                               当前观众、金币余额、已解锁的集
+  POST /api/users/{uid}/unlock               需要本人的会话；付费集按 price_coins 扣金币，重复解锁不重复扣
+  upload-url / complete / GET /api/assets/{id} 改为调视频云（Core）：付费集上传成 Core 加密资产，
+                                             转码完成后由后台对账线程把这一集切到新的 Core 资产
+  play / vod-play                            一律经视频云签 Core 播放 token；还没迁移的旧资产暂时走旧链路
+旧的 /keys/{id}、/api/playback/{asset}/…、/hls/ 只为切换前已经发出的旧地址保留，新的播放不再产生它们。
 """
 import base64, hashlib, hmac, json, os, re, threading, time
 from urllib.parse import quote
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from origin_path import object_key
+import accounts
 import secret_guard
 import vod_client
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel
 
-from common import (ENV, HLS_BUCKET, Q_MAIN, SOURCE_BUCKET, db, log, mq_channel, publish, rds, s3,
-                    transcode_message, wait_for)
+from common import ENV, HLS_BUCKET, SOURCE_BUCKET, db, log, rds, s3, wait_for
 
 VOD_ENV = ENV("VOD_ENV", "dev")
 MIN_SECRET_LENGTH = int(ENV("VOD_MIN_SECRET_LENGTH") or 32)
@@ -38,6 +47,16 @@ PLAY_URL_TTL = int(ENV("PLAY_URL_TTL", "600"))
 PUBLIC_UPLOAD_ENDPOINT = ENV("PUBLIC_UPLOAD_ENDPOINT", "http://localhost:9000")
 # compose 不再给 :-dev 兜底：dev 下为空时在这里退回 dev（Nginx 的入口脚本同样处理），非 dev 由启动检查拒绝。
 ORIGIN_SECRET = secret_guard.dev_fallback(ENV("ORIGIN_SECRET", ""), VOD_ENV)
+# 路线 C：Demo 观众会话的 HMAC 密钥（和旧播放 token、Core 播放 token 分开）。dev 下为空时退回 dev。
+DEMO_SESSION_SECRET = secret_guard.dev_fallback(ENV("DEMO_SESSION_SECRET", ""), VOD_ENV)
+DEMO_SESSION_TTL = int(ENV("DEMO_SESSION_TTL_SECONDS") or 7 * 86400)
+DEMO_SIGNUP_COINS = int(ENV("DEMO_SIGNUP_COINS") or 100)
+# 过渡开关：1 = 没有会话时仍按 ?user_id= 认人（路线 C 之前的行为，不安全）。默认关。
+DEMO_ALLOW_USER_ID_PARAM = (ENV("DEMO_ALLOW_USER_ID_PARAM") or "0").strip() == "1"
+DEMO_SYNC_INTERVAL = float(ENV("DEMO_SYNC_INTERVAL_SECONDS") or 5)
+# 登录失败限流：同一用户名在窗口内失败这么多次后 429（默认值只是开发默认，不是基准或承诺）。
+DEMO_LOGIN_MAX_FAILURES = int(ENV("DEMO_LOGIN_MAX_FAILURES") or 10)
+DEMO_LOGIN_WINDOW = int(ENV("DEMO_LOGIN_WINDOW_SECONDS") or 300)
 
 app = FastAPI(title="drama-vod api")
 s3_internal = s3()
@@ -105,7 +124,8 @@ def internal_origin(scope: str, asset_id: str, file_path: str,
 def check_secrets():
     """非 dev 下弱密钥直接让 startup 失败（uvicorn 退出）；dev 只警告。"""
     secret_guard.check_secrets(
-        {"ORIGIN_SECRET": ORIGIN_SECRET, "HLS_SECRET": HLS_SECRET, "TOKEN_SECRET": TOKEN_SECRET.decode()},
+        {"ORIGIN_SECRET": ORIGIN_SECRET, "HLS_SECRET": HLS_SECRET, "TOKEN_SECRET": TOKEN_SECRET.decode(),
+         "DEMO_SESSION_SECRET": DEMO_SESSION_SECRET},
         VOD_ENV, MIN_SECRET_LENGTH, warn=lambda msg: log("weak_secrets", detail=msg))
 
 
@@ -126,7 +146,9 @@ def startup():
     wait_for("minio", ensure_buckets)
     wait_for("mysql", lambda: db().close())
     wait_for("mysql", ensure_vod_link_table)
+    wait_for("mysql", ensure_demo_schema)
     threading.Thread(target=flush_play_counts_loop, daemon=True).start()
+    threading.Thread(target=core_sync_loop, daemon=True).start()
     log("api_started")
 
 
@@ -140,22 +162,115 @@ def ensure_vod_link_table():
     conn.close()
 
 
-def vod_link(episode_id):
-    conn = db()
-    with conn.cursor() as c:
-        c.execute("SELECT vod_asset_id, vod_session_id FROM episode_vod_link WHERE episode_id=%s", (episode_id,))
-        row = c.fetchone()
-    conn.close()
-    return row
+# ---------------- 路线 C：Demo 自己的表 ----------------
+DEMO_TABLES = (
+    # 观众账号。coins 是演示用的金币余额，扣费和 user_unlock 在同一事务里。
+    "CREATE TABLE IF NOT EXISTS demo_user ("
+    "id BIGINT PRIMARY KEY AUTO_INCREMENT, username VARCHAR(32) NOT NULL, password_hash VARCHAR(200) NOT NULL, "
+    "coins INT NOT NULL DEFAULT 0, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+    "UNIQUE KEY uk_demo_username (username)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    # 金币流水：每次加减一行，balance 是变动后的余额，方便对账。
+    "CREATE TABLE IF NOT EXISTS coin_ledger ("
+    "id BIGINT PRIMARY KEY AUTO_INCREMENT, user_id BIGINT NOT NULL, delta INT NOT NULL, balance INT NOT NULL, "
+    "reason VARCHAR(32) NOT NULL, episode_id BIGINT NULL, order_no VARCHAR(64) NULL, "
+    "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, KEY idx_ledger_user (user_id, id)) "
+    "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    # 一集上传到 Core 的每个资产。PENDING：等 Core 转码；SWITCHED：这一集已切到它；FAILED / GONE：转码失败、资产没了。
+    "CREATE TABLE IF NOT EXISTS episode_core_upload ("
+    "core_asset_id BIGINT PRIMARY KEY, episode_id BIGINT NOT NULL, core_session_id BIGINT NOT NULL, "
+    "status VARCHAR(16) NOT NULL DEFAULT 'PENDING', source VARCHAR(16) NOT NULL DEFAULT 'upload', "
+    "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+    "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, "
+    "KEY idx_core_upload_status (status), KEY idx_core_upload_episode (episode_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+)
+# episode 上追加的列：这一集当前播放的 Core 资产、时长（列表展示用，旧资产的时长仍从 video_asset 取）。
+EPISODE_COLUMNS = {"core_asset_id": "BIGINT NULL", "duration_ms": "INT NULL"}
 
 
-def save_vod_link(episode_id, asset_id, session_id):
+def ensure_demo_schema():
     conn = db()
     with conn.cursor() as c:
-        c.execute("INSERT INTO episode_vod_link(episode_id, vod_asset_id, vod_session_id) VALUES (%s,%s,%s) "
-                  "ON DUPLICATE KEY UPDATE vod_asset_id=VALUES(vod_asset_id), vod_session_id=VALUES(vod_session_id)",
-                  (episode_id, asset_id, session_id))
+        for ddl in DEMO_TABLES:
+            c.execute(ddl)
+        c.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'episode'")
+        have = {row["COLUMN_NAME"].lower() for row in c.fetchall()}
+        for name, ddl in EPISODE_COLUMNS.items():
+            if name not in have:
+                c.execute(f"ALTER TABLE episode ADD COLUMN {name} {ddl}")
+        # 路线 C 之前经 vod-upload 接上的 Core 资产（episode_vod_link）补进对账表，由对账线程决定是否切换。
+        c.execute("INSERT IGNORE INTO episode_core_upload(core_asset_id, episode_id, core_session_id, source) "
+                  "SELECT vod_asset_id, episode_id, vod_session_id, 'link' FROM episode_vod_link")
     conn.close()
+
+
+# ---------------- 路线 C：一集 → Core 资产的对账 ----------------
+CORE_SYNC = Counter("demo_core_sync_total", "episode/core asset reconciliation", ["result"])
+
+
+def pending_core_uploads(limit=50):
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("SELECT core_asset_id, episode_id FROM episode_core_upload WHERE status='PENDING' "
+                  "ORDER BY core_asset_id LIMIT %s", (int(limit),))
+        rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def mark_core_upload(core_asset_id, status):
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("UPDATE episode_core_upload SET status=%s WHERE core_asset_id=%s AND status='PENDING'",
+                  (status, core_asset_id))
+    conn.close()
+
+
+def switch_episode(episode_id, core_asset_id, duration_ms):
+    """这一集改播 core_asset_id。只往更新的资产切（Core 资产 id 递增），同一集先后两次上传、先完成的那次不会覆盖后一次。
+    返回是否切换。"""
+    conn = db()
+    with conn.cursor() as c:
+        changed = c.execute(
+            "UPDATE episode SET core_asset_id=%s, duration_ms=%s, status='READY' "
+            "WHERE id=%s AND (core_asset_id IS NULL OR core_asset_id < %s)",
+            (core_asset_id, duration_ms, episode_id, core_asset_id))
+        c.execute("UPDATE episode_core_upload SET status=%s WHERE core_asset_id=%s",
+                  ("SWITCHED" if changed else "SUPERSEDED", core_asset_id))
+    conn.close()
+    r.delete(f"ep:{episode_id}")
+    return bool(changed)
+
+
+def sync_core_upload(row):
+    """问 Core 这个资产的状态：READY 就切换这一集；终态失败或资产不见了就不再等。返回结果名（测试和指标用）。"""
+    status, payload = vod_client.asset(row["core_asset_id"])
+    if status == 404:
+        mark_core_upload(row["core_asset_id"], "GONE")
+        result = "gone"
+    elif status != 200:
+        result = "core_error"
+    elif payload.get("status") == "READY":
+        result = "switched" if switch_episode(row["episode_id"], row["core_asset_id"], payload.get("duration_ms")) else "superseded"
+    elif payload.get("status") in ("FAILED", "CANCELLED"):
+        mark_core_upload(row["core_asset_id"], "FAILED")
+        result = "failed"
+    else:
+        result = "waiting"
+    CORE_SYNC.labels(result).inc()
+    return result
+
+
+def sync_core_uploads():
+    return [sync_core_upload(row) for row in pending_core_uploads()]
+
+
+def core_sync_loop():
+    while True:
+        time.sleep(DEMO_SYNC_INTERVAL)
+        try:
+            sync_core_uploads()
+        except Exception as e:
+            log("core_sync_error", err=str(e)[:200])
 
 
 def flush_play_counts_loop():
@@ -220,7 +335,8 @@ def create_episode(drama_id: int, body: EpisodeIn):
 
 def _episode_rows(c, drama_id: int):
     c.execute(
-        "SELECT e.id, e.ep_no, e.title, e.is_paid, e.price_coins, e.asset_id, e.status, a.duration_ms "
+        "SELECT e.id, e.ep_no, e.title, e.is_paid, e.price_coins, e.asset_id, e.core_asset_id, e.status, "
+        "COALESCE(e.duration_ms, a.duration_ms) AS duration_ms "
         "FROM episode e LEFT JOIN video_asset a ON a.id = e.asset_id "
         "WHERE e.drama_id=%s ORDER BY e.ep_no", (drama_id,))
     rows = c.fetchall()
@@ -266,7 +382,8 @@ def episode_detail(episode_id: int):
     conn = db()
     with conn.cursor() as c:
         c.execute(
-            "SELECT e.id, e.drama_id, e.ep_no, e.title, e.is_paid, e.price_coins, e.asset_id, e.status, a.duration_ms "
+            "SELECT e.id, e.drama_id, e.ep_no, e.title, e.is_paid, e.price_coins, e.asset_id, e.core_asset_id, e.status, "
+            "COALESCE(e.duration_ms, a.duration_ms) AS duration_ms "
             "FROM episode e LEFT JOIN video_asset a ON a.id = e.asset_id WHERE e.id=%s", (episode_id,))
         ep = c.fetchone()
         drama = None
@@ -281,60 +398,93 @@ def episode_detail(episode_id: int):
     return {"episode": ep, "drama": drama}
 
 
-# ---------------- 上传：预签名直传 ----------------
-@app.post("/api/episodes/{episode_id}/upload-url")
-def upload_url(episode_id: int):
-    ep = get_episode(episode_id)
+# ---------------- 上传：经视频云（路线 C） ----------------
+def _core_error(status, payload, fallback):
+    """Core 的 4xx 原样带回（409 = 源文件还没传完等），5xx / 连不上统一 502。"""
+    raise HTTPException(status if 400 <= status < 500 else 502, payload.get("detail", fallback))
+
+
+def _drama_title(drama_id):
     conn = db()
     with conn.cursor() as c:
-        c.execute("INSERT INTO video_asset(episode_id, source_bucket, source_key, encrypted) VALUES(%s,%s,'',%s)",
-                  (episode_id, SOURCE_BUCKET, ep["is_paid"]))
-        asset_id = c.lastrowid
-        # 目录按 剧/集/资产 分层；资产 id 保证同一集重传不会覆盖旧原片
-        key = f"raw/{ep['drama_id']}/{episode_id}/{asset_id}/source.mp4"
-        c.execute("UPDATE video_asset SET source_key=%s WHERE id=%s", (key, asset_id))
+        c.execute("SELECT title FROM drama WHERE id=%s", (drama_id,))
+        row = c.fetchone()
     conn.close()
-    put_url = s3_public.generate_presigned_url("put_object", Params={"Bucket": SOURCE_BUCKET, "Key": key},
-                                               ExpiresIn=900)
-    return {"asset_id": asset_id, "put_url": put_url, "expires_in": 900}
+    return row["title"] if row else ""
+
+
+def open_core_upload(episode_id, source="upload"):
+    """为这一集在 Core 开一个 put 上传会话：付费集是加密资产；标题、标签写到 Core 资产上。记进 episode_core_upload。"""
+    ep = get_episode(episode_id)
+    title = f"{_drama_title(ep['drama_id'])} 第{ep['ep_no']}集 {ep.get('title') or ''}".strip()
+    status, payload = vod_client.open_upload(encrypted=bool(ep["is_paid"]), title=title,
+                                             tags=[f"drama-{ep['drama_id']}", f"episode-{episode_id}"], filename="source.mp4")
+    if status != 200 or not payload.get("asset_id"):
+        _core_error(status, payload, "vod upload failed")
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("INSERT INTO episode_core_upload(core_asset_id, episode_id, core_session_id, source) VALUES (%s,%s,%s,%s)",
+                  (payload["asset_id"], episode_id, payload["session_id"], source))
+    conn.close()
+    log("core_upload_opened", episode_id=episode_id, core_asset_id=payload["asset_id"])
+    return payload
+
+
+def core_upload(core_asset_id):
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("SELECT core_asset_id, episode_id, core_session_id, status FROM episode_core_upload WHERE core_asset_id=%s",
+                  (core_asset_id,))
+        row = c.fetchone()
+    conn.close()
+    return row
+
+
+def complete_core_upload(row, trace_id=None):
+    status, payload = vod_client.complete_upload(row["core_session_id"])
+    if status != 200:
+        UPLOAD_DONE.labels("missing" if status == 409 else "error").inc()
+        _core_error(status, payload, "vod complete failed")
+    UPLOAD_DONE.labels("ok").inc()
+    log("upload_complete", asset_id=row["core_asset_id"], job_id=payload.get("job_id"), trace_id=trace_id, via="vod-api")
+    return {"asset_id": row["core_asset_id"], "job_id": payload.get("job_id"), "job_status": payload.get("job_status")}
+
+
+@app.post("/api/episodes/{episode_id}/upload-url")
+def upload_url(episode_id: int):
+    """冻结接口，路线 C 起改为 Core 的上传会话：asset_id 是 Core 资产 id，put_url 直传到 Core 的源对象键
+    raw/t{租户}/{资产}/source.mp4（不再是旧的 raw/{剧}/{集}/{资产}/），expires_in 是 Core 会话的有效期。"""
+    payload = open_core_upload(episode_id)
+    return {"asset_id": payload["asset_id"], "put_url": payload["put_url"], "expires_in": payload.get("expires_in")}
 
 
 @app.post("/api/assets/{asset_id}/complete")
 def upload_complete(asset_id: int, x_request_id: str | None = Header(default=None)):
-    conn = db()
-    with conn.cursor() as c:
-        c.execute("SELECT * FROM video_asset WHERE id=%s", (asset_id,))
-        a = c.fetchone()
-        if not a:
-            raise HTTPException(404, "asset not found")
-        try:  # 不信客户端：自己去对象存储确认文件真的在
-            head = s3_internal.head_object(Bucket=a["source_bucket"], Key=a["source_key"])
-        except Exception:
-            UPLOAD_DONE.labels("missing").inc()
-            raise HTTPException(409, "source object not found, upload first")
-        c.execute("UPDATE video_asset SET status='UPLOADED', source_size=%s WHERE id=%s AND status='UPLOADING'",
-                  (head["ContentLength"], asset_id))
-        # INSERT IGNORE + 唯一键：回调重复调用也只会有一个任务
-        c.execute("INSERT IGNORE INTO transcode_job(asset_id, profile, trace_id) VALUES(%s,'ladder_v1',%s)",
-                  (asset_id, x_request_id))
-        c.execute("SELECT id, status FROM transcode_job WHERE asset_id=%s AND profile='ladder_v1'", (asset_id,))
-        job = c.fetchone()
-    conn.close()
-    if job["status"] == "PENDING":
-        # 先落库再发消息；发失败也没关系，worker 的补偿扫描会把久未开始的 PENDING 任务重新投递
-        try:
-            mconn, ch = mq_channel()
-            publish(ch, Q_MAIN, transcode_message(job["id"], asset_id, x_request_id))
-            mconn.close()
-        except Exception as e:
-            log("publish_failed", job_id=job["id"], err=str(e))
-    UPLOAD_DONE.labels("ok").inc()
-    log("upload_complete", asset_id=asset_id, job_id=job["id"], trace_id=x_request_id)
-    return {"asset_id": asset_id, "job_id": job["id"], "job_status": job["status"]}
+    """冻结接口：对象不存在 409（Core 判断），重复调用返回同一个任务。旧链路的资产不再接受新的 complete。"""
+    row = core_upload(asset_id)
+    if not row:
+        raise HTTPException(404, "asset not found")
+    return complete_core_upload(row, x_request_id)
 
 
 @app.get("/api/assets/{asset_id}")
 def asset_status(asset_id: int):
+    """冻结接口：asset.status、jobs[]、renditions[]。Core 资产从视频云读（顺便对一次账）；
+    路线 C 之前的旧资产仍从旧表读。Core 不按档位记 renditions，返回空数组。"""
+    row = core_upload(asset_id)
+    if row:
+        status, a = vod_client.asset(asset_id)
+        if status != 200:
+            _core_error(status, a, "vod asset lookup failed")
+        if row["status"] == "PENDING":
+            sync_core_upload(row)
+        jstatus, jpayload = vod_client.jobs()
+        jobs = [{"id": j["id"], "status": j["status"], "attempts": j.get("attempts"), "profile": j.get("profile")}
+                for j in (jpayload.get("jobs") or []) if j.get("asset_id") == asset_id] if jstatus == 200 else []
+        return {"asset": {"id": asset_id, "episode_id": row["episode_id"], "status": a.get("status"),
+                          "duration_ms": a.get("duration_ms"), "width": a.get("width"), "height": a.get("height"),
+                          "encrypted": 1 if a.get("encrypted") else 0, "hls_prefix": a.get("hls_prefix"), "via": "vod-api"},
+                "jobs": jobs, "renditions": []}
     conn = db()
     with conn.cursor() as c:
         c.execute("SELECT id, episode_id, status, duration_ms, width, height, encrypted, hls_prefix "
@@ -352,27 +502,167 @@ def asset_status(asset_id: int):
     return {"asset": a, "jobs": jobs, "renditions": rend}
 
 
+# ---------------- 路线 C：观众账号 ----------------
+class Credentials(BaseModel):
+    username: str
+    password: str
+
+
+def _user_view(row):
+    return {"id": row["id"], "username": row["username"], "coins": int(row["coins"])}
+
+
+def _session_response(row):
+    token, exp = accounts.issue_session(row["id"], DEMO_SESSION_SECRET.encode(), DEMO_SESSION_TTL)
+    return {"token": token, "expires_at": exp, "user": _user_view(row)}
+
+
+@app.post("/api/auth/register")
+def register(body: Credentials):
+    if not accounts.valid_username(body.username):
+        raise HTTPException(400, "username: 3-32 letters, digits, '_', '.', '-'")
+    if not accounts.valid_password(body.password):
+        raise HTTPException(400, "password: 8-128 characters")
+    conn = db()
+    try:
+        conn.begin()
+        with conn.cursor() as c:
+            if not c.execute("INSERT IGNORE INTO demo_user(username, password_hash, coins) VALUES (%s,%s,%s)",
+                             (body.username, accounts.hash_password(body.password), DEMO_SIGNUP_COINS)):
+                conn.rollback()
+                raise HTTPException(409, "username already taken")
+            uid = c.lastrowid
+            if DEMO_SIGNUP_COINS:
+                c.execute("INSERT INTO coin_ledger(user_id, delta, balance, reason) VALUES (%s,%s,%s,'signup')",
+                          (uid, DEMO_SIGNUP_COINS, DEMO_SIGNUP_COINS))
+            c.execute("SELECT id, username, coins FROM demo_user WHERE id=%s", (uid,))
+            row = c.fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    log("demo_register", user_id=row["id"])
+    return _session_response(row)
+
+
+@app.post("/api/auth/login")
+def login(body: Credentials):
+    fail_key = f"login:fail:{(body.username or '')[:64].lower()}"
+    if int(r.get(fail_key) or 0) >= DEMO_LOGIN_MAX_FAILURES:
+        raise HTTPException(429, "too many failed logins, try again later", headers={"Retry-After": str(DEMO_LOGIN_WINDOW)})
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("SELECT id, username, coins, password_hash FROM demo_user WHERE username=%s", (body.username,))
+        row = c.fetchone()
+    conn.close()
+    if not row or not accounts.verify_password(body.password or "", row["password_hash"]):
+        pipe = r.pipeline()
+        pipe.incr(fail_key)
+        pipe.expire(fail_key, DEMO_LOGIN_WINDOW)
+        pipe.execute()
+        raise HTTPException(401, "wrong username or password")
+    r.delete(fail_key)
+    return _session_response(row)
+
+
+def session_user(authorization):
+    """Authorization: Bearer dsess1.… → user_id；没有或无效返回 None。"""
+    return accounts.verify_session(accounts.bearer(authorization), DEMO_SESSION_SECRET.encode())
+
+
+def require_user(authorization):
+    uid = session_user(authorization)
+    if uid is None:
+        raise HTTPException(401, "login required")
+    return uid
+
+
+def viewer(authorization, user_id):
+    """播放时的观众：有会话就用会话里的人，查询参数 user_id（旧接口）给了但对不上则 403；
+    没有会话时，只有打开 DEMO_ALLOW_USER_ID_PARAM 才按 user_id 认人（旧行为），否则当匿名观众（只能看免费集）。"""
+    uid = session_user(authorization)
+    if uid is not None:
+        if user_id is not None and int(user_id) != uid:
+            raise HTTPException(403, "user_id does not match the logged-in viewer")
+        return uid
+    if DEMO_ALLOW_USER_ID_PARAM and user_id is not None:
+        return int(user_id)
+    return None
+
+
+@app.get("/api/me")
+def me(authorization: str | None = Header(default=None)):
+    uid = require_user(authorization)
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("SELECT id, username, coins FROM demo_user WHERE id=%s", (uid,))
+        row = c.fetchone()
+        c.execute("SELECT episode_id FROM user_unlock WHERE user_id=%s ORDER BY id", (uid,))
+        unlocked = [x["episode_id"] for x in c.fetchall()]
+    conn.close()
+    if not row:
+        raise HTTPException(401, "login required")
+    return {"user": _user_view(row), "unlocked": unlocked}
+
+
 # ---------------- 付费 / 解锁 ----------------
 class UnlockIn(BaseModel):
     episode_id: int
     order_no: str | None = None
 
 
+UNLOCKS = Counter("demo_unlock_total", "unlock requests", ["result"])
+
+
 @app.post("/api/users/{user_id}/unlock")
-def unlock(user_id: int, body: UnlockIn):
-    # 真实场景：先扣金币/支付回调成功，再在同一事务里写 unlock；这里直接写
+def unlock(user_id: int, body: UnlockIn, authorization: str | None = Header(default=None)):
+    """路线 C：要本人的会话（没有 401、别人 403）。付费集在同一事务里写 user_unlock、扣 price_coins、记流水；
+    已经解锁过不再扣（200、charged=0）；余额不够 402（code=insufficient_coins），什么都不写。免费集直接 200。"""
+    uid = require_user(authorization)
+    if uid != user_id:
+        raise HTTPException(403, "can only unlock for yourself")
+    ep = get_episode(body.episode_id)
+    price = int(ep.get("price_coins") or 0) if ep["is_paid"] else 0
     conn = db()
-    with conn.cursor() as c:
-        c.execute("INSERT IGNORE INTO user_unlock(user_id, episode_id, order_no) VALUES(%s,%s,%s)",
-                  (user_id, body.episode_id, body.order_no))
-    conn.close()
-    r.sadd(f"unlock:{user_id}", body.episode_id)
-    return {"ok": True}
+    try:
+        conn.begin()
+        with conn.cursor() as c:
+            c.execute("SELECT coins FROM demo_user WHERE id=%s FOR UPDATE", (uid,))
+            user = c.fetchone()
+            if not user:
+                conn.rollback()
+                raise HTTPException(401, "login required")
+            if not ep["is_paid"]:
+                conn.rollback()
+                UNLOCKS.labels("free").inc()
+                return {"ok": True, "charged": 0, "coins": int(user["coins"])}
+            if not c.execute("INSERT IGNORE INTO user_unlock(user_id, episode_id, source, order_no) VALUES (%s,%s,'PURCHASE',%s)",
+                             (uid, ep["id"], body.order_no)):
+                conn.rollback()
+                UNLOCKS.labels("already").inc()
+                return {"ok": True, "charged": 0, "coins": int(user["coins"])}
+            if price and not c.execute("UPDATE demo_user SET coins = coins - %s WHERE id=%s AND coins >= %s", (price, uid, price)):
+                conn.rollback()
+                UNLOCKS.labels("insufficient").inc()
+                return JSONResponse(status_code=402, content={
+                    "detail": f"need {price} coins, have {int(user['coins'])}", "code": "insufficient_coins",
+                    "price": price, "coins": int(user["coins"])})
+            balance = int(user["coins"]) - price
+            c.execute("INSERT INTO coin_ledger(user_id, delta, balance, reason, episode_id, order_no) VALUES (%s,%s,%s,'unlock',%s,%s)",
+                      (uid, -price, balance, ep["id"], body.order_no))
+        conn.commit()
+    finally:
+        conn.close()
+    r.sadd(f"unlock:{uid}", ep["id"])
+    UNLOCKS.labels("charged").inc()
+    log("demo_unlock", user_id=uid, episode_id=ep["id"], price=price)
+    return {"ok": True, "charged": price, "coins": balance}
 
 
-def can_play(user_id: int, ep: dict) -> bool:
+def can_play(user_id, ep: dict) -> bool:
     if not ep["is_paid"]:
         return True
+    if user_id is None:  # 路线 C：匿名观众只能看免费集
+        return False
     if r.sismember(f"unlock:{user_id}", ep["id"]):
         return True
     conn = db()
@@ -394,7 +684,7 @@ def get_episode(episode_id: int) -> dict:
         return json.loads(cached)
     conn = db()
     with conn.cursor() as c:
-        c.execute("SELECT id, drama_id, ep_no, title, is_paid, price_coins, asset_id, status FROM episode WHERE id=%s",
+        c.execute("SELECT id, drama_id, ep_no, title, is_paid, price_coins, asset_id, core_asset_id, status FROM episode WHERE id=%s",
                   (episode_id,))
         ep = c.fetchone()
     conn.close()
@@ -433,76 +723,77 @@ def verify_token(token: str) -> dict | None:
         return None
 
 
-def play_info(user_id: int, ep: dict) -> dict:
+def play_info(user_id, ep: dict) -> dict:
+    """旧链路（路线 C 之前的旧资产，还没迁移到 Core）的播放信息：旧签名地址 + 旧 token。"""
     exp = int(time.time()) + PLAY_URL_TTL
+    PLAY_REQ.labels("legacy").inc()
     return {"episode_id": ep["id"], "asset_id": ep["asset_id"], "encrypted": bool(ep["is_paid"]),
             "master_url": sign_hls_path(ep["asset_id"], exp),
-            "token": make_token(user_id, ep["asset_id"], exp), "expires_at": exp}
+            "token": make_token(user_id or 0, ep["asset_id"], exp), "expires_at": exp, "via": "legacy"}
 
 
-def apply_vod_playback(info, episode_id):
-    """能从视频云拿到播放地址就替换 master_url。解锁仍由本服务决定，这里不再检查。"""
-    link = vod_link(episode_id)
-    if not link:
-        return info
-    status, payload = vod_client.playback(link["vod_asset_id"])
-    if status == 200 and payload.get("master_url"):
-        info["master_url"] = payload["master_url"]
-        info["expires_at"] = payload.get("expires_at", info["expires_at"])
-        info["via"] = "vod-api"
-    return info
+def core_play_info(user_id, ep: dict) -> dict:
+    """路线 C：向视频云要 Core 播放 token（同时得到 hls.js 用的 master_url 和原生 HLS 用的 native_master_url）。
+    encrypted 取 Core 资产的真实值。Core 409（还没就绪）原样返回，其余失败 502。"""
+    viewer_id = f"u{user_id}" if user_id is not None else "anon"
+    status, payload = vod_client.playback_token(ep["core_asset_id"], ttl_seconds=PLAY_URL_TTL, viewer_id=viewer_id)
+    if status != 200 or not payload.get("token") or not payload.get("master_url"):
+        raise HTTPException(409 if status == 409 else 502, payload.get("detail", "vod playback failed"))
+    return {"episode_id": ep["id"], "asset_id": ep["core_asset_id"], "encrypted": bool(payload.get("encrypted")),
+            "master_url": payload["master_url"], "native_master_url": payload.get("native_master_url"),
+            "poster_url": payload.get("poster_url"), "token": payload["token"], "expires_at": payload.get("expires_at"),
+            "via": "vod-api"}
+
+
+def playable(ep: dict) -> bool:
+    return ep["status"] == "READY" and bool(ep.get("core_asset_id") or ep.get("asset_id"))
+
+
+def episode_play_info(user_id, ep: dict) -> dict:
+    return core_play_info(user_id, ep) if ep.get("core_asset_id") else play_info(user_id, ep)
 
 
 @app.post("/api/episodes/{episode_id}/vod-upload")
 def vod_upload(episode_id: int):
-    get_episode(episode_id)
-    status, payload = vod_client.open_upload()
-    if status != 200:
-        raise HTTPException(status if status < 500 else 502, payload.get("detail", "vod upload failed"))
-    save_vod_link(episode_id, payload["asset_id"], payload["session_id"])
-    return payload
+    """播放页「上传到视频云」用。路线 C 起和 upload-url 是同一件事，返回 Core 的上传会话原样字段。"""
+    return open_core_upload(episode_id)
 
 
 @app.post("/api/episodes/{episode_id}/vod-complete")
 def vod_complete(episode_id: int):
-    link = vod_link(episode_id)
-    if not link:
+    """完成这一集最近一次还在等待的 Core 上传。"""
+    conn = db()
+    with conn.cursor() as c:
+        c.execute("SELECT core_asset_id, episode_id, core_session_id, status FROM episode_core_upload "
+                  "WHERE episode_id=%s AND status='PENDING' ORDER BY core_asset_id DESC LIMIT 1", (episode_id,))
+        row = c.fetchone()
+    conn.close()
+    if not row:
         raise HTTPException(404, "upload first")
-    status, payload = vod_client.complete_upload(link["vod_session_id"])
-    if status != 200:
-        raise HTTPException(status if status < 500 else 502, payload.get("detail", "vod complete failed"))
-    return payload
+    return complete_core_upload(row)
 
 
 @app.get("/api/episodes/{episode_id}/vod-play")
-def vod_play(episode_id: int, user_id: int):
-    """付费解锁仍由 Demo 的 can_play 决定；通过后向视频云要 Core 播放 token。
-    token 用于 /keys/v1/{asset}（加密资产）和 /api/v1/qoe 上报；encrypted 取 Core 资产的真实值，不再看 is_paid。"""
-    ep = get_episode(episode_id)
-    link = vod_link(episode_id)
-    if not link:
-        raise HTTPException(404, "no vod asset")
-    if not can_play(user_id, ep):
-        PLAY_REQ.labels("need_unlock").inc()
-        raise HTTPException(402, "paid episode, unlock first")
-    status, payload = vod_client.playback_token(link["vod_asset_id"])
-    if status != 200 or not payload.get("token") or not payload.get("master_url"):
-        raise HTTPException(409 if status == 409 else 502, payload.get("detail", "vod playback failed"))
-    return {"episode_id": episode_id, "asset_id": link["vod_asset_id"], "encrypted": bool(payload.get("encrypted")),
-            "master_url": payload["master_url"], "token": payload["token"], "expires_at": payload.get("expires_at"),
-            "via": "vod-api", "next": None}
+def vod_play(episode_id: int, user_id: int | None = None, authorization: str | None = Header(default=None)):
+    """路线 C 起与 play 相同（保留给旧播放页）。"""
+    return play(episode_id, user_id, authorization)
 
 
 @app.get("/api/episodes/{episode_id}/play")
-def play(episode_id: int, user_id: int):
+def play(episode_id: int, user_id: int | None = None, authorization: str | None = Header(default=None)):
+    """冻结接口。路线 C：观众来自 Demo 会话（见 viewer）；付费集匿名 401、未解锁 402、未就绪 409。
+    播放地址和 token 一律由视频云签（Core 资产）；还没迁移的旧资产暂时走旧链路（via=legacy）。"""
+    uid = viewer(authorization, user_id)
     ep = get_episode(episode_id)
-    if ep["status"] != "READY" or not ep["asset_id"]:
+    if not playable(ep):
         PLAY_REQ.labels("not_ready").inc()
         raise HTTPException(409, "episode not ready (still transcoding?)")
-    if not can_play(user_id, ep):
-        PLAY_REQ.labels("need_unlock").inc()
+    if not can_play(uid, ep):
+        PLAY_REQ.labels("need_login" if uid is None else "need_unlock").inc()
+        if uid is None:
+            raise HTTPException(401, "login required for paid episodes")
         raise HTTPException(402, "paid episode, unlock first")
-    info = apply_vod_playback(play_info(user_id, ep), episode_id)
+    info = episode_play_info(uid, ep)
     # 下一集：能播才给地址，客户端用来预加载 master + 首片
     conn = db()
     with conn.cursor() as c:
@@ -512,9 +803,14 @@ def play(episode_id: int, user_id: int):
     info["next"] = None
     if nxt:
         nep = get_episode(nxt["id"])
-        if nep["status"] == "READY" and nep["asset_id"]:
-            info["next"] = play_info(user_id, nep) if can_play(user_id, nep) else {
-                "episode_id": nep["id"], "locked": True}
+        if playable(nep):
+            if can_play(uid, nep):
+                try:
+                    info["next"] = episode_play_info(uid, nep)
+                except HTTPException:
+                    info["next"] = None  # 下一集签不出来不影响本集
+            else:
+                info["next"] = {"episode_id": nep["id"], "locked": True}
     pipe = r.pipeline()
     pipe.incr(f"play:cnt:{episode_id}")
     pipe.zincrby(f"rank:hot:{time.strftime('%Y%m%d')}", 1, ep["drama_id"])

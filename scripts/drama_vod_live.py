@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""短剧 Demo 经视频云上传、转码、播放；付费解锁仍由 Demo 拒绝。"""
+"""短剧 Demo 经视频云上传、转码、播放（vod-upload / vod-complete / vod-play 这组播放页在用的接口）。"""
 import json, subprocess, time, urllib.error, urllib.request
 
 BASE = "http://nginx:8080"
@@ -56,7 +56,13 @@ def main():
     else:
         raise SystemExit(f"not ready {asset}")
     print("PASS demo 资产 READY", asset_id, flush=True)
-    play = http("GET", f"/api/episodes/{free}/vod-play?user_id=7")
+    # 路线 C：Core 资产 READY 后由 Demo 的对账线程把这一集切过去（默认每 5 秒一轮）
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        play = http("GET", f"/api/episodes/{free}/vod-play")
+        if play[0] == 200:
+            break
+        time.sleep(2)
     assert play[0] == 200 and play[1]["master_url"].startswith("/hls/v1/"), play
     decode = subprocess.run(["ffmpeg", "-v", "error", "-i", BASE + play[1]["master_url"], "-f", "null", "-"],
                             capture_output=True, text=True)
@@ -65,8 +71,8 @@ def main():
     paid_up = http("POST", f"/api/episodes/{paid}/vod-upload")
     assert paid_up[0] == 200, paid_up
     blocked = http("GET", f"/api/episodes/{paid}/vod-play?user_id=7")
-    assert blocked[0] == 402, blocked
-    print("PASS 未解锁付费集仍由 Demo 返回 402", flush=True)
+    assert blocked[0] == 409, blocked
+    print("PASS 还没转码完的付费集 409（付费与登录规则见 e2e.py）", flush=True)
 
 
 if __name__ == "__main__":

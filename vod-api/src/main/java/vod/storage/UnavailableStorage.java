@@ -40,6 +40,11 @@ public class UnavailableStorage implements ObjectStorage {
     }
 
     @Override
+    public Optional<String> getText(String bucket, String key, int maxBytes) {
+        throw notConfigured();
+    }
+
+    @Override
     public void delete(String bucket, String key) {
         throw notConfigured();
     }

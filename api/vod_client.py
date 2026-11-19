@@ -37,8 +37,26 @@ def call(method, path, body=None, transport=None):
         return UNAVAILABLE, {"detail": f"vod-api unavailable: {type(getattr(e, 'reason', e)).__name__}"}
 
 
-def open_upload(transport=None):
-    return call("POST", "/api/v1/uploads", {}, transport)
+def open_upload(transport=None, encrypted=False, title=None, tags=None, filename=None):
+    """POST /api/v1/uploads（put 方式）。路线 C：付费集 encrypted=True；title / tags 写到 Core 资产上方便在控制台里认。"""
+    body = {}
+    if encrypted:
+        body["encrypted"] = True
+    if title:
+        body["title"] = title[:200]
+    if tags:
+        body["tags"] = list(tags)
+    if filename:
+        body["filename"] = filename
+    return call("POST", "/api/v1/uploads", body, transport)
+
+
+def asset(asset_id, transport=None):
+    return call("GET", f"/api/v1/assets/{asset_id}", None, transport)
+
+
+def jobs(transport=None):
+    return call("GET", "/api/v1/jobs", None, transport)
 
 
 def complete_upload(session_id, transport=None):

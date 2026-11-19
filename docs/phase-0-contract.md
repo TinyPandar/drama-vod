@@ -287,3 +287,19 @@ Phase 5（Core）：
 3. Demo 的剧、集、解锁不要进 Core 的表。
 4. 播放签名算法和 `/keys/{asset_id}` 的 16 字节响应，在 Nginx 和现有播放器替换完之前保持不变。
 5. e2e 还是旧路径的回归测试。Demo 改调 `/api/v1` 时，再把 e2e 的准备数据从「建剧」换成「建资产」。在那之前不要为了新模型拆掉 e2e。
+
+## 路线 C：Demo 拆成视频云的客户（2026-11-19）
+
+Phase 0 写过：「Demo 改完之前，`play?user_id=` 不能从现有进程里拿掉」「e2e 在 Demo 拆出去之后要改成先建资产、再由 Demo 关联」。路线 C 就是这一步。上面的冻结条目按下表变化，没列出的不变。旧链路的读接口（`/hls/{sig}/…`、`/keys/{id}`、`/api/playback/{asset}/…`）保留，只为切换前已经发出去的地址服务，新的播放不再产生它们。
+
+| 接口 | 路线 C 之后 |
+|---|---|
+| `POST /api/episodes/{id}/upload-url` | 改为在 Core 开 put 上传会话：`asset_id` 是 **Core 资产 id**，`put_url` 指向 Core 的源对象键 `raw/t{租户}/{资产}/source.{ext}`（不再是 `raw/{剧}/{集}/{资产}/source.mp4`），`expires_in` 是 Core 会话有效期（默认 900）。付费集上传成 Core 加密资产。 |
+| `PUT` 预签名 URL | 仍是直传对象存储。Core complete 会校验源文件类型，**直传要带 `Content-Type`**（如 `video/mp4`；浏览器用 `File` 上传会自动带上）。 |
+| `POST /api/assets/{id}/complete` | 转给 Core：对象不存在仍 **409**，重复调用仍返回同一个 `job_id`。只认路线 C 之后开的上传（旧资产 404）。 |
+| `GET /api/assets/{id}` | Core 资产从视频云读：`asset.status`、`jobs[]` 不变，`renditions[]` 恒为空数组（Core 不按档位记）。旧资产仍从旧表读。 |
+| `GET /api/episodes/{id}/play` | 观众来自 Demo 会话（`Authorization: Bearer dsess1.…`，由 `/api/auth/register`、`/api/auth/login` 签发）。`?user_id=` 只在和会话一致时允许（不一致 **403**）；没有会话时不再按它认人（过渡开关 `DEMO_ALLOW_USER_ID_PARAM=1` 可恢复旧行为）。匿名看付费集 **401**（新增）；未解锁 **402**、未就绪 **409** 不变。地址和 token 由视频云签：`master_url` 是 `/hls/v1/…`，`token` 是 Core 播放 token（`vpt1.`），加密集的 key 走 `/keys/v1/{id}`；新增 `native_master_url`（原生 HLS 用）、`poster_url`、`via`。`encrypted` 取 Core 资产的真实值。还没迁到 Core 的旧集暂时仍走旧链路（`via: "legacy"`）。 |
+| `POST /api/users/{id}/unlock` | 要本人的会话（没有 **401**、别人 **403**）。付费集按 `price_coins` 扣金币，余额不够 **402** 且 `code: "insufficient_coins"`；重复调用仍 200，不重复扣（`charged: 0`）。 |
+| `/api/playback/{asset}/master.m3u8?token=` | 只服务旧资产。Core 资产的原生 HLS 入口是 vod-api 的 `GET /api/v1/native-hls/{asset}/master.m3u8?token=<Core 播放 token>`：分片仍落在 `/hls/v1/` 签名地址下（与 `master_url` 同一签名、同一缓存规则），key URI 带 `?token=`。token 无效、过期、资产不匹配或资产不是 READY 一律 **401**，响应 no-store。 |
+
+转码：旧 Demo 的转码链路（`transcode_job`、`assets/{id}/`、`/keys/{id}`）停用，Worker 默认确认并丢弃旧消息（`WORKER_LEGACY_ENABLED=1` 可临时打开以排空遗留任务）。消息 v1 本身不变，Core 仍用它。已有的旧剧集用 `api/migrate_core.py` 迁到 Core。

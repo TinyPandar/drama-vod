@@ -3,7 +3,7 @@
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "worker"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "api"))
-from job_route import origin_of, job_table, hls_prefix, updates_episode, is_generation_prefix
+from job_route import accepts, origin_of, job_table, hls_prefix, updates_episode, is_generation_prefix
 from origin_path import object_key
 
 def raises(fn):
@@ -32,4 +32,6 @@ check("core job does not rewrite episode", updates_episode("core") is False and 
 check("origin path rejects traversal", raises(lambda: object_key("legacy", "4", "../secret")))
 check("v1 origin key", object_key("v1", "4", "master.m3u8") == "assets/v1/4/master.m3u8")
 check("v1 gen origin key", object_key("v1", "4", "12-3/720p/seg_00000.ts") == "assets/v1/4/12-3/720p/seg_00000.ts")
+check("legacy pipeline off by default (route C)", accepts("core", False) and not accepts("legacy", False))
+check("legacy pipeline can be re-enabled to drain", accepts("legacy", True) and accepts("core", True))
 print("bridge ok")

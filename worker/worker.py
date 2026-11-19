@@ -25,7 +25,7 @@ import output_gc, output_prefix, transcode_template
 from fencing import apply_failure, claim, commit_success, due_jobs, mark_transcoding, record_failure
 from fencing import renew_lease as renew_lease_sql
 from hls_verify import local_manifest, verify_hls, verify_remote
-from job_route import hls_prefix, job_table, updates_episode
+from job_route import accepts, hls_prefix, job_table, origin_of, updates_episode
 from key_provider import PlaintextKeyStore, key_uri
 from retry_policy import (INPUT_INVALID, NO_VIDEO_STREAM, OUTPUT_INVALID, SOURCE_MISSING, STORAGE_ERROR, TIMEOUT,
                           TRANSCODE_FAILED, FenceLost, JobError, plan_failure)
@@ -63,6 +63,8 @@ OUTPUT_GC_DELETE_BATCH = env_int("WORKER_OUTPUT_GC_DELETE_BATCH", 500)   # 每�
 POLL_SEC = 0.5                                               # 子进程轮询间隔：围栏丢失后多快杀掉 ffmpeg
 # Phase 6：Core 转码成功时在本期前缀里写一张封面（poster.jpg）。抽帧失败不影响 READY。
 POSTER_ENABLED = os.environ.get("WORKER_POSTER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+# 路线 C：旧 Demo 转码链路默认停用（Demo 已改走视频云），排空遗留旧任务时临时设 1。
+LEGACY_ENABLED = env_int("WORKER_LEGACY_ENABLED", 0) == 1
 POSTER_AT_SEC = env_float("WORKER_POSTER_AT_SECONDS", 1.0)    # 抽帧位置；比片长还长时取片长一半
 POSTER_TIMEOUT_SEC = env_int("WORKER_POSTER_TIMEOUT_SECONDS", 60)
 POSTER_MAX_WIDTH = env_int("WORKER_POSTER_MAX_WIDTH", 1280)  # 封面宽度上限（不放大）
@@ -456,11 +458,16 @@ def on_message(ch, method, props, body):
     否则 broker 会以为连接死了把它断掉。pika 的 channel 不是线程安全的，所以 ack 要切回主线程。"""
     msg = json.loads(body)  # v1 只读 job_id / trace_id；未知字段与 schema_version 忽略，状态以数据库为准
     conn = ch.connection
+    origin = origin_of(msg)
+    if not accepts(origin, LEGACY_ENABLED):
+        log("legacy_disabled", job_id=msg.get("job_id"))
+        ch.basic_ack(method.delivery_tag)
+        return
 
     def work():
         try:
             # 重投（method.redelivered）不再抢占：原进程可能还活着，只有租约过期才能接手
-            res = process(msg["job_id"], msg.get("trace_id"), msg.get("origin") or "legacy")
+            res = process(msg["job_id"], msg.get("trace_id"), origin)
         except Exception as e:  # 比如数据库连不上：稍后重试
             log("process_crash", job_id=msg.get("job_id"), err=str(e))
             res = "requeue"
@@ -479,7 +486,7 @@ def sweeper():
         try:
             conn = db()
             with conn.cursor() as c:
-                rows = due_jobs(c, "legacy", SWEEP_PENDING_AGE_SEC)
+                rows = due_jobs(c, "legacy", SWEEP_PENDING_AGE_SEC) if LEGACY_ENABLED else []
             conn.close()
             HEARTBEAT.set_to_current_time()
             core_rows = []

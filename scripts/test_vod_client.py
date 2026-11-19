@@ -31,6 +31,15 @@ assert [(m, p) for m, p, _ in seen] == [
     ("POST", "/api/v1/assets/9/playback-token"),
 ], seen
 assert seen[3][2] == {} and seen[4][2] == {"ttl_seconds": 120, "viewer_id": "v1"}, seen[3:]
+# 路线 C：付费集开加密资产，标题标签带到 Core；默认请求体不变
+seen.clear()
+vod_client.open_upload(transport, encrypted=True, title="剧 第1集", tags=["drama-1"], filename="source.mp4")
+assert seen[0][2] == {"encrypted": True, "title": "剧 第1集", "tags": ["drama-1"], "filename": "source.mp4"}, seen
+vod_client.open_upload(transport)
+assert seen[1][2] == {}, seen
+vod_client.asset(9, transport)
+vod_client.jobs(transport)
+assert [(m, p) for m, p, _ in seen[2:]] == [("GET", "/api/v1/assets/9"), ("GET", "/api/v1/jobs")], seen
 assert all("unlock" not in path for _, path, _ in seen)
 assert "localhost:9000" in transport("POST", "/api/v1/uploads", {})[1]["put_url"]
 assert "/api/" not in transport("POST", "/api/v1/uploads", {})[1]["put_url"].split("9000", 1)[1]

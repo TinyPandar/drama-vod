@@ -24,7 +24,9 @@ def main():
     drama_id = http("POST", "/api/dramas", {"title": "kill-recover"})["drama_id"]
     episode_id = http("POST", f"/api/dramas/{drama_id}/episodes", {"ep_no": 1, "title": "k"})["episode_id"]
     upload = http("POST", f"/api/episodes/{episode_id}/upload-url")
-    put = urllib.request.Request(upload["put_url"], data=open("/tmp/k.mp4", "rb").read(), method="PUT")
+    # 路线 C 起 upload-url 落到视频云，complete 会校验源文件类型，直传要声明 Content-Type
+    put = urllib.request.Request(upload["put_url"], data=open("/tmp/k.mp4", "rb").read(), method="PUT",
+                                 headers={"Content-Type": "video/mp4"})
     urllib.request.urlopen(put, timeout=60).read()
     done = http("POST", f"/api/assets/{upload['asset_id']}/complete")
     print("ASSET", upload["asset_id"], "EP", episode_id, "JOB", done["job_id"], flush=True)

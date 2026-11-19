@@ -30,6 +30,8 @@ public class MemoryStorage implements ObjectStorage {
     public volatile boolean failAbort;
     /** 置为 true 时 delete 抛异常，模拟存储不可用。 */
     public volatile boolean failDelete;
+    /** 文本对象（播放列表），getText 从这里读。 */
+    public final Map<String, String> texts = new ConcurrentHashMap<>();
     /** 被删除过的对象（bucket/key）。 */
     public final Set<String> deleted = ConcurrentHashMap.newKeySet();
 
@@ -46,6 +48,7 @@ public class MemoryStorage implements ObjectStorage {
         uploads.clear();
         aborted.clear();
         deleted.clear();
+        texts.clear();
         failAbort = false;
         failDelete = false;
     }
@@ -132,6 +135,17 @@ public class MemoryStorage implements ObjectStorage {
     public void abortMultipart(String bucket, String key, String uploadId) {
         if (failAbort) throw new IllegalStateException("storage unavailable");
         if (uploads.remove(uploadId) != null) aborted.add(uploadId);
+    }
+
+    public void putText(String bucket, String key, String text) {
+        texts.put(bucket + "/" + key, text);
+    }
+
+    @Override
+    public Optional<String> getText(String bucket, String key, int maxBytes) {
+        String t = texts.get(bucket + "/" + key);
+        if (t != null && t.length() > maxBytes) throw new IllegalStateException("object too large");
+        return Optional.ofNullable(t);
     }
 
     @Override

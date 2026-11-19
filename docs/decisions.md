@@ -82,3 +82,19 @@
 
 - 不借这一轮重写 Worker、换消息队列、改消息 v1，不做 DRM / KMS / 多 CDN / 微服务拆分。
 - 不把 E（运营与安全）、D（开发者体验）、F（媒体进阶）里的内容塞进这三段。
+
+## 2026-11-19 路线 C 改变 Phase 0 冻结的 Demo 接口语义
+
+**决定**
+
+- Demo 拆成视频云的客户之后，`upload-url` / `complete` / `GET /api/assets/{id}` 落到 Core，`asset_id` 变成 Core 资产 id、源对象键换成 Core 的键；`play` 的观众改由 Demo 会话决定，`?user_id=` 不再单独算数，匿名看付费集新增 401；`unlock` 要本人会话并扣金币。逐条写在 `docs/phase-0-contract.md` 末尾。
+- 旧 Demo 转码链路默认停用，旧读接口保留到切换前发出的地址过期；已有旧剧集用迁移工具搬到 Core。
+- 保留过渡开关 `DEMO_ALLOW_USER_ID_PARAM`（默认关）和 `WORKER_LEGACY_ENABLED`（默认关），只用于切换期。
+
+**原因**
+
+- Phase 0 文档本身就写明这些条目要冻结到「Demo 改完」「Demo 拆出去」为止；路线 C 就是这一步。不改语义就只能让 Demo 继续绕开视频云，或继续让任何人凭 `user_id` 看付费集。
+
+**排除**
+
+- 不做真实支付、充值、找回口令；不在这一步删除旧原片和旧 HLS 产物。

@@ -29,6 +29,9 @@ public interface ObjectStorage {
     /** 取消分片上传，丢掉已传分片。upload 已不存在时视为成功（幂等）。 */
     void abortMultipart(String bucket, String key, String uploadId);
 
+    /** 路线 C：读一个小文本对象（播放列表）。不存在返回 empty；超过 maxBytes 抛 IllegalStateException。 */
+    Optional<String> getText(String bucket, String key, int maxBytes);
+
     /** 路线 B：删除对象。对象不存在视为成功（幂等）。 */
     void delete(String bucket, String key);
 

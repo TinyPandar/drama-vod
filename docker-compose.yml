@@ -71,6 +71,12 @@ services:
       PUBLIC_UPLOAD_ENDPOINT: ${PUBLIC_UPLOAD_ENDPOINT}
       HLS_SECRET: ${HLS_SECRET}
       TOKEN_SECRET: ${TOKEN_SECRET}
+      # 路线 C：Demo 观众会话的 HMAC 密钥；dev 下为空时退回 dev，非 dev 必须设置（openssl rand -hex 32）
+      DEMO_SESSION_SECRET: ${DEMO_SESSION_SECRET:-}
+      # 新注册观众送的演示金币；过渡开关 DEMO_ALLOW_USER_ID_PARAM=1 时没有会话也按 ?user_id= 认人（不安全，默认关）
+      DEMO_SIGNUP_COINS: ${DEMO_SIGNUP_COINS:-}
+      DEMO_ALLOW_USER_ID_PARAM: ${DEMO_ALLOW_USER_ID_PARAM:-}
+      DEMO_SYNC_INTERVAL_SECONDS: ${DEMO_SYNC_INTERVAL_SECONDS:-}
       PLAY_URL_TTL: "600"
       # 不再用 :-dev 兜底：dev 下为空时 api 与 nginx 各自退回 dev（一条命令仍能起栈），非 dev 为空则拒绝启动
       ORIGIN_SECRET: ${ORIGIN_SECRET:-}
@@ -139,6 +145,8 @@ services:
       WORKER_POSTER_AT_SECONDS: ${WORKER_POSTER_AT_SECONDS:-}
       WORKER_POSTER_TIMEOUT_SECONDS: ${WORKER_POSTER_TIMEOUT_SECONDS:-}
       WORKER_POSTER_MAX_WIDTH: ${WORKER_POSTER_MAX_WIDTH:-}
+      # 路线 C：旧 Demo 转码链路默认停用；排空遗留的旧任务时设 1
+      WORKER_LEGACY_ENABLED: ${WORKER_LEGACY_ENABLED:-}
     depends_on:
       api: {condition: service_started}
 

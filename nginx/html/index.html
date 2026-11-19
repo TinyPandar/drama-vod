@@ -57,11 +57,17 @@
     padding: 8px 12px; color: var(--muted); min-height: 40px;
   }
   .uid-pop {
-    position: absolute; right: 0; top: calc(100% + 8px); width: min(240px, 72vw);
+    /* 放在页面根部、固定定位：首页和观看页都能弹出（观看页时首页是隐藏的） */
+    position: fixed; right: 16px; top: 64px; z-index: 60; width: min(260px, 80vw);
     padding: 12px; background: #1c1916; border: 1px solid var(--line); border-radius: 14px;
     box-shadow: 0 16px 40px rgba(0,0,0,.4);
   }
   .uid-pop label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .acct { margin-left: auto; margin-right: 8px; border: 1px solid rgba(255,255,255,.28); background: rgba(0,0,0,.35);
+    color: #fff; border-radius: 999px; padding: 6px 12px; font-size: 12px; min-height: 32px; }
+  .acct + .sound { margin-left: 0; }
+  .auth-err { color: #f08a7a; font-size: 12px; margin: 0 0 8px; }
+  .auth-who { font-size: 13px; margin: 0 0 10px; line-height: 1.5; }
   .uid-pop input {
     width: 100%; border: 1px solid var(--line); background: #100e0c; border-radius: 10px;
     padding: 10px 12px; margin-bottom: 8px;
@@ -121,6 +127,7 @@
     top: 0; display: flex; align-items: center; gap: 8px;
     padding: calc(10px + env(safe-area-inset-top)) 12px 36px;
     background: linear-gradient(to bottom, rgba(0,0,0,.62), transparent);
+    z-index: 5; /* 浮在 #gate 之上：拦截提示出现时仍能返回、登录 */
   }
   .botshade {
     bottom: 0; padding: 56px 14px calc(14px + env(safe-area-inset-bottom));
@@ -285,12 +292,7 @@
     <header class="top">
       <div class="brand"><strong>短剧场</strong><span>drama-vod</span></div>
       <div class="uid-wrap">
-        <button class="uid-btn" id="uid-btn" type="button">观众 1001</button>
-        <div class="uid-pop" id="uid-pop" hidden>
-          <label for="uid">观众编号</label>
-          <input id="uid" inputmode="numeric" value="1001" autocomplete="off">
-          <button class="btn gold" id="uid-save" type="button" style="width:100%">确定</button>
-        </div>
+        <button class="uid-btn" id="uid-btn" type="button">登录</button>
       </div>
     </header>
     <main class="wrap">
@@ -309,6 +311,21 @@
     </main>
   </div>
 
+  <div class="uid-pop" id="uid-pop" role="dialog" aria-label="观众登录" hidden>
+          <form id="auth-form" autocomplete="on">
+            <label for="auth-user">用户名</label>
+            <input id="auth-user" autocomplete="username" maxlength="32" placeholder="3–32 位字母、数字、_ . -">
+            <label for="auth-pass">口令</label>
+            <input id="auth-pass" type="password" autocomplete="current-password" maxlength="128" placeholder="至少 8 位">
+            <p class="auth-err" id="auth-err" hidden></p>
+            <button class="btn gold" id="auth-login" type="submit" style="width:100%">登录</button>
+            <button class="btn ghost" id="auth-register" type="button" style="width:100%;margin-top:6px">注册（送演示金币）</button>
+          </form>
+          <div id="auth-me" hidden>
+            <p class="auth-who" id="auth-who"></p>
+            <button class="btn ghost" id="auth-logout" type="button" style="width:100%">退出登录</button>
+          </div>
+        </div>
   <div id="watch" hidden>
     <div class="stage">
       <div class="screen">
@@ -316,6 +333,7 @@
         <div class="shade topshade">
           <button class="back" id="back" type="button" aria-label="返回剧场"></button>
           <span id="q" class="pill" hidden></span>
+          <button class="acct" id="watch-acct" type="button" aria-haspopup="dialog">登录</button>
           <button class="sound" id="sound" type="button" aria-label="开启声音"></button>
         </div>
         <button class="bigplay" id="bigplay" type="button" aria-label="播放" hidden></button>
@@ -402,8 +420,57 @@ let hls = null, nextEp = null, t0 = 0, playGen = 0, seeking = false, soundOn = f
 
 function wide() { return matchMedia('(min-width: 880px)').matches; }
 function landscapePhone() { return matchMedia('(max-width: 879px) and (orientation: landscape)').matches; }
-function currentUid() { return ($('uid').value || '1001').trim(); }
-function uidLabel() { $('uid-btn').textContent = '观众 ' + currentUid(); }
+// 路线 C：观众登录。会话 token 存在本机（localStorage），播放和解锁带 Authorization 头；没登录只能看免费集。
+const auth = { token: null, user: null };
+try { auth.token = localStorage.getItem('demo.session'); } catch {}
+function authHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  if (auth.token) h.Authorization = 'Bearer ' + auth.token;
+  return h;
+}
+function authLabel() {
+  const label = auth.user ? (auth.user.username + ' · ' + auth.user.coins + ' 金币') : '登录';
+  $('uid-btn').textContent = label;
+  $('watch-acct').textContent = label;
+  $('auth-form').hidden = !!auth.user;
+  $('auth-me').hidden = !auth.user;
+  if (auth.user) $('auth-who').textContent = '已登录：' + auth.user.username + '，余额 ' + auth.user.coins + ' 金币';
+}
+function setSession(token, user) {
+  auth.token = token; auth.user = user;
+  try { token ? localStorage.setItem('demo.session', token) : localStorage.removeItem('demo.session'); } catch {}
+  authLabel();
+}
+async function refreshMe() {
+  if (!auth.token) { setSession(null, null); return; }
+  const r = await fetch('/api/me', { headers: authHeaders() });
+  if (r.ok) { auth.user = (await r.json()).user; authLabel(); }
+  else if (r.status === 401) setSession(null, null);
+}
+async function authSubmit(kind) {
+  const body = JSON.stringify({ username: $('auth-user').value.trim(), password: $('auth-pass').value });
+  const r = await fetch('/api/auth/' + kind, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+  let info = {};
+  try { info = await r.json(); } catch {}
+  if (!r.ok) {
+    const why = { 400: '用户名或口令格式不对', 401: '用户名或口令不对', 409: '用户名已被占用', 429: '失败次数太多，稍后再试' }[r.status];
+    $('auth-err').textContent = why || ('登录失败 ' + r.status);
+    $('auth-err').hidden = false;
+    return false;
+  }
+  $('auth-err').hidden = true;
+  $('auth-pass').value = '';
+  setSession(info.token, info.user);
+  $('uid-pop').hidden = true;
+  toast(kind === 'register' ? '注册成功，送你 ' + info.user.coins + ' 金币' : '已登录');
+  // 正在看的这一集因为没登录被拦下时，登录后直接重试
+  if (state.episodeId && !$('watch').hidden) play(state.episodeId, { gesture: true });
+  return true;
+}
+function askLogin() {
+  $('uid-pop').hidden = false;
+  $('auth-user').focus();
+}
 function toast(msg) {
   const el = $('toast');
   el.textContent = msg;
@@ -442,7 +509,6 @@ function writeLast(ep, drama) {
       id: ep.id, drama_id: drama && drama.id, drama_title: drama && drama.title,
       ep_no: ep.ep_no, title: ep.title || ''
     }));
-    localStorage.setItem('vod.uid', currentUid());
   } catch { /* 隐私模式忽略 */ }
 }
 
@@ -646,7 +712,7 @@ function useNative() {
 function rememberQuery(id) {
   const u = new URL(location.href);
   u.searchParams.set('ep', id);
-  u.searchParams.set('uid', currentUid());
+  u.searchParams.delete('uid');
   history.replaceState(null, '', u);
 }
 
@@ -703,9 +769,7 @@ async function play(epId, opts) {
   renderPanel();
   let r;
   try {
-    const uid = encodeURIComponent(currentUid());
-    r = await fetch('/api/episodes/' + state.episodeId + '/vod-play?user_id=' + uid);
-    if (r.status === 404) r = await fetch('/api/episodes/' + state.episodeId + '/play?user_id=' + uid);
+    r = await fetch('/api/episodes/' + state.episodeId + '/play', { headers: authHeaders() });
   } catch (e) {
     if (gen !== playGen) return;
     $('opening').hidden = true;
@@ -721,9 +785,14 @@ async function play(epId, opts) {
     $('opening').hidden = true;
     log('play 被拒', r.status, JSON.stringify(info));
     window.vodState.errors.push(r.status);
-    if (r.status === 402) {
+    if (r.status === 401) {
       setLocked(true);
-      showGate('本集需要解锁', '解锁后即可播放。演示不扣金币。', '解锁并播放', () => unlockAndPlay(state.episodeId));
+      showGate('登录后观看付费集', '免费集不用登录。注册就送演示金币。', '登录 / 注册', askLogin);
+    } else if (r.status === 402) {
+      setLocked(true);
+      const cur = (state.episodes || []).find(e => e.id === state.episodeId);
+      const price = cur && cur.price_coins ? cur.price_coins + ' 金币' : '金币';
+      showGate('本集需要解锁', '解锁需要 ' + price + '，解锁后可以反复看。', '解锁并播放', () => unlockAndPlay(state.episodeId));
     } else if (r.status === 409) {
       showGate('还在转码', '这一集还不能播。', '再试一次', () => play(state.episodeId, { gesture: true }));
     } else {
@@ -806,16 +875,16 @@ function attachHls(v, info) {
 }
 
 async function attachNative(v, info) {
-  // Core 资产（vod-play）没有原生改写列表：直接用签名地址，加密 Core 资产在 iPhone 原生播放器上取不到 key（已知限制）。
+  // 路线 C：Core 资产用视频云的原生改写列表（分片走签名 CDN 地址，key 带 ?token=），加密集在 iPhone 上也能取到 key。
   if (info.via === 'vod-api') {
-    v.src = info.master_url;
+    v.src = info.native_master_url || info.master_url;
     $('opening').hidden = true;
     v.onerror = () => {
       window.vodState.errors.push('native');
       qoePush({ type: 'error', code: 'native' });
       showGate('手机播放失败', '这个视频暂时只能在电脑或安卓上播放。', '重试', () => play(state.episodeId, { gesture: true }));
     };
-    log('native HLS (vod-api)', info.master_url);
+    log('native HLS (vod-api)', (info.native_master_url || info.master_url).split('?')[0]);
     return;
   }
   // iPhone 不能给 key 请求加头。改写后的列表仍把分片指回原来的签名地址。
@@ -850,13 +919,20 @@ async function preload(n) {
 
 async function unlockAndPlay(epId) {
   const id = epId || state.episodeId;
-  const r = await fetch('/api/users/' + encodeURIComponent(currentUid()) + '/unlock', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+  if (!auth.user) { askLogin(); toast('先登录再解锁'); return; }
+  const r = await fetch('/api/users/' + auth.user.id + '/unlock', {
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ episode_id: +id })
   });
-  log('unlock', r.status);
+  let info = {};
+  try { info = await r.json(); } catch {}
+  log('unlock', r.status, JSON.stringify(info));
+  if (r.status === 401) { setSession(null, null); askLogin(); return; }
+  if (r.status === 402 && info.code === 'insufficient_coins') { toast('金币不够：需要 ' + info.price + '，现有 ' + info.coins); return; }
   if (!r.ok) { toast('解锁失败'); return; }
-  toast('已解锁');
+  auth.user.coins = info.coins;
+  authLabel();
+  toast(info.charged ? '已解锁，扣 ' + info.charged + ' 金币' : '已解锁');
   play(id, { gesture: true });
 }
 async function openDrama(dramaId, epId) {
@@ -948,7 +1024,10 @@ $('vod-file').onchange = async () => {
   toast('上传完成，转码后可播放');
 };
 $('uid-btn').onclick = () => { $('uid-pop').hidden = !$('uid-pop').hidden; };
-$('uid-save').onclick = () => { uidLabel(); $('uid-pop').hidden = true; try { localStorage.setItem('vod.uid', currentUid()); } catch {} };
+$('watch-acct').onclick = () => { $('uid-pop').hidden = !$('uid-pop').hidden; };
+$('auth-form').onsubmit = (e) => { e.preventDefault(); authSubmit('login'); };
+$('auth-register').onclick = () => authSubmit('register');
+$('auth-logout').onclick = () => { setSession(null, null); $('uid-pop').hidden = true; toast('已退出'); };
 $('seek').addEventListener('pointerdown', () => { seeking = true; });
 $('seek').addEventListener('pointerup', () => { seeking = false; applySeek(); });
 $('seek').addEventListener('change', () => { seeking = false; applySeek(); });
@@ -992,13 +1071,9 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { if ($('watch').classList.contains('sheet')) closeSheet(); else if ($('home').hidden) showHome(); }
 });
 
-try {
-  const saved = localStorage.getItem('vod.uid');
-  if (saved) $('uid').value = saved;
-} catch {}
+authLabel();
+refreshMe().catch(() => {});
 const q = new URLSearchParams(location.search);
-if (q.get('uid')) $('uid').value = q.get('uid');
-uidLabel();
 if (q.get('ep')) {
   setInterval(() => { document.title = JSON.stringify(window.vodState); }, 500);
   showWatch();

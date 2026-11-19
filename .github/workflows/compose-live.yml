@@ -51,6 +51,7 @@ jobs:
             echo "PUBLIC_UPLOAD_ENDPOINT=http://localhost:9000"
             echo "HLS_SECRET=$(r)"; echo "TOKEN_SECRET=$(r)"; echo "ORIGIN_SECRET=$(r)"
             echo "VOD_PLAY_TOKEN_SECRET=$(r)"; echo "VOD_ADMIN_JWT_SECRET=$(r)"
+            echo "DEMO_SESSION_SECRET=$(r)"
             echo "VOD_ADMIN_USERNAME=ops"; echo "VOD_ADMIN_PASSWORD=$(r)"
           } > .env
       - name: 起栈
@@ -93,6 +94,7 @@ jobs:
           run drama_vod_live.py inside drama_vod_live.py
           run browser_check.py python scripts/browser_check.py
           run console_live.py python scripts/console_live.py
+          run player_live.py python scripts/player_live.py
           MYSQL_HOST=127.0.0.1 MYSQL_USER=root MYSQL_PASSWORD="$MYSQL_ROOT_PASSWORD" run test_fencing_mysql.py python scripts/test_fencing_mysql.py
           exit $status
       - name: 故障注入

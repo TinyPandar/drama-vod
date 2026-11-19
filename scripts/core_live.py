@@ -89,7 +89,8 @@ def main():
     with conn.cursor() as c:
         c.execute("INSERT INTO vod_tenant(name, status) VALUES ('other', 'ACTIVE')")
         tenant_id = c.lastrowid
-        c.execute("INSERT INTO vod_api_credential(tenant_id, key_hash, scopes, status) VALUES (%s,%s,'*','ACTIVE')",
+        # 重复运行时这把 Key 已经在了（挂在上一次建的租户上），照样是「别的租户」
+        c.execute("INSERT IGNORE INTO vod_api_credential(tenant_id, key_hash, scopes, status) VALUES (%s,%s,'*','ACTIVE')",
                   (tenant_id, other_hash))
     conn.close()
     hidden, _ = http("GET", f"/api/v1/assets/{opened['asset_id']}", key=OTHER)

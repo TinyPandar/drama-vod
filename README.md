@@ -1,10 +1,69 @@
 # drama-vod：短剧点播示例
 
-Docker Compose 点播系统，包含两条并行演进的路径：旧版 Drama Demo（FastAPI）和新版 VOD Core 控制面（Java 21 + Spring Boot）。播放页仍使用 Demo；管理控制台调用 `/api/v1`；两条路径共享 Python 转码 Worker。
+Docker Compose 点播系统：VOD Core 视频云（Java 21 + Spring Boot 控制面 + Python/FFmpeg Worker）和它的第一个客户——短剧 Demo（FastAPI，负责剧集、观众账号、金币解锁和播放页）。路线 C 起 Demo 的上传、转码、播放都经视频云（见下文「路线 C」），旧的 Demo 转码链路已停用；管理控制台调用 `/api/v1`。
 
 媒体流程：**预签名直传 → RabbitMQ → FFmpeg 多码率 HLS → Nginx 签名校验与缓存 → hls.js 播放**。HLS 桶保持私有，API 验证回源密钥后为 Nginx 提供对象。旧 Demo 的付费集使用 AES-128 HLS。MySQL 保存数据，Redis 提供热点缓存和播放计数，Prometheus 是可选监控。
 
 路线图见 [docs/panda-vod-roadmap.html](docs/panda-vod-roadmap.html)，旧接口兼容约定见 [docs/phase-0-contract.md](docs/phase-0-contract.md)。
+
+## 路线 C：Demo 迁到视频云（`plan/demo-on-core`，从 `plan/asset-lifecycle` 叠出，未合并）
+
+### 为什么
+
+路线图把短剧站定为视频云的第一个内部客户，但此前 Demo 的上传、转码、播放和付费集仍走自己的旧链路（FastAPI 直接建任务、旧 `/hls/`、旧 `/keys/{id}`），视频云那条路只是旁路；观众身份是调用方随便传的 `user_id`，解锁不扣费，等于不设防；Core 的加密资产在 iPhone 原生播放器上取不到 key。
+
+### 做了什么
+
+**观众账号与金币**（`api/accounts.py`、`api/main.py`）
+
+- `POST /api/auth/register`、`POST /api/auth/login`：用户名 3–32 位、口令至少 8 位；口令 PBKDF2-HMAC-SHA256（每人随机盐）；返回会话 token `dsess1.…`（HMAC，密钥 `DEMO_SESSION_SECRET`，有效期 `DEMO_SESSION_TTL_SECONDS` 默认 7 天）。新用户送 `DEMO_SIGNUP_COINS`（默认 100）演示金币。同一用户名登录失败过多 429。
+- `GET /api/me`：当前观众、余额、已解锁的集。
+- `POST /api/users/{id}/unlock`：要本人的会话（没有 401、别人 403）。付费集在一个事务里写 `user_unlock`、条件扣 `price_coins`、记 `coin_ledger` 流水；重复解锁不重复扣；余额不够 402 `insufficient_coins`、什么都不写。
+- 播放：观众取自会话；`?user_id=` 只在和会话一致时允许（否则 403），没有会话时不再算数（过渡开关 `DEMO_ALLOW_USER_ID_PARAM=1`）。匿名可看免费集，付费集 401。
+- 新表（api 启动时 `CREATE TABLE IF NOT EXISTS`）：`demo_user`、`coin_ledger`、`episode_core_upload`；`episode` 追加 `core_asset_id`、`duration_ms`。`mysql/init.sql` 不变。
+
+**每一集都在视频云上**
+
+- 冻结的 `upload-url` / `complete` / `GET /api/assets/{id}` 改成 Core 的适配层：付费集上传成 Core 加密资产，标题和 `drama-{id}`、`episode-{id}` 标签写到 Core 资产上（控制台里能认出来）。播放页的 `vod-upload` / `vod-complete` 是同一件事。
+- 对账线程（默认每 5 秒，`DEMO_SYNC_INTERVAL_SECONDS`）问 Core 每个等待中的上传：READY 就把这一集切到新资产（只往更新的资产切，同一集先后两次上传不会被先完成的那次覆盖）；失败或资产不见了就不再等。`GET /api/assets/{id}` 也会顺手对一次。
+- 播放一律向视频云要 Core 播放 token：`master_url` 是 `/hls/v1/…`，加密集 key 走 `/keys/v1/{id}`，`encrypted` 取 Core 的真实值；下一集预加载同样经视频云。还没迁到 Core 的旧集暂时仍按旧链路播（`via: "legacy"`），迁完就没有了。
+- 路线 C 之前经 `vod-upload` 接上的资产（`episode_vod_link`）启动时并入对账表，自动切换。
+
+**iPhone 原生播放加密集**（vod-api `NativeHlsController`）
+
+- `GET /api/v1/native-hls/{asset}/master.m3u8?token=` 和 `…/media.m3u8?rendition=&token=`：只认 Core 播放 token（不经租户 Key 过滤器）。现读存储里的播放列表并改写：子列表指回本接口，分片改成和 `master_url` 同一签名的绝对 `/hls/v1/` 地址（仍走 Nginx 签名与缓存），`#EXT-X-KEY` 的 URI 加 `?token=`。token 无效、过期、资产不匹配、资产不是 READY 一律 401；no-store。
+- `playback-token` 响应新增 `native_master_url`；Demo 的 play 原样带出，播放页在不支持 hls.js 的浏览器（iPhone / Safari）上用它。
+
+**收掉旧链路**
+
+- Worker 默认不再处理旧 Demo 的转码消息（确认并丢弃），补偿扫描也不再重投旧任务；`WORKER_LEGACY_ENABLED=1` 可临时打开以排空遗留任务。Demo 不再自己建转码任务、发 MQ 消息（`contract_check.py` 改成检查这一点）。
+- 迁移工具 `api/migrate_core.py`（在 api 容器里 `python migrate_core.py [--dry-run]`）：对还挂在旧资产上的 READY 剧集，在 Core 开上传会话、在源桶里服务端复制旧原片、调 complete；转码完成后由对账线程切换，切换前这一集照常按旧链路播。可重复运行。旧原片和旧 HLS 产物不删。
+- 旧的读接口（`/hls/{sig}/…`、`/keys/{id}`、`/api/playback/{asset}/…`）保留，只为切换前已发出的地址服务。冻结条目的具体变化写在 [docs/phase-0-contract.md](docs/phase-0-contract.md) 末尾「路线 C」一节。
+
+**播放页**（`nginx/html/index.html`）：页头的「观众编号」换成登录 / 注册和金币余额；付费集未登录提示登录，登录后自动重试；解锁写明价格、扣金币、余额不够有提示；观看页顶栏也有账号入口；拦截提示出现时顶栏仍可点（原来「返回」按钮会被遮住）；登录弹层改到页面根部（原来在观看页里打不开）。原生 HLS 用 `native_master_url`。
+
+### 跑过的检查
+
+| 检查 | 结果 |
+| --- | --- |
+| `mvn test`（H2 + MySQL 8.4） | 165 个，0 失败 0 跳过；新增 `NativeHlsTest` 4 个（改写结果与签名、固定前缀、各种 401、档位名校验） |
+| 重写的 `scripts/e2e.py`（Demo 作为视频云客户） | 47/47：冻结上传接口落到 Core、没 PUT 就 complete 409、重复 complete 同一任务；对账切换；注册 / 登录 / 重名 409 / 口令错 401；匿名看免费集、付费集 401、只带 `user_id` 不算登录、未解锁 402、会话与 `user_id` 不符 403；不能替别人解锁、扣 30 金币、重复解锁不扣、余额不够 402；加密集 key 走 `/keys/v1/`、无 token 401、别的集的 token 401；**带 Authorization 头和 iPhone 原生方式（不带任何头）都用 ffmpeg 完整解码加密集**；篡改签名 403；下一集预加载；播放计数回刷 |
+| 新增 `scripts/player_live.py`（播放页，真实 Chromium） | 11/11：匿名免费集真的在播；付费集提示登录 → 页头注册 → 自动重试提示 30 金币 → 解锁后加密集真的在播、余额扣 30；退出后又要求登录；无脚本错误 |
+| `api/migrate_core.py` 在 A、B 留下的真实旧数据上 | 8 个旧剧集全部迁到 Core 并切换（付费集在 Core 是加密资产），第二次 `--dry-run` 显示 0 个待迁；`browser_check.py` 打开的第 1 集已从 Core 播放 |
+| `drama_vod_live.py`、`core_live.py` | 全过（前者「未解锁 402」改为「未就绪 409」，付费规则改由 e2e 覆盖；后者改成可重复运行） |
+| 回归：`playback_live`、`platform_live`、`media_live`、`lifecycle_live`、`console_live`、`fault_inject` 6 个场景 | 30/30、40/40、27/27、28/28、61/61、6/6 |
+| `test_api_playback.py`（15 个，含新的账号与播放用例）、`test_vod_client.py`、`test_bridge.py`（旧链路默认停用）、`contract_check.py`、其余 `scripts/test_*.py`、`test_fencing_mysql.py` | 全过 |
+
+CI 的 Compose live 工作流加了 `player_live.py` 和一次性的 `DEMO_SESSION_SECRET`。
+
+### 已知边界
+
+- 账号只有用户名口令，没有找回口令、邮箱或手机验证；金币只能注册时获得，没有充值。会话 token 不能单独吊销（只能换 `DEMO_SESSION_SECRET` 或等过期）。
+- 对账靠轮询，没有用 Webhook：Demo 在内网（`http://api:8000`），Core 的 SSRF 检查会拒绝这种地址。换成 Webhook 需要 Demo 有公网 HTTPS 地址。
+- 换片后旧的 Core 资产不会自动删除（可在控制台或用 `DELETE /api/v1/assets/{id}` 删）。
+- 迁移只处理 READY 的旧剧集；还在转码中的旧任务要先 `WORKER_LEGACY_ENABLED=1` 排空。迁移中途失败的那一集，要等它的 Core 上传会话过期被清理（默认约 20 分钟）后再运行一次。
+- 原生 HLS 改写在真 iPhone / Safari 上没有测过，只用 ffmpeg 不带请求头的方式验证了同一份播放列表。
+- 重建 api 容器后 Nginx 要 `docker compose restart nginx`：Nginx 里旧 Demo 的 upstream 只在启动时解析一次（原来就如此，`/hls/` 回源的缓存与 Range 行为依赖它，这次没改）。
 
 ## 路线 B：资产生命周期（`plan/asset-lifecycle`，从 `plan/live-verify` 叠出，未合并）
 
@@ -1248,7 +1307,7 @@ docker compose --profile obs up -d prometheus
 
 | 地址 | 用途 |
 |---|---|
-| http://localhost:8080 | 短剧播放页（可用 `?ep=1&uid=7` 打开指定集） |
+| http://localhost:8080 | 短剧播放页（可用 `?ep=1` 打开指定集；页头登录 / 注册，付费集用演示金币解锁） |
 | http://localhost:8080/vod-console/ | 平台控制台（Vue；管理登录用 `VOD_ADMIN_USERNAME`/`VOD_ADMIN_PASSWORD` 种子的账号） |
 | http://localhost:8080/console.html | 旧版静态控制台（只粘贴 API Key） |
 | http://localhost:8080/api/... | Drama Demo API |
@@ -1296,7 +1355,7 @@ Java 控制面测试：在 `vod-api/` 下运行 `mvn test`（需要 Java 21 和 
 
 ## 已知边界
 
-- Drama Demo 使用调用方提供的 `user_id` 和演示解锁流程；Core 租户 API Key 尚未替代 Demo 用户体系。
-- Core 控制面与旧 Demo 并行运行，播放链路尚未整体迁移。
+- Drama Demo 有自己的观众账号和演示金币（路线 C），没有真实支付、找回口令或充值。
+- 旧 Demo 的读接口（`/hls/`、`/keys/{id}`、`/api/playback/`）只为路线 C 之前发出的地址保留；已有旧剧集用 `api/migrate_core.py` 迁到视频云。
 - Worker 输出 HLS/TS，尚未实现 fMP4/CMAF、H.265、Widevine/FairPlay DRM 或多 CDN 调度。
 - Demo 播放计数采用定时回刷，未承诺精确一次。

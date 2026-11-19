@@ -2,5 +2,5 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY common.py main.py origin_path.py secret_guard.py vod_client.py ./
+COPY common.py main.py origin_path.py secret_guard.py vod_client.py accounts.py migrate_core.py ./
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

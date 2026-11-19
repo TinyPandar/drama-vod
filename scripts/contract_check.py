@@ -72,7 +72,9 @@ check("api/common.py and worker/common.py emit the same message helper", len(bod
 
 api = (ROOT / "api" / "main.py").read_text(encoding="utf-8")
 worker = (ROOT / "worker" / "worker.py").read_text(encoding="utf-8")
-check("api publishes transcode_message", "transcode_message(job[\"id\"], asset_id, x_request_id)" in api)
+# 路线 C：Demo 不再自己建转码任务、发 MQ 消息，上传一律经视频云（Core 用 outbox 发同一个 v1 消息）
+check("api no longer publishes transcode messages (Demo goes through Core)",
+      "publish(ch, Q_MAIN" not in api and "INSERT IGNORE INTO transcode_job" not in api)
 check("worker sweeper publishes transcode_message", "transcode_message(row[\"id\"], row[\"asset_id\"], row[\"trace_id\"])" in worker)
 handler = worker.split("def on_message", 1)[-1].split("def sweeper", 1)[0]
 check("worker does not read schema_version", 'msg["schema_version"]' not in handler and 'msg.get("schema_version")' not in handler)

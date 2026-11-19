@@ -30,7 +30,9 @@ public class ApiKeyFilter extends OncePerRequestFilter {
         String path = request.getRequestURI();
         // /api/v1/qoe 用 body 里的 Core 播放 token 鉴权（sendBeacon 不能带头），见 vod.qoe.QoeController。
         // /api/v1/admin/** 由 Spring Security + 管理端 JWT 鉴权（vod.admin.AdminSecurityConfig），租户 Key 在那里无效。
+        // 路线 C：/api/v1/native-hls/** 用 query 里的 Core 播放 token 鉴权（原生 HLS 播放器加不了头），见 vod.media.NativeHlsController。
         return !path.startsWith("/api/v1/") || path.equals("/api/v1/healthz") || path.equals("/api/v1/qoe")
+                || path.startsWith(vod.media.NativeHlsController.PATH)
                 || path.startsWith("/api/v1/admin/") || path.equals("/api/v1/admin");
     }
 

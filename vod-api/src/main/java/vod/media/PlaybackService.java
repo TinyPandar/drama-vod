@@ -120,6 +120,8 @@ public class PlaybackService {
         out.put("expires_at", exp);
         out.put("encrypted", asset.encrypted());
         out.put("poster_url", posterUrl(asset, exp));
+        // 路线 C：原生 HLS（iPhone / Safari）入口，用同一个 token；hls.js 继续用 master_url。
+        out.put("native_master_url", NativeHlsController.masterUrl(assetId, token));
         return out;
     }
 

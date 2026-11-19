@@ -43,3 +43,9 @@ def is_generation_prefix(prefix, asset_id=None):
 
 def updates_episode(origin):
     return origin != "core"
+
+
+def accepts(origin, legacy_enabled):
+    """路线 C：旧 Demo 的转码链路默认停用。停用时旧消息直接确认丢弃，库里的旧任务保持原状；
+    需要排空遗留的旧任务时把 WORKER_LEGACY_ENABLED 设为 1（补偿扫描也会重新投递它们）。"""
+    return origin == "core" or bool(legacy_enabled)

@@ -12,6 +12,7 @@ import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListPartsRequest;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
@@ -160,6 +161,20 @@ public final class S3ObjectStorage implements ObjectStorage, AutoCloseable {
             // 已完成或已取消：幂等
         } catch (S3Exception e) {
             if (!isNoSuchUpload(e)) throw e;
+        }
+    }
+
+    @Override
+    public Optional<String> getText(String bucket, String key, int maxBytes) {
+        try {
+            var bytes = internal.getObjectAsBytes(GetObjectRequest.builder().bucket(bucket).key(key).build());
+            if (bytes.asByteArrayUnsafe().length > maxBytes) throw new IllegalStateException("object too large: " + key);
+            return Optional.of(bytes.asUtf8String());
+        } catch (NoSuchKeyException e) {
+            return Optional.empty();
+        } catch (S3Exception e) {
+            if (e.statusCode() == 404) return Optional.empty();
+            throw e;
         }
     }
 
